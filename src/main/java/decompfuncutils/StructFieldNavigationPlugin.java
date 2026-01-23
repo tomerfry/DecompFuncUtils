@@ -2,6 +2,7 @@ package decompfuncutils;
 
 import docking.ActionContext;
 import docking.action.DockingAction;
+import docking.action.KeyBindingData; // [Added Import]
 import docking.action.MenuData;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.plugin.ProgramPlugin;
@@ -14,6 +15,9 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
 import ghidra.util.Msg;
+
+import java.awt.event.InputEvent; // [Added Import]
+import java.awt.event.KeyEvent;   // [Added Import]
 
 //@formatter:off
 @PluginInfo(
@@ -90,6 +94,11 @@ public class StructFieldNavigationPlugin extends ProgramPlugin {
         // Set default menu data
         navigateAction.setPopupMenuData(
             new MenuData(new String[] { "Go to Field Target" }, "Navigation")
+        );
+
+        // [Added] Set Key Binding to Ctrl+G
+        navigateAction.setKeyBindingData(
+            new KeyBindingData(KeyEvent.VK_G, InputEvent.CTRL_DOWN_MASK)
         );
         
         tool.addAction(navigateAction);
