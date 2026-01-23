@@ -2,22 +2,39 @@ package decompfuncutils;
 
 import docking.ActionContext;
 import docking.action.DockingAction;
-import docking.action.KeyBindingData; // [Added Import]
+import docking.action.KeyBindingData;
 import docking.action.MenuData;
+import docking.widgets.fieldpanel.FieldPanel;
+import docking.widgets.fieldpanel.Layout;
+import docking.widgets.fieldpanel.support.FieldLocation;
+import ghidra.app.decompiler.ClangFieldToken;
+import ghidra.app.decompiler.ClangToken;
+import ghidra.app.decompiler.component.ClangTextField;
+import ghidra.app.decompiler.component.DecompilerPanel;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.plugin.ProgramPlugin;
 import ghidra.app.plugin.core.decompile.DecompilerActionContext;
-import ghidra.app.decompiler.*;
 import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.listing.*;
-import ghidra.program.model.symbol.*;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.symbol.SymbolTable;
+import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.Msg;
 
-import java.awt.event.InputEvent; // [Added Import]
-import java.awt.event.KeyEvent;   // [Added Import]
+import javax.swing.SwingUtilities;
+import java.awt.AWTEvent;
+import java.awt.Component;
+import java.awt.Toolkit;
+import java.awt.event.AWTEventListener;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
+import java.awt.event.MouseEvent;
+import java.math.BigInteger; // [Added Import]
 
 //@formatter:off
 @PluginInfo(
@@ -30,21 +47,100 @@ import java.awt.event.KeyEvent;   // [Added Import]
 //@formatter:on
 public class StructFieldNavigationPlugin extends ProgramPlugin {
 
+    private AWTEventListener globalMouseListener;
+
     public StructFieldNavigationPlugin(PluginTool tool) {
         super(tool);
         createActions();
+        setupGlobalMouseListener();
+    }
+
+    private void setupGlobalMouseListener() {
+        globalMouseListener = new AWTEventListener() {
+            @Override
+            public void eventDispatched(AWTEvent event) {
+                if (event.getID() == MouseEvent.MOUSE_CLICKED) {
+                    MouseEvent mouseEvent = (MouseEvent) event;
+                    if (mouseEvent.getClickCount() == 2 && mouseEvent.getButton() == MouseEvent.BUTTON1) {
+                        checkForDecompilerNavigation(mouseEvent);
+                    }
+                }
+            }
+        };
+
+        Toolkit.getDefaultToolkit().addAWTEventListener(globalMouseListener, AWTEvent.MOUSE_EVENT_MASK);
+    }
+
+    private void checkForDecompilerNavigation(MouseEvent e) {
+        Component clickedComponent = (Component) e.getSource();
+        DecompilerPanel panel = findDecompilerPanel(clickedComponent);
+
+        if (panel != null) {
+            // Since the double click places the cursor, we can just get the token at the cursor
+            ClangToken token = getTokenAtCursor(panel);
+            
+            if (token != null) {
+                handleNavigation(token, null);
+            }
+        }
+    }
+
+    private DecompilerPanel findDecompilerPanel(Component c) {
+        while (c != null) {
+            if (c instanceof DecompilerPanel) {
+                return (DecompilerPanel) c;
+            }
+            c = c.getParent();
+        }
+        return null;
+    }
+
+    /**
+     * Retrieves the token at the current cursor position in the DecompilerPanel.
+     */
+    private ClangToken getTokenAtCursor(DecompilerPanel panel) {
+        FieldPanel fieldPanel = panel.getFieldPanel();
+        
+        // Get current cursor location
+        FieldLocation loc = fieldPanel.getCursorLocation();
+        
+        if (loc == null) {
+            return null;
+        }
+
+        // Retrieve the Layout using the BigInteger index
+        Layout layout = fieldPanel.getLayoutModel().getLayout(loc.getIndex());
+        
+        if (layout == null) {
+            return null;
+        }
+
+        // Get the specific field within the layout
+        docking.widgets.fieldpanel.field.Field field = layout.getField(loc.getFieldNum());
+        
+        if (field instanceof ClangTextField) {
+            ClangTextField clangField = (ClangTextField) field;
+            return clangField.getToken(loc);
+        }
+        return null;
+    }
+
+    @Override
+    protected void dispose() {
+        if (globalMouseListener != null) {
+            Toolkit.getDefaultToolkit().removeAWTEventListener(globalMouseListener);
+            globalMouseListener = null;
+        }
+        super.dispose();
     }
 
     private void createActions() {
-        // Action with dynamic menu name
         DockingAction navigateAction = new DockingAction("Navigate to Field Target", getName()) {
             @Override
             public void actionPerformed(ActionContext context) {
-                try {
-                    navigateToFieldTarget(context);
-                } catch (Exception e) {
-                    Msg.showError(this, null, "Navigation Error", 
-                        "Failed to navigate: " + e.getMessage(), e);
+                if (context instanceof DecompilerActionContext) {
+                    DecompilerActionContext decompContext = (DecompilerActionContext) context;
+                    handleNavigation(decompContext.getTokenAtCursor(), null);
                 }
             }
 
@@ -53,94 +149,54 @@ public class StructFieldNavigationPlugin extends ProgramPlugin {
                 if (currentProgram == null || !(context instanceof DecompilerActionContext)) {
                     return false;
                 }
-                
                 DecompilerActionContext decompContext = (DecompilerActionContext) context;
                 ClangToken token = decompContext.getTokenAtCursor();
-                
-                if (token == null) {
-                    return false;
-                }
-                
-                // Check if this is a field token
-                if (token instanceof ClangFieldToken) {
-                    String fieldName = token.getText();
-                    // Check if a symbol exists with this name
-                    return findSymbolByName(fieldName) != null;
-                }
-                
-                return false;
+                return getTargetSymbol(token) != null;
             }
             
             @Override
             public boolean isAddToPopup(ActionContext context) {
-                if (!isValidContext(context)) {
-                    return false;
-                }
+                if (!isValidContext(context)) return false;
                 
-                // Update menu text dynamically
                 DecompilerActionContext decompContext = (DecompilerActionContext) context;
                 ClangToken token = decompContext.getTokenAtCursor();
                 if (token != null) {
-                    String fieldName = token.getText();
                     setPopupMenuData(
-                        new MenuData(new String[] { "Go to '" + fieldName + "'" }, "Navigation")
+                        new MenuData(new String[] { "Go to '" + token.getText() + "'" }, "Navigation")
                     );
                 }
-                
                 return true;
             }
         };
         
-        // Set default menu data
-        navigateAction.setPopupMenuData(
-            new MenuData(new String[] { "Go to Field Target" }, "Navigation")
-        );
-
-        // [Added] Set Key Binding to Ctrl+G
-        navigateAction.setKeyBindingData(
-            new KeyBindingData(KeyEvent.VK_G, InputEvent.CTRL_DOWN_MASK)
-        );
+        navigateAction.setPopupMenuData(new MenuData(new String[] { "Go to Field Target" }, "Navigation"));
+        navigateAction.setKeyBindingData(new KeyBindingData(KeyEvent.VK_G, InputEvent.CTRL_DOWN_MASK));
         
         tool.addAction(navigateAction);
     }
-    
-    private void navigateToFieldTarget(ActionContext context) throws Exception {
-        if (!(context instanceof DecompilerActionContext)) {
-            return;
-        }
-        
-        DecompilerActionContext decompContext = (DecompilerActionContext) context;
-        ClangToken token = decompContext.getTokenAtCursor();
-        
-        if (token == null) {
-            Msg.showWarn(this, null, "No Token", "No token at cursor");
-            return;
-        }
-        
-        String fieldName = token.getText();
-        
-        // Find symbol with this name
-        Symbol symbol = findSymbolByName(fieldName);
+
+    private void handleNavigation(ClangToken token, Component sourceComponent) {
+        Symbol symbol = getTargetSymbol(token);
         
         if (symbol == null) {
-            Msg.showInfo(this, null, "Not Found", 
-                "No function or label named '" + fieldName + "' found");
+            if (sourceComponent != null) { 
+                Msg.showWarn(this, null, "Navigation Failed", "Could not find target symbol.");
+            }
             return;
         }
-        
-        // Navigate to the symbol's address
+
         Address targetAddr = symbol.getAddress();
-        
-        if (targetAddr == null) {
-            Msg.showWarn(this, null, "No Address", 
-                "Symbol '" + fieldName + "' has no address");
-            return;
+        if (targetAddr != null) {
+            goTo(targetAddr);
+            tool.setStatusInfo("Navigated to '" + symbol.getName() + "' at " + targetAddr);
         }
-        
-        // Navigate using the parent class's goTo method
-        goTo(targetAddr);
-        
-        tool.setStatusInfo("Navigated to '" + fieldName + "' at " + targetAddr);
+    }
+
+    private Symbol getTargetSymbol(ClangToken token) {
+        if (token == null || !(token instanceof ClangFieldToken)) {
+            return null;
+        }
+        return findSymbolByName(token.getText());
     }
     
     private Symbol findSymbolByName(String name) {
@@ -151,35 +207,20 @@ public class StructFieldNavigationPlugin extends ProgramPlugin {
         SymbolTable symbolTable = currentProgram.getSymbolTable();
         FunctionManager funcMgr = currentProgram.getFunctionManager();
         
-        // Try to find as function first by iterating through all functions
         for (Function func : funcMgr.getFunctions(true)) {
             if (func.getName().equals(name)) {
                 return func.getSymbol();
             }
         }
         
-        // Search for symbol by name
         SymbolIterator symbols = symbolTable.getSymbols(name);
-        
-        // Prefer functions and labels
         Symbol bestMatch = null;
+        
         while (symbols.hasNext()) {
             Symbol sym = symbols.next();
-            
-            // Prioritize functions
-            if (sym.getSymbolType() == SymbolType.FUNCTION) {
-                return sym;
-            }
-            
-            // Then labels
-            if (sym.getSymbolType() == SymbolType.LABEL) {
-                bestMatch = sym;
-            }
-            
-            // Keep any match as fallback
-            if (bestMatch == null) {
-                bestMatch = sym;
-            }
+            if (sym.getSymbolType() == SymbolType.FUNCTION) return sym;
+            if (sym.getSymbolType() == SymbolType.LABEL) bestMatch = sym;
+            if (bestMatch == null) bestMatch = sym;
         }
         
         return bestMatch;
