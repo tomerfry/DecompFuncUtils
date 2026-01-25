@@ -33,17 +33,6 @@ Double-click or use `Ctrl+G` on struct field names in the decompiler to navigate
 
 **Use case:** When analyzing a vtable like `vtable->doSomething`, double-clicking on `doSomething` jumps directly to that function.
 
-### 🔷 Inter-Procedural Taint Analysis
-Advanced data flow analysis using sparse matrix representation for efficient taint propagation across function boundaries.
-
-**Capabilities:**
-- Forward and backward taint tracking
-- Follows calls up to N levels deep (configurable)
-- Visual highlighting of tainted variables in decompiler
-- Detailed logging panel showing matrices, edges, and propagation steps
-- Custom taint query language for complex analysis patterns
-- Source/sink detection with configurable thresholds
-
 ---
 
 ## Installation
@@ -89,15 +78,6 @@ The built extension will be in `dist/`.
 2. Right-click and select **"Create Struct from Selection"**
 3. Enter a name for the new struct
 4. The struct is created with pointer fields named after referenced symbols
-
-### Taint Analysis
-
-1. Open **Window → Taint Analysis Log** to view results
-2. Right-click on a variable in the decompiler
-3. Select from the **Taint Analysis** submenu:
-   - **Forward Taint** - Where does this data flow?
-   - **Backward Taint** - What data reaches this variable?
-   - **Inter-procedural Analysis** - Follow taint across function calls
 
 ---
 
