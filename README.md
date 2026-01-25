@@ -49,7 +49,7 @@ Advanced data flow analysis using sparse matrix representation for efficient tai
 **Workflow:**
 - Create better looking decompiled C++ OOP code.
 
-![Class Creation](CPP Reverse Demo.svg)
+![Class Creation](cpp_reverse_demo.svg)
 
 
 ---
