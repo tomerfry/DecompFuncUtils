@@ -8,6 +8,11 @@ A Ghidra extension that enhances the decompiler with C++ reverse engineering uti
 
 ---
 
+## Installin The Plugin (Or Any Other Plugin)
+- How to install the plugin from you download from the releases.
+![Installing The Plugin](installing_the_plugin.gif)
+
+
 ## Features
 
 ### 🔷 Memory-to-Struct Converter
