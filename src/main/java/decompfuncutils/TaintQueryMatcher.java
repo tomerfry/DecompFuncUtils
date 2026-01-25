@@ -67,12 +67,12 @@ public class TaintQueryMatcher {
         // Create taint context
         TaintContextImpl taintCtx = new TaintContextImpl(taintData, highFunc, engine);
         
-        // Get the C code markup
-        DecompileResults results = getDecompileResults(highFunc);
-        if (results == null) return matches;
-        
-        ClangTokenGroup root = results.getCCodeMarkup();
-        if (root == null) return matches;
+        // Get the C code markup - need to decompile to get it
+        ClangTokenGroup root = decompileAndGetMarkup(func);
+        if (root == null) {
+            logPanel.logWarning("Could not get C code markup for " + func.getName());
+            return matches;
+        }
         
         // Search for pattern matches
         searchInTokens(query, root, highFunc, taintCtx, new ArrayList<>());
@@ -110,12 +110,36 @@ public class TaintQueryMatcher {
             HighFunction hf = results.getHighFunction();
             if (hf == null) continue;
             
+            ClangTokenGroup root = results.getCCodeMarkup();
+            if (root == null) continue;
+            
             int before = matches.size();
-            matchInFunction(query, hf);
+            matchInFunctionWithMarkup(query, hf, root);
             matchCount += (matches.size() - before);
         }
         
         logPanel.logInfo("Searched " + funcCount + " functions, found " + matchCount + " total matches");
+        
+        return matches;
+    }
+    
+    /**
+     * Search for pattern matches in a single function with pre-provided markup
+     */
+    public List<QueryMatch> matchInFunctionWithMarkup(TaintQuery query, HighFunction highFunc, ClangTokenGroup root) {
+        if (highFunc == null || root == null) return matches;
+        
+        Function func = highFunc.getFunction();
+        logPanel.logInfo("Searching in " + func.getName() + "...");
+        
+        // Build taint matrix for constraint evaluation
+        TaintMatrixConverter.CsrData taintData = converter.convert(highFunc);
+        
+        // Create taint context
+        TaintContextImpl taintCtx = new TaintContextImpl(taintData, highFunc, engine);
+        
+        // Search for pattern matches
+        searchInTokens(query, root, highFunc, taintCtx, new ArrayList<>());
         
         return matches;
     }
@@ -178,8 +202,236 @@ public class TaintQueryMatcher {
             }
         }
         
-        // For multi-element patterns (like UAF), need to track state across statements
-        // This is handled at a higher level
+        // For multi-element patterns (like UAF, double-free)
+        // Check if this statement could be the START of a multi-element pattern
+        if (elements.size() >= 2) {
+            TaintQuery.PatternElement firstElem = elements.get(0);
+            if (firstElem instanceof TaintQuery.FunctionCall fc) {
+                if (matchFunctionCall(fc, stmt, highFunc, bindings)) {
+                    // This matches the first element - search for rest of pattern
+                    searchMultiElementPattern(query, stmt, highFunc, taintCtx, bindings, 1);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Search for remaining elements of a multi-element pattern
+     */
+    private void searchMultiElementPattern(TaintQuery query, ClangStatement startStmt,
+                                           HighFunction highFunc, TaintContextImpl taintCtx,
+                                           Map<String, Object> bindings, int elementIdx) {
+        
+        List<TaintQuery.PatternElement> elements = query.getPatternElements();
+        if (elementIdx >= elements.size()) {
+            // All elements matched!
+            if (query.getConstraint().evaluate(bindings, taintCtx)) {
+                addMatch(query, startStmt, highFunc, bindings);
+            }
+            return;
+        }
+        
+        TaintQuery.PatternElement currentElem = elements.get(elementIdx);
+        
+        // Handle WildcardMulti with negative patterns
+        if (currentElem instanceof TaintQuery.WildcardMulti wm) {
+            // Need to find the NEXT pattern element after the wildcard
+            if (elementIdx + 1 >= elements.size()) {
+                // Wildcard at end - match complete
+                if (query.getConstraint().evaluate(bindings, taintCtx)) {
+                    addMatch(query, startStmt, highFunc, bindings);
+                }
+                return;
+            }
+            
+            TaintQuery.PatternElement nextElem = elements.get(elementIdx + 1);
+            
+            // Search through remaining statements for next element
+            List<ClangStatement> remainingStmts = getStatementsAfter(startStmt, highFunc);
+            
+            for (int i = 0; i < remainingStmts.size(); i++) {
+                ClangStatement candidateStmt = remainingStmts.get(i);
+                Map<String, Object> newBindings = new HashMap<>(bindings);
+                
+                // Check if this statement matches the next element
+                boolean matches = false;
+                if (nextElem instanceof TaintQuery.FunctionCall fc) {
+                    matches = matchFunctionCall(fc, candidateStmt, highFunc, newBindings);
+                } else if (nextElem instanceof TaintQuery.Dereference deref) {
+                    matches = matchDereference(deref, candidateStmt, highFunc, newBindings);
+                }
+                
+                if (matches) {
+                    // Check negative patterns on statements between start and candidate
+                    List<ClangStatement> between = remainingStmts.subList(0, i);
+                    if (checkNegativePatterns(wm.negatives, between, newBindings, highFunc)) {
+                        // Negative patterns satisfied - continue matching
+                        searchMultiElementPattern(query, startStmt, highFunc, taintCtx, 
+                                                 newBindings, elementIdx + 2);
+                    }
+                }
+            }
+        }
+        // Handle regular elements
+        else if (currentElem instanceof TaintQuery.FunctionCall fc) {
+            List<ClangStatement> remaining = getStatementsAfter(startStmt, highFunc);
+            for (ClangStatement stmt : remaining) {
+                Map<String, Object> newBindings = new HashMap<>(bindings);
+                if (matchFunctionCall(fc, stmt, highFunc, newBindings)) {
+                    searchMultiElementPattern(query, startStmt, highFunc, taintCtx,
+                                             newBindings, elementIdx + 1);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Check that negative patterns are NOT present in the given statements
+     */
+    private boolean checkNegativePatterns(List<TaintQuery.NegativePattern> negatives,
+                                          List<ClangStatement> statements,
+                                          Map<String, Object> bindings,
+                                          HighFunction highFunc) {
+        if (negatives.isEmpty()) return true;
+        
+        for (TaintQuery.NegativePattern neg : negatives) {
+            for (ClangStatement stmt : statements) {
+                String stmtText = extractCodeText(stmt);
+                
+                // Check for variable assignment: not:$ptr=_
+                if (neg.varName != null) {
+                    Object boundVar = bindings.get(neg.varName);
+                    if (boundVar != null) {
+                        // Check if this statement assigns to the bound variable
+                        if (isAssignmentTo(stmt, boundVar, highFunc)) {
+                            return false;  // Found forbidden assignment
+                        }
+                    }
+                }
+                
+                // Check for pattern match: not:free($ptr)
+                if (neg.pattern != null) {
+                    // Simple text-based check for now
+                    if (stmtText.contains(neg.pattern.split("\\(")[0])) {
+                        return false;  // Found forbidden pattern
+                    }
+                }
+            }
+        }
+        
+        return true;  // No negative patterns found - OK
+    }
+    
+    /**
+     * Check if a statement assigns to the given variable
+     */
+    private boolean isAssignmentTo(ClangStatement stmt, Object targetVar, HighFunction highFunc) {
+        if (!(targetVar instanceof Varnode targetVn)) return false;
+        
+        // Look for COPY/STORE operations that write to targetVn
+        Address stmtAddr = stmt.getMinAddress();
+        if (stmtAddr == null) return false;
+        
+        Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            int opcode = op.getOpcode();
+            
+            if (opcode == PcodeOp.COPY || opcode == PcodeOp.STORE || 
+                opcode == PcodeOp.CALL || opcode == PcodeOp.CALLIND) {
+                Varnode output = op.getOutput();
+                if (output != null && varnodeMatches(output, targetVn)) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Check if two varnodes refer to the same variable
+     */
+    private boolean varnodeMatches(Varnode a, Varnode b) {
+        if (a.equals(b)) return true;
+        
+        // Check high variables
+        HighVariable hvA = a.getHigh();
+        HighVariable hvB = b.getHigh();
+        if (hvA != null && hvB != null && hvA.equals(hvB)) return true;
+        
+        // Check by name
+        if (hvA != null && hvB != null) {
+            String nameA = hvA.getName();
+            String nameB = hvB.getName();
+            if (nameA != null && nameA.equals(nameB)) return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Get all statements after a given statement in the function
+     */
+    private List<ClangStatement> getStatementsAfter(ClangStatement start, HighFunction highFunc) {
+        List<ClangStatement> result = new ArrayList<>();
+        
+        // Get all statements in the function
+        ClangNode parentNode = start.Parent();
+        if (!(parentNode instanceof ClangTokenGroup parent)) return result;
+        
+        boolean found = false;
+        collectStatementsRecursive(parent, start, result, new boolean[]{false});
+        
+        return result;
+    }
+    
+    private void collectStatementsRecursive(ClangNode node, ClangStatement after,
+                                            List<ClangStatement> result, boolean[] foundStart) {
+        if (node instanceof ClangStatement stmt) {
+            if (foundStart[0]) {
+                result.add(stmt);
+            } else if (stmt == after) {
+                foundStart[0] = true;
+            }
+        }
+        if (node instanceof ClangTokenGroup group) {
+            for (int i = 0; i < group.numChildren(); i++) {
+                collectStatementsRecursive(group.Child(i), after, result, foundStart);
+            }
+        }
+    }
+    
+    /**
+     * Match a dereference pattern
+     */
+    private boolean matchDereference(TaintQuery.Dereference deref, ClangStatement stmt,
+                                     HighFunction highFunc, Map<String, Object> bindings) {
+        String stmtText = extractCodeText(stmt);
+        if (!stmtText.contains("*")) return false;
+        
+        // Check if dereferencing the bound variable
+        Object boundVar = bindings.get(deref.ptrVar);
+        if (boundVar == null) return true;  // Not yet bound, will bind later
+        
+        if (boundVar instanceof Varnode targetVn) {
+            // Check P-Code for LOAD operations on this varnode
+            Address stmtAddr = stmt.getMinAddress();
+            if (stmtAddr == null) return false;
+            
+            Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
+            while (ops.hasNext()) {
+                PcodeOpAST op = ops.next();
+                if (op.getOpcode() == PcodeOp.LOAD) {
+                    Varnode ptr = op.getInput(1);
+                    if (ptr != null && varnodeMatches(ptr, targetVn)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        return false;
     }
     
     /**
@@ -422,12 +674,23 @@ public class TaintQueryMatcher {
     }
     
     /**
-     * Get decompile results (may need to re-decompile)
+     * Decompile a function and get its C code markup
      */
-    private DecompileResults getDecompileResults(HighFunction highFunc) {
-        // The HighFunction should have access to its decompile results
-        // For now, we work with what we have
-        return null;  // Will use ClangTokens from the existing context
+    private ClangTokenGroup decompileAndGetMarkup(Function func) {
+        DecompInterface decompiler = new DecompInterface();
+        try {
+            DecompileOptions options = new DecompileOptions();
+            decompiler.setOptions(options);
+            decompiler.openProgram(program);
+            
+            DecompileResults results = decompiler.decompileFunction(func, 30, null);
+            if (results != null && results.decompileCompleted()) {
+                return results.getCCodeMarkup();
+            }
+        } finally {
+            decompiler.dispose();
+        }
+        return null;
     }
     
     // ============ Context Implementations ============

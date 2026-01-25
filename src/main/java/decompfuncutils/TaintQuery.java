@@ -172,6 +172,8 @@ public class TaintQuery {
     
     public static class WildcardMulti extends PatternElement {
         // Matches zero or more statements "..."
+        public List<NegativePattern> negatives = new ArrayList<>();  // not: patterns
+        
         @Override
         public boolean matches(TokenContext ctx, Map<String, Object> bindings) {
             return true;
@@ -179,7 +181,23 @@ public class TaintQuery {
         
         @Override
         public String toString() {
-            return "...";
+            if (negatives.isEmpty()) return "...";
+            StringBuilder sb = new StringBuilder("...");
+            for (NegativePattern neg : negatives) {
+                sb.append(" not:").append(neg);
+            }
+            return sb.toString();
+        }
+    }
+    
+    public static class NegativePattern {
+        public String varName;      // Variable that must NOT be assigned
+        public String pattern;      // Full pattern that must NOT appear
+        
+        @Override
+        public String toString() {
+            if (varName != null) return varName + "=_";
+            return pattern;
         }
     }
     

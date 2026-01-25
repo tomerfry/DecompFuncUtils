@@ -64,17 +64,33 @@ public class TaintQueryParser {
             "    execve($path, $argv, $envp);\n" +
             "} WHERE tainted($path) OR tainted($argv)");
         
-        // Use-after-free (simplified - looks for free then use)
+        // Use-after-free (with negative check - no reassignment between free and use)
         BUILTIN_PATTERNS.put("use_after_free",
             "PATTERN use_after_free {\n" +
+            "    free($ptr);\n" +
+            "    ... not:$ptr=_;\n" +
+            "    *$ptr;\n" +
+            "}");
+        
+        // Use-after-free simple
+        BUILTIN_PATTERNS.put("use_after_free_simple",
+            "PATTERN use_after_free_simple {\n" +
             "    free($ptr);\n" +
             "    ...;\n" +
             "    *$ptr;\n" +
             "}");
         
-        // Double free
+        // Double free - with negative check (no reassignment between frees)
         BUILTIN_PATTERNS.put("double_free",
             "PATTERN double_free {\n" +
+            "    free($ptr);\n" +
+            "    ... not:$ptr=_;\n" +
+            "    free($ptr);\n" +
+            "}");
+        
+        // Double free simple (without negative check)
+        BUILTIN_PATTERNS.put("double_free_simple",
+            "PATTERN double_free_simple {\n" +
             "    free($ptr);\n" +
             "    ...;\n" +
             "    free($ptr);\n" +
@@ -123,7 +139,12 @@ public class TaintQueryParser {
      * Parse a query string
      */
     public TaintQuery parse(String queryText) throws ParseException {
-        queryText = queryText.trim();
+        // Strip comments first
+        queryText = stripComments(queryText).trim();
+        
+        if (queryText.isEmpty()) {
+            throw new ParseException("Empty query after removing comments");
+        }
         
         // Check if it's a builtin pattern name
         if (BUILTIN_PATTERNS.containsKey(queryText)) {
@@ -133,10 +154,95 @@ public class TaintQueryParser {
         // Check for PATTERN keyword
         if (queryText.toUpperCase().startsWith("PATTERN")) {
             return parseFullPattern(queryText);
-        } else {
-            // Quick pattern - just function call or expression
-            return parseQuickPattern(queryText);
         }
+        
+        // Check for weggli-style inline: {free($ptr); not:$ptr=_; free($ptr);}
+        if (queryText.startsWith("{") && queryText.endsWith("}")) {
+            return parseWeggliStyle(queryText);
+        }
+        
+        // Quick pattern - just function call or expression
+        return parseQuickPattern(queryText);
+    }
+    
+    /**
+     * Strip line comments and block comments from query text
+     */
+    private String stripComments(String text) {
+        StringBuilder result = new StringBuilder();
+        String[] lines = text.split("\n");
+        
+        boolean inBlockComment = false;
+        for (String line : lines) {
+            if (inBlockComment) {
+                int endIdx = line.indexOf("*/");
+                if (endIdx != -1) {
+                    inBlockComment = false;
+                    line = line.substring(endIdx + 2);
+                } else {
+                    continue;  // Skip entire line
+                }
+            }
+            
+            // Remove // comments
+            int lineCommentIdx = line.indexOf("//");
+            if (lineCommentIdx != -1) {
+                line = line.substring(0, lineCommentIdx);
+            }
+            
+            // Handle /* */ on same line
+            while (line.contains("/*")) {
+                int startIdx = line.indexOf("/*");
+                int endIdx = line.indexOf("*/", startIdx + 2);
+                if (endIdx != -1) {
+                    line = line.substring(0, startIdx) + line.substring(endIdx + 2);
+                } else {
+                    line = line.substring(0, startIdx);
+                    inBlockComment = true;
+                    break;
+                }
+            }
+            
+            if (!line.trim().isEmpty()) {
+                result.append(line).append("\n");
+            }
+        }
+        
+        return result.toString();
+    }
+    
+    /**
+     * Parse weggli-style inline pattern: {stmt1; stmt2; ...}
+     */
+    private TaintQuery parseWeggliStyle(String text) throws ParseException {
+        // Remove outer braces
+        String body = text.substring(1, text.length() - 1).trim();
+        
+        // Check for WHERE clause
+        String whereClause = null;
+        int whereIdx = body.toUpperCase().lastIndexOf(" WHERE ");
+        if (whereIdx != -1) {
+            whereClause = body.substring(whereIdx + 7).trim();
+            body = body.substring(0, whereIdx).trim();
+        }
+        
+        List<TaintQuery.PatternElement> elements = parsePatternBody(body);
+        
+        TaintQuery.Constraint constraint = null;
+        if (whereClause != null && !whereClause.isEmpty()) {
+            constraint = parseConstraint(whereClause);
+        }
+        
+        Set<String> boundVars = new HashSet<>();
+        collectBoundVariables(elements, boundVars);
+        
+        return new TaintQuery.Builder()
+            .name("weggli_pattern")
+            .rawPattern(body)
+            .elements(elements)
+            .constraint(constraint)
+            .variables(boundVars)
+            .build();
     }
     
     /**
@@ -233,14 +339,57 @@ public class TaintQueryParser {
     private TaintQuery.PatternElement parseStatement(String stmt) throws ParseException {
         stmt = stmt.trim();
         
-        // Wildcard multi (...)
-        if (stmt.equals("...")) {
-            return new TaintQuery.WildcardMulti();
+        // Wildcard multi with negative patterns (... not:$ptr=_)
+        if (stmt.startsWith("...")) {
+            TaintQuery.WildcardMulti wm = new TaintQuery.WildcardMulti();
+            
+            // Parse any not: clauses
+            String remaining = stmt.substring(3).trim();
+            while (remaining.toLowerCase().startsWith("not:")) {
+                remaining = remaining.substring(4).trim();
+                
+                TaintQuery.NegativePattern neg = new TaintQuery.NegativePattern();
+                
+                // Check for $var=_ pattern (no assignment to var)
+                Pattern assignPattern = Pattern.compile("^(\\$\\w+)\\s*=\\s*_(.*)$");
+                Matcher assignMatcher = assignPattern.matcher(remaining);
+                if (assignMatcher.matches()) {
+                    neg.varName = assignMatcher.group(1);
+                    wm.negatives.add(neg);
+                    remaining = assignMatcher.group(2).trim();
+                    if (remaining.startsWith(";")) {
+                        remaining = remaining.substring(1).trim();
+                    }
+                    continue;
+                }
+                
+                // Check for function call pattern not:free($ptr)
+                Pattern funcPattern = Pattern.compile("^(\\w+\\s*\\([^)]*\\))(.*)$");
+                Matcher funcMatcher = funcPattern.matcher(remaining);
+                if (funcMatcher.matches()) {
+                    neg.pattern = funcMatcher.group(1);
+                    wm.negatives.add(neg);
+                    remaining = funcMatcher.group(2).trim();
+                    if (remaining.startsWith(";")) {
+                        remaining = remaining.substring(1).trim();
+                    }
+                    continue;
+                }
+                
+                break;
+            }
+            
+            return wm;
         }
         
         // Wildcard single (_)
         if (stmt.equals("_")) {
             return new TaintQuery.Wildcard();
+        }
+        
+        // Legacy ... without not:
+        if (stmt.equals("...")) {
+            return new TaintQuery.WildcardMulti();
         }
         
         // Dereference (*$ptr or *$ptr = ...)
