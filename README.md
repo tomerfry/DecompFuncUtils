@@ -10,8 +10,14 @@ A Ghidra extension that enhances the decompiler with C++ reverse engineering uti
 
 ## Features
 
-### 🔷 VTable Handler
-Automatically create and update vtable structures directly from the decompiler view. The plugin scans memory for function pointers and generates properly named struct fields based on the target function names.
+### 🔷 Memory-to-Struct Converter
+Select a memory region in the Listing view and instantly create a struct with automatic field naming based on symbol references.
+
+**Capabilities:**
+- Select any memory range containing pointers
+- Automatically resolves pointer targets to symbols/functions
+- Creates sanitized field names from referenced symbols
+- Applies the new struct at the selection address
 
 ![VTable Demo](vtable_from_mem.gif)
 
@@ -27,15 +33,6 @@ Double-click or use `Ctrl+G` on struct field names in the decompiler to navigate
 
 **Use case:** When analyzing a vtable like `vtable->doSomething`, double-clicking on `doSomething` jumps directly to that function.
 
-### 🔷 Memory-to-Struct Converter
-Select a memory region in the Listing view and instantly create a struct with automatic field naming based on symbol references.
-
-**Capabilities:**
-- Select any memory range containing pointers
-- Automatically resolves pointer targets to symbols/functions
-- Creates sanitized field names from referenced symbols
-- Applies the new struct at the selection address
-
 ### 🔷 Inter-Procedural Taint Analysis
 Advanced data flow analysis using sparse matrix representation for efficient taint propagation across function boundaries.
 
@@ -46,6 +43,14 @@ Advanced data flow analysis using sparse matrix representation for efficient tai
 - Detailed logging panel showing matrices, edges, and propagation steps
 - Custom taint query language for complex analysis patterns
 - Source/sink detection with configurable thresholds
+
+---
+
+**Workflow:**
+- Create better looking decompiled C++ OOP code.
+
+![Class Creation](CPP Reverse Demo.svg)
+
 
 ---
 
