@@ -1,6 +1,6 @@
 # DecompFuncUtils
 
-A powerful Ghidra extension that enhances the decompiler with C++ reverse engineering utilities, including VTable reconstruction, struct field navigation, and inter-procedural taint analysis.
+A Ghidra extension that enhances the decompiler with C++ reverse engineering utilities, including VTable reconstruction, struct field navigation, and inter-procedural taint analysis.
 
 ![Ghidra](https://img.shields.io/badge/Ghidra-11.x-red?style=flat-square)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)
