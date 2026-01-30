@@ -8,7 +8,13 @@ package decompfuncutils;
 import ghidra.app.decompiler.*;
 import ghidra.program.model.pcode.*;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.data.AbstractStringDataType;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.StringDataType;
+import ghidra.program.model.data.TerminatedStringDataType;
 
 import java.util.*;
 
@@ -812,9 +818,129 @@ public class TaintQueryMatcher {
         
         @Override
         public boolean isConstant(Object var) {
-            if (var instanceof Varnode vn) {
-                return vn.isConstant();
+            if (!(var instanceof Varnode vn)) {
+                return false;
             }
+            
+            // Case 1: Direct constant value (like 0xb in strncmp(buf, str, 0xb))
+            if (vn.isConstant()) {
+                return true;
+            }
+            
+            // Case 2: Address-type varnode pointing to constant data
+            if (vn.isAddress()) {
+                Address addr = vn.getAddress();
+                return isAddressInConstantMemory(addr);
+            }
+            
+            // Case 3: Check the defining PcodeOp to see if value comes from constant
+            PcodeOp def = vn.getDef();
+            if (def != null) {
+                int opcode = def.getOpcode();
+                
+                // COPY or PTRSUB from a constant address
+                if (opcode == PcodeOp.COPY || opcode == PcodeOp.PTRSUB) {
+                    Varnode input = def.getInput(0);
+                    if (input != null) {
+                        // Recursively check if input is constant
+                        if (input.isConstant()) {
+                            // The constant might be an address - check it
+                            long offset = input.getOffset();
+                            Address addr = highFunc.getFunction().getProgram()
+                                .getAddressFactory().getDefaultAddressSpace().getAddress(offset);
+                            if (isAddressInConstantMemory(addr)) {
+                                return true;
+                            }
+                        }
+                        // Also check if input is itself pointing to constant memory
+                        if (isConstant(input)) {
+                            return true;
+                        }
+                    }
+                }
+                
+                // LOAD from constant address (reading string pointer from GOT, etc.)
+                if (opcode == PcodeOp.LOAD) {
+                    Varnode addrInput = def.getInput(1);
+                    if (addrInput != null && addrInput.isConstant()) {
+                        long offset = addrInput.getOffset();
+                        Address addr = highFunc.getFunction().getProgram()
+                            .getAddressFactory().getDefaultAddressSpace().getAddress(offset);
+                        if (isAddressInConstantMemory(addr)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            
+            // Case 4: Check HighVariable for additional info
+            HighVariable hv = vn.getHigh();
+            if (hv != null) {
+                // Check if it's a global constant
+                if (hv instanceof HighGlobal hg) {
+                    HighSymbol highSym = hg.getSymbol();
+                    if (highSym != null) {
+                        Address symAddr = highSym.getStorage().getMinAddress();
+                        if (symAddr != null && isAddressInConstantMemory(symAddr)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            
+            return false;
+        }
+        
+        /**
+         * Check if an address points to constant/read-only memory
+         * (e.g., .rodata, .text, or defined string data)
+         */
+        private boolean isAddressInConstantMemory(Address addr) {
+            if (addr == null) return false;
+            
+            Program prog = highFunc.getFunction().getProgram();
+            Memory memory = prog.getMemory();
+            MemoryBlock block = memory.getBlock(addr);
+            
+            if (block != null) {
+                // Check if block is read-only (not writable)
+                if (!block.isWrite()) {
+                    return true;
+                }
+                
+                // Check common constant section names
+                String name = block.getName().toLowerCase();
+                if (name.contains("rodata") || name.contains("const") || 
+                    name.equals(".text") || name.contains("string") ||
+                    name.equals(".rdata")) {
+                    return true;
+                }
+            }
+            
+            // Check if there's defined data at this address
+            Listing listing = prog.getListing();
+            Data data = listing.getDataAt(addr);
+            if (data != null) {
+                DataType dt = data.getDataType();
+                // String types are constants
+                if (dt instanceof StringDataType || 
+                    dt instanceof TerminatedStringDataType ||
+                    dt instanceof AbstractStringDataType) {
+                    return true;
+                }
+            }
+            
+            // Check for defined strings that might not have exact Data at addr
+            Data containingData = listing.getDataContaining(addr);
+            if (containingData != null) {
+                DataType dt = containingData.getDataType();
+                if (dt instanceof StringDataType || 
+                    dt instanceof TerminatedStringDataType ||
+                    dt instanceof AbstractStringDataType) {
+                    return true;
+                }
+            }
+            
             return false;
         }
         
