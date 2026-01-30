@@ -410,30 +410,94 @@ public class TaintQueryMatcher {
     
     /**
      * Match a dereference pattern
+     * 
+     * This checks if the statement dereferences the EXACT pointer that was bound.
+     * For UAF detection, we need to ensure that the pointer being dereferenced
+     * is the same as what was freed, not just a related pointer.
      */
     private boolean matchDereference(TaintQuery.Dereference deref, ClangStatement stmt,
                                      HighFunction highFunc, Map<String, Object> bindings) {
-        String stmtText = extractCodeText(stmt);
-        if (!stmtText.contains("*")) return false;
-        
         // Check if dereferencing the bound variable
         Object boundVar = bindings.get(deref.ptrVar);
-        if (boundVar == null) return true;  // Not yet bound, will bind later
+        if (boundVar == null) return false;  // Must have a bound variable to match
         
-        if (boundVar instanceof Varnode targetVn) {
-            // Check P-Code for LOAD operations on this varnode
-            Address stmtAddr = stmt.getMinAddress();
-            if (stmtAddr == null) return false;
+        if (!(boundVar instanceof Varnode targetVn)) return false;
+        
+        Address stmtAddr = stmt.getMinAddress();
+        if (stmtAddr == null) return false;
+        
+        // Check P-Code for LOAD or STORE operations that use the exact pointer
+        Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            int opcode = op.getOpcode();
             
-            Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
-            while (ops.hasNext()) {
-                PcodeOpAST op = ops.next();
-                if (op.getOpcode() == PcodeOp.LOAD) {
-                    Varnode ptr = op.getInput(1);
-                    if (ptr != null && varnodeMatches(ptr, targetVn)) {
-                        return true;
-                    }
+            // LOAD: reading through a pointer (*ptr on right side)
+            if (opcode == PcodeOp.LOAD) {
+                Varnode ptr = op.getInput(1);
+                if (ptr != null && varnodeMatchesExact(ptr, targetVn, highFunc)) {
+                    return true;
                 }
+            }
+            
+            // STORE: writing through a pointer (*ptr on left side, or ptr->field = x)
+            if (opcode == PcodeOp.STORE) {
+                Varnode ptr = op.getInput(1);
+                if (ptr != null && varnodeMatchesExact(ptr, targetVn, highFunc)) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Strict varnode matching for UAF/double-free detection.
+     * 
+     * This is more strict than varnodeMatches() - it checks that the pointers
+     * are semantically equivalent, not just that they share a high variable.
+     * 
+     * For example: local_10->obj and local_10 should NOT match, even though
+     * they're related. The freed pointer was local_10->obj (a field load),
+     * and accessing local_10->field is accessing a different memory location.
+     */
+    private boolean varnodeMatchesExact(Varnode a, Varnode b, HighFunction highFunc) {
+        // Direct equality
+        if (a.equals(b)) return true;
+        
+        // Check if they resolve to the same high variable AND same offset
+        HighVariable hvA = a.getHigh();
+        HighVariable hvB = b.getHigh();
+        
+        if (hvA != null && hvB != null) {
+            // Must be the exact same high variable
+            if (!hvA.equals(hvB)) return false;
+            
+            // Check if both varnodes are the representative (main) varnode
+            // or if they have the same defining operation
+            Varnode repA = hvA.getRepresentative();
+            Varnode repB = hvB.getRepresentative();
+            
+            if (repA != null && repB != null && repA.equals(repB)) {
+                return true;
+            }
+        }
+        
+        // Check by tracing definitions - if both come from the same computation
+        PcodeOp defA = a.getDef();
+        PcodeOp defB = b.getDef();
+        
+        if (defA != null && defB != null) {
+            // If both are defined by the same operation, they're the same value
+            if (defA.equals(defB)) return true;
+            
+            // If one is a field load (LOAD) and the other is the base pointer, they're DIFFERENT
+            // This handles the case: free(ptr->obj) followed by ptr->field = x
+            // ptr->obj and ptr are different even though ptr is involved in both
+            if (defA.getOpcode() == PcodeOp.LOAD || defB.getOpcode() == PcodeOp.LOAD) {
+                // One is loaded from memory, need exact match
+                return false;
             }
         }
         
@@ -487,6 +551,11 @@ public class TaintQueryMatcher {
     
     /**
      * Match a function call pattern against a statement
+     * 
+     * When a variable like $ptr is already bound (from a previous pattern element),
+     * this method verifies that the argument in this call matches the bound value.
+     * This is critical for double-free detection: free($ptr) ... free($ptr)
+     * must verify both calls free the SAME pointer.
      */
     private boolean matchFunctionCall(TaintQuery.FunctionCall fc, ClangStatement stmt,
                                       HighFunction highFunc, Map<String, Object> bindings) {
@@ -498,12 +567,18 @@ public class TaintQueryMatcher {
         
         // Check function name
         if (fc.funcName.startsWith("$")) {
-            bindings.put(fc.funcName, calledName);
+            // Variable function name - check if already bound
+            Object boundFunc = bindings.get(fc.funcName);
+            if (boundFunc != null) {
+                if (!calledName.equals(boundFunc)) return false;
+            } else {
+                bindings.put(fc.funcName, calledName);
+            }
         } else if (!calledName.equals(fc.funcName) && !calledName.contains(fc.funcName)) {
             return false;
         }
         
-        // Find and bind arguments
+        // Find and bind/verify arguments
         PcodeOp callOp = findCallPcodeOp(funcToken, highFunc);
         if (callOp != null) {
             Varnode[] inputs = callOp.getInputs();
@@ -512,7 +587,22 @@ public class TaintQueryMatcher {
                 if (argPattern.equals("...")) break;
                 
                 if (argPattern.startsWith("$")) {
-                    bindings.put(argPattern, inputs[i + 1]);
+                    Varnode currentArg = inputs[i + 1];
+                    Object boundArg = bindings.get(argPattern);
+                    
+                    if (boundArg != null) {
+                        // Variable already bound - verify this argument matches
+                        if (boundArg instanceof Varnode boundVn) {
+                            if (!varnodeMatchesExact(currentArg, boundVn, highFunc)) {
+                                return false;  // Arguments don't match - not a true double-free/UAF
+                            }
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        // First binding of this variable
+                        bindings.put(argPattern, currentArg);
+                    }
                 }
             }
         }
