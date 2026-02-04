@@ -15,6 +15,15 @@ import ghidra.program.model.data.AbstractStringDataType;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.StringDataType;
 import ghidra.program.model.data.TerminatedStringDataType;
+import ghidra.program.model.symbol.ExternalLocation;
+import ghidra.program.model.symbol.ExternalLocationIterator;
+import ghidra.program.model.symbol.ExternalManager;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceIterator;
+import ghidra.program.model.symbol.ReferenceManager;
+import ghidra.program.model.symbol.SymbolTable;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
 
 import java.util.*;
 
@@ -87,26 +96,69 @@ public class TaintQueryMatcher {
         
         return matches;
     }
-    
+
     /**
-     * Search for pattern matches across all functions
+     * Search for pattern matches across all functions (OPTIMIZED)
+     * 
+     * Uses xref-based filtering with fallback to reference scanning.
      */
     public List<QueryMatch> matchInAllFunctions(TaintQuery query, DecompInterface decompiler,
-                                                 ghidra.util.task.TaskMonitor monitor) {
+                                                ghidra.util.task.TaskMonitor monitor) {
         matches.clear();
         
         FunctionManager fm = program.getFunctionManager();
-        FunctionIterator funcs = fm.getFunctions(true);
+        
+        // Optimization: Extract concrete function names and filter by xrefs
+        Set<String> concreteFuncs = extractConcreteFunctionNames(query);
+        Set<Function> candidateFunctions;
+        
+        if (!concreteFuncs.isEmpty()) {
+            logPanel.logInfo("Pattern references concrete functions: " + concreteFuncs);
+            
+            // Try xref-based lookup first
+            candidateFunctions = getFunctionsWithXrefsTo(concreteFuncs);
+            
+            // If no results, try the fallback approach
+            if (candidateFunctions.isEmpty()) {
+                logPanel.logInfo("Xref lookup found no results, trying reference scan...");
+                candidateFunctions = getFunctionsCallingByName(concreteFuncs, decompiler, monitor);
+            }
+            
+            logPanel.logInfo("Optimization: Analyzing " + candidateFunctions.size() + 
+                            " functions (filtered by calls to " + concreteFuncs + ")");
+            
+            if (candidateFunctions.isEmpty()) {
+                logPanel.logWarning("No functions found that call " + concreteFuncs);
+                // Fall back to analyzing all functions
+                logPanel.logInfo("Falling back to full analysis...");
+                FunctionIterator allFuncs = fm.getFunctions(true);
+                candidateFunctions = new HashSet<>();
+                while (allFuncs.hasNext()) {
+                    candidateFunctions.add(allFuncs.next());
+                }
+            }
+        } else {
+            // No concrete functions in pattern - must analyze all functions
+            logPanel.logInfo("Pattern uses only variable function names - analyzing all functions");
+            candidateFunctions = new HashSet<>();
+            FunctionIterator allFuncs = fm.getFunctions(true);
+            while (allFuncs.hasNext()) {
+                candidateFunctions.add(allFuncs.next());
+            }
+        }
         
         int funcCount = 0;
+        int totalFuncs = candidateFunctions.size();
         int matchCount = 0;
         
-        while (funcs.hasNext() && !monitor.isCancelled()) {
-            Function func = funcs.next();
+        for (Function func : candidateFunctions) {
+            if (monitor.isCancelled()) break;
+            
             funcCount++;
             
-            if (funcCount % 100 == 0) {
-                monitor.setMessage("Searching... " + funcCount + " functions, " + matchCount + " matches");
+            if (funcCount % 50 == 0 || funcCount == totalFuncs) {
+                monitor.setMessage("Searching... " + funcCount + "/" + totalFuncs + 
+                                " functions, " + matchCount + " matches");
             }
             
             // Decompile
@@ -128,7 +180,31 @@ public class TaintQueryMatcher {
         
         return matches;
     }
-    
+
+
+    /**
+     * Get statistics about how effective the xref filtering would be for a query.
+     * Useful for debugging/logging.
+     */
+    public String getOptimizationStats(TaintQuery query) {
+        Set<String> concreteFuncs = extractConcreteFunctionNames(query);
+        
+        if (concreteFuncs.isEmpty()) {
+            return "No optimization possible - pattern uses only variable function names";
+        }
+        
+        Set<Function> candidates = getFunctionsWithXrefsTo(concreteFuncs);
+        int totalFuncs = program.getFunctionManager().getFunctionCount();
+        
+        double reduction = totalFuncs > 0 ? 
+            (1.0 - ((double) candidates.size() / totalFuncs)) * 100 : 0;
+        
+        return String.format(
+            "Pattern references %s: %d/%d functions to analyze (%.1f%% reduction)",
+            concreteFuncs, candidates.size(), totalFuncs, reduction
+        );
+    }
+
     /**
      * Search for pattern matches in a single function with pre-provided markup
      */
@@ -151,19 +227,333 @@ public class TaintQueryMatcher {
     }
     
     /**
+     * Extract concrete (non-variable) function names from a query pattern.
+     * 
+     * For example, from pattern:
+     *   PATTERN uaf {
+     *       free($ptr);
+     *       ...;
+     *       *$ptr;
+     *   }
+     * 
+     * This extracts: ["free"]
+     * 
+     * Variable function names like "$func" are ignored since they match anything.
+     */
+    private Set<String> extractConcreteFunctionNames(TaintQuery query) {
+        Set<String> concreteNames = new HashSet<>();
+        
+        for (TaintQuery.PatternElement elem : query.getPatternElements()) {
+            if (elem instanceof TaintQuery.FunctionCall fc) {
+                // Only add non-variable function names
+                if (!fc.funcName.startsWith("$")) {
+                    concreteNames.add(fc.funcName);
+                }
+            }
+            else if (elem instanceof TaintQuery.Assignment assign) {
+                // Check RHS for function calls like "$ptr = malloc($size)"
+                String rhs = assign.rhs;
+                if (rhs != null && rhs.contains("(") && !rhs.startsWith("$")) {
+                    // Extract function name from "funcname(...)"
+                    int parenIdx = rhs.indexOf('(');
+                    if (parenIdx > 0) {
+                        String funcName = rhs.substring(0, parenIdx).trim();
+                        if (!funcName.startsWith("$")) {
+                            concreteNames.add(funcName);
+                        }
+                    }
+                }
+            }
+        }
+        
+        return concreteNames;
+    }
+
+    /**
+     * Match a function call argument against a pattern.
+     * 
+     * Handles:
+     * - Simple variables: "$x" matches any argument
+     * - Binary expressions: "$a * $b" requires INT_MULT operation
+     * - Constants: literal values must match
+     */
+    private boolean matchArgument(String argPattern, Varnode actualArg, 
+                                HighFunction highFunc, Map<String, Object> bindings) {
+        argPattern = argPattern.trim();
+        
+        // Check for binary operation patterns: $a * $b, $a + $b, etc.
+        java.util.regex.Pattern binOpPattern = java.util.regex.Pattern.compile(
+            "^(\\$\\w+)\\s*([+\\-*/%])\\s*(\\$\\w+)$");
+        java.util.regex.Matcher binOpMatcher = binOpPattern.matcher(argPattern);
+        
+        if (binOpMatcher.matches()) {
+            String leftVar = binOpMatcher.group(1);
+            String operator = binOpMatcher.group(2);
+            String rightVar = binOpMatcher.group(3);
+            
+            // The actual argument must be the result of the matching operation
+            PcodeOp defOp = actualArg.getDef();
+            if (defOp == null) {
+                return false;  // Argument isn't defined by an operation
+            }
+            
+            int expectedOpcode = getOpcodeForOperator(operator);
+            if (defOp.getOpcode() != expectedOpcode) {
+                return false;  // Wrong operation type
+            }
+            
+            // Bind the operands
+            Varnode input0 = defOp.getInput(0);
+            Varnode input1 = defOp.getInput(1);
+            
+            if (input0 == null || input1 == null) {
+                return false;
+            }
+            
+            bindings.put(leftVar, input0);
+            bindings.put(rightVar, input1);
+            return true;
+        }
+        
+        // Simple variable pattern: $x
+        if (argPattern.startsWith("$")) {
+            Object existing = bindings.get(argPattern);
+            if (existing != null) {
+                // Already bound - verify it matches
+                if (existing instanceof Varnode) {
+                    return varnodeMatchesExact(actualArg, (Varnode) existing, highFunc);
+                }
+                return false;
+            }
+            bindings.put(argPattern, actualArg);
+            return true;
+        }
+        
+        // Wildcard
+        if (argPattern.equals("_")) {
+            return true;
+        }
+        
+        // Literal/constant - would need value comparison
+        return true;  // For now, accept
+    }
+
+    /**
+     * Find all functions that have xrefs (calls) to any of the target functions.
+     * 
+     * This improved version handles:
+     * - Multiple symbols with the same name
+     * - Thunk functions
+     * - PLT/external entries
+     * - Function name variants
+     * 
+     * @param targetFuncNames Set of function names to look for (e.g., {"malloc", "free"})
+     * @return Set of functions that call at least one of the target functions
+     */
+    private Set<Function> getFunctionsWithXrefsTo(Set<String> targetFuncNames) {
+        Set<Function> callingFunctions = new HashSet<>();
+        
+        if (targetFuncNames.isEmpty()) {
+            return callingFunctions;
+        }
+        
+        FunctionManager funcMgr = program.getFunctionManager();
+        SymbolTable symbolTable = program.getSymbolTable();
+        ReferenceManager refMgr = program.getReferenceManager();
+        ExternalManager extMgr = program.getExternalManager();
+        
+        // Collect all addresses that represent the target functions
+        Set<Address> targetAddresses = new HashSet<>();
+        
+        for (String targetName : targetFuncNames) {
+            // Get all variants of the function name
+            List<String> variants = getFunctionNameVariants(targetName);
+            
+            for (String name : variants) {
+                // 1. Find all symbols with this name (functions, labels, etc.)
+                SymbolIterator symbols = symbolTable.getSymbols(name);
+                while (symbols.hasNext()) {
+                    Symbol sym = symbols.next();
+                    targetAddresses.add(sym.getAddress());
+                    logPanel.logInfo("  Found symbol '" + name + "' at " + sym.getAddress() + 
+                                " (type: " + sym.getSymbolType() + ")");
+                }
+                
+                // 2. Find external functions with this name
+                // These might not have regular symbols but are called via PLT/GOT
+                ExternalLocationIterator extLocIter = extMgr.getExternalLocations(name);
+                while (extLocIter.hasNext()) {
+                    ExternalLocation extLoc = extLocIter.next();
+                    Address extAddr = extLoc.getAddress();
+                    if (extAddr != null) {
+                        targetAddresses.add(extAddr);
+                        logPanel.logInfo("  Found external '" + name + "' at " + extAddr);
+                    }
+                    // Also get the thunk address if there is one
+                    Function extFunc = extLoc.getFunction();
+                    if (extFunc != null) {
+                        // Get all thunks pointing to this external
+                        Address[] thunkAddrs = extFunc.getFunctionThunkAddresses(true);
+                        if (thunkAddrs != null) {
+                            for (Address thunkAddr : thunkAddrs) {
+                                targetAddresses.add(thunkAddr);
+                                logPanel.logInfo("  Found thunk for '" + name + "' at " + thunkAddr);
+                            }
+                        }
+                    }
+                }
+                
+                // 3. Find functions by name directly (catches named functions)
+                FunctionIterator funcIter = funcMgr.getFunctions(true);
+                while (funcIter.hasNext()) {
+                    Function func = funcIter.next();
+                    if (func.getName().equals(name) || 
+                        func.getName().equals(name + "@PLT") ||
+                        func.getName().startsWith(name + "@")) {
+                        targetAddresses.add(func.getEntryPoint());
+                        logPanel.logInfo("  Found function '" + func.getName() + "' at " + 
+                                    func.getEntryPoint());
+                    }
+                }
+            }
+        }
+        
+        logPanel.logInfo("Total target addresses to check for xrefs: " + targetAddresses.size());
+        
+        // Now find all functions that reference any of these addresses
+        for (Address targetAddr : targetAddresses) {
+            ReferenceIterator refs = refMgr.getReferencesTo(targetAddr);
+            
+            while (refs.hasNext()) {
+                Reference ref = refs.next();
+                Address fromAddr = ref.getFromAddress();
+                
+                // Find the function containing this reference
+                Function callingFunc = funcMgr.getFunctionContaining(fromAddr);
+                if (callingFunc != null) {
+                    // Don't include the target function itself (avoid self-reference from thunks)
+                    if (!targetAddresses.contains(callingFunc.getEntryPoint())) {
+                        callingFunctions.add(callingFunc);
+                    }
+                }
+            }
+        }
+        
+        return callingFunctions;
+    }
+
+    /**
+     * Get common variants of a function name that should also be matched.
+     * This corresponds to the matchFunctionName() logic.
+     */
+    private List<String> getFunctionNameVariants(String baseName) {
+        List<String> variants = new ArrayList<>();
+        variants.add(baseName);
+        variants.add("__wrap_" + baseName);   // Linker wrapper
+        variants.add(baseName + "_s");         // Safe variant (e.g., strcpy_s)
+        variants.add("__" + baseName);         // Internal variant
+        variants.add("_" + baseName);          // Single underscore prefix
+        variants.add(baseName + "@PLT");       // PLT entry (ELF)
+        variants.add("__imp_" + baseName);     // Import entry (PE/Windows)
+        variants.add(baseName + "_impl");      // Implementation variant
+        return variants;
+    }
+
+
+    /**
+     * Alternative implementation: Instead of relying on xrefs, scan all functions
+     * and check if they contain calls to functions with matching names.
+     * 
+     * This is slower but more reliable as it doesn't depend on xref accuracy.
+     */
+    private Set<Function> getFunctionsCallingByName(Set<String> targetFuncNames, 
+                                                    DecompInterface decompiler,
+                                                    ghidra.util.task.TaskMonitor monitor) {
+        Set<Function> callingFunctions = new HashSet<>();
+        Set<String> allVariants = new HashSet<>();
+        
+        // Build complete set of name variants to look for
+        for (String name : targetFuncNames) {
+            allVariants.addAll(getFunctionNameVariants(name));
+        }
+        
+        FunctionManager funcMgr = program.getFunctionManager();
+        FunctionIterator funcs = funcMgr.getFunctions(true);
+        
+        int count = 0;
+        while (funcs.hasNext() && !monitor.isCancelled()) {
+            Function func = funcs.next();
+            count++;
+            
+            if (count % 500 == 0) {
+                monitor.setMessage("Pre-filtering functions... " + count);
+            }
+            
+            // Quick check: does this function have any CALL references to our targets?
+            // This uses the reference manager but checks FROM this function
+            Address start = func.getEntryPoint();
+            Address end = func.getBody().getMaxAddress();
+            
+            ReferenceIterator refs = program.getReferenceManager().getReferenceIterator(start);
+            while (refs.hasNext()) {
+                Reference ref = refs.next();
+                if (ref.getFromAddress().compareTo(end) > 0) break;
+                
+                if (ref.getReferenceType().isCall()) {
+                    // Get the target of this call
+                    Address toAddr = ref.getToAddress();
+                    Function targetFunc = funcMgr.getFunctionAt(toAddr);
+                    
+                    if (targetFunc != null) {
+                        String targetName = targetFunc.getName();
+                        // Check if target name matches any of our variants
+                        for (String variant : allVariants) {
+                            if (targetName.equals(variant) || 
+                                targetName.contains(variant) ||
+                                variant.contains(targetName)) {
+                                callingFunctions.add(func);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Also check symbol at target address
+                    Symbol sym = program.getSymbolTable().getPrimarySymbol(toAddr);
+                    if (sym != null) {
+                        String symName = sym.getName();
+                        for (String variant : allVariants) {
+                            if (symName.equals(variant) || 
+                                symName.startsWith(variant + "@")) {
+                                callingFunctions.add(func);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return callingFunctions;
+    }
+
+    /**
      * Recursively search for pattern matches in token tree
+     * 
+     * NOTE: For multi-element patterns, we only use checkStatementMatch which properly
+     * validates the full pattern sequence. checkFunctionCallMatch is only used for
+     * single-element function call patterns.
      */
     private void searchInTokens(TaintQuery query, ClangNode node, HighFunction highFunc,
                                 TaintContextImpl taintCtx, List<ClangToken> context) {
         
-        // Check if this subtree could match the pattern
+        // Check statement-level patterns (handles both single and multi-element patterns)
         if (node instanceof ClangStatement stmt) {
-            // Check statement-level patterns
             checkStatementMatch(query, stmt, highFunc, taintCtx);
         }
         
-        // For function calls, check call-level patterns
-        if (node instanceof ClangFuncNameToken funcToken) {
+        // For single-element function call patterns only, also check at token level
+        // This prevents multi-element patterns from matching individual function calls
+        if (node instanceof ClangFuncNameToken funcToken && isSingleFunctionCallPattern(query)) {
             checkFunctionCallMatch(query, funcToken, highFunc, taintCtx);
         }
         
@@ -174,12 +564,21 @@ public class TaintQueryMatcher {
             }
         }
     }
-    
+
+    /**
+     * Check if the query is a single function call pattern (no other elements)
+     */
+    private boolean isSingleFunctionCallPattern(TaintQuery query) {
+        List<TaintQuery.PatternElement> elements = query.getPatternElements();
+        return elements.size() == 1 && 
+            elements.get(0) instanceof TaintQuery.FunctionCall;
+    }
+
     /**
      * Check if a statement matches the pattern
      */
     private void checkStatementMatch(TaintQuery query, ClangStatement stmt, 
-                                     HighFunction highFunc, TaintContextImpl taintCtx) {
+                                    HighFunction highFunc, TaintContextImpl taintCtx) {
         
         // Extract information from the statement
         TokenContextImpl ctx = new TokenContextImpl(stmt, highFunc);
@@ -208,27 +607,43 @@ public class TaintQueryMatcher {
             }
         }
         
-        // For multi-element patterns (like UAF, double-free)
+        // For multi-element patterns (like UAF, double-free, int-overflow-malloc)
         // Check if this statement could be the START of a multi-element pattern
         if (elements.size() >= 2) {
             TaintQuery.PatternElement firstElem = elements.get(0);
+            
+            // Handle patterns starting with FunctionCall (e.g., free($ptr); ...; free($ptr))
             if (firstElem instanceof TaintQuery.FunctionCall fc) {
                 if (matchFunctionCall(fc, stmt, highFunc, bindings)) {
                     // This matches the first element - search for rest of pattern
                     searchMultiElementPattern(query, stmt, highFunc, taintCtx, bindings, 1);
                 }
             }
+            
+            // Handle patterns starting with Assignment (e.g., $size = $a * $b; malloc($size))
+            else if (firstElem instanceof TaintQuery.Assignment assign) {
+                if (matchAssignmentWithExpression(assign, stmt, highFunc, bindings)) {
+                    // This matches the first element - search for rest of pattern
+                    searchMultiElementPattern(query, stmt, highFunc, taintCtx, bindings, 1);
+                }
+            }
         }
     }
-    
+
     /**
      * Search for remaining elements of a multi-element pattern
      */
     private void searchMultiElementPattern(TaintQuery query, ClangStatement startStmt,
-                                           HighFunction highFunc, TaintContextImpl taintCtx,
-                                           Map<String, Object> bindings, int elementIdx) {
+                                        HighFunction highFunc, TaintContextImpl taintCtx,
+                                        Map<String, Object> bindings, int elementIdx) {
         
         List<TaintQuery.PatternElement> elements = query.getPatternElements();
+
+        logPanel.logInfo("Pattern has " + elements.size() + " elements:");
+        for (int i = 0; i < elements.size(); i++) {
+            logPanel.logInfo("  [" + i + "] " + elements.get(i).getClass().getSimpleName() + ": " + elements.get(i));
+        }
+
         if (elementIdx >= elements.size()) {
             // All elements matched!
             if (query.getConstraint().evaluate(bindings, taintCtx)) {
@@ -263,6 +678,8 @@ public class TaintQueryMatcher {
                 boolean matches = false;
                 if (nextElem instanceof TaintQuery.FunctionCall fc) {
                     matches = matchFunctionCall(fc, candidateStmt, highFunc, newBindings);
+                } else if (nextElem instanceof TaintQuery.Assignment assign) {
+                    matches = matchAssignmentWithExpression(assign, candidateStmt, highFunc, newBindings);
                 } else if (nextElem instanceof TaintQuery.Dereference deref) {
                     matches = matchDereference(deref, candidateStmt, highFunc, newBindings);
                 }
@@ -273,24 +690,36 @@ public class TaintQueryMatcher {
                     if (checkNegativePatterns(wm.negatives, between, newBindings, highFunc)) {
                         // Negative patterns satisfied - continue matching
                         searchMultiElementPattern(query, startStmt, highFunc, taintCtx, 
-                                                 newBindings, elementIdx + 2);
+                                                newBindings, elementIdx + 2);
                     }
                 }
             }
         }
-        // Handle regular elements
+        // Handle regular FunctionCall elements
         else if (currentElem instanceof TaintQuery.FunctionCall fc) {
             List<ClangStatement> remaining = getStatementsAfter(startStmt, highFunc);
             for (ClangStatement stmt : remaining) {
                 Map<String, Object> newBindings = new HashMap<>(bindings);
                 if (matchFunctionCall(fc, stmt, highFunc, newBindings)) {
                     searchMultiElementPattern(query, startStmt, highFunc, taintCtx,
-                                             newBindings, elementIdx + 1);
+                                            newBindings, elementIdx + 1);
+                }
+            }
+        }
+        // Handle Assignment elements in multi-element patterns
+        else if (currentElem instanceof TaintQuery.Assignment assign) {
+            List<ClangStatement> remaining = getStatementsAfter(startStmt, highFunc);
+            for (ClangStatement stmt : remaining) {
+                Map<String, Object> newBindings = new HashMap<>(bindings);
+                if (matchAssignmentWithExpression(assign, stmt, highFunc, newBindings)) {
+                    searchMultiElementPattern(query, startStmt, highFunc, taintCtx,
+                                            newBindings, elementIdx + 1);
                 }
             }
         }
     }
-    
+
+
     /**
      * Check that negative patterns are NOT present in the given statements
      */
@@ -503,52 +932,110 @@ public class TaintQueryMatcher {
         
         return false;
     }
-    
+
     /**
-     * Check if a function call token matches the pattern
+     * Check if a function call token matches the pattern.
+     * 
+     * IMPORTANT: This method is now ONLY called for single-element function call patterns.
+     * Multi-element patterns are handled entirely through checkStatementMatch and
+     * searchMultiElementPattern to ensure proper pattern sequence validation.
      */
     private void checkFunctionCallMatch(TaintQuery query, ClangFuncNameToken funcToken,
                                         HighFunction highFunc, TaintContextImpl taintCtx) {
         
         List<TaintQuery.PatternElement> elements = query.getPatternElements();
         
-        for (TaintQuery.PatternElement elem : elements) {
-            if (elem instanceof TaintQuery.FunctionCall fc) {
-                Map<String, Object> bindings = new HashMap<>();
+        // Only process single-element function call patterns here
+        // Multi-element patterns are handled in checkStatementMatch
+        if (elements.size() != 1 || !(elements.get(0) instanceof TaintQuery.FunctionCall fc)) {
+            return;
+        }
+        
+        Map<String, Object> bindings = new HashMap<>();
+        String calledName = funcToken.getText();
+        
+        // Check function name match - use strict matching
+        if (!matchFunctionName(calledName, fc.funcName, bindings)) {
+            return;
+        }
+        
+        // Try to get arguments from P-Code
+        PcodeOp callOp = findCallPcodeOp(funcToken, highFunc);
+        if (callOp != null) {
+            Varnode[] inputs = callOp.getInputs();
+            
+            boolean argsMatch = true;
+            for (int i = 0; i < fc.args.size() && i + 1 < inputs.length; i++) {
+                String argPattern = fc.args.get(i);
+                if (argPattern.equals("...")) break;
                 
-                String calledName = funcToken.getText();
+                Varnode currentArg = inputs[i + 1];
                 
-                // Check function name match
-                if (fc.funcName.startsWith("$")) {
-                    bindings.put(fc.funcName, calledName);
-                } else if (!calledName.equals(fc.funcName) && !calledName.contains(fc.funcName)) {
-                    continue;
+                if (!matchArgument(argPattern, currentArg, highFunc, bindings)) {
+                    argsMatch = false;
+                    break;  // Stop checking arguments
                 }
-                
-                // Try to get arguments from P-Code
-                PcodeOp callOp = findCallPcodeOp(funcToken, highFunc);
-                if (callOp != null) {
-                    Varnode[] inputs = callOp.getInputs();
-                    
-                    // Bind arguments
-                    for (int i = 0; i < fc.args.size() && i + 1 < inputs.length; i++) {
-                        String argPattern = fc.args.get(i);
-                        if (argPattern.equals("...")) break;
-                        
-                        if (argPattern.startsWith("$")) {
-                            bindings.put(argPattern, inputs[i + 1]);  // +1 because input[0] is target
-                        }
-                    }
-                    
-                    // Check constraints
-                    if (query.getConstraint().evaluate(bindings, taintCtx)) {
-                        addMatch(query, funcToken, highFunc, bindings, callOp);
-                    }
-                }
+            }
+
+            if (!argsMatch) {
+                return;  // Exit the void method, no match
+            }
+
+            // Continue with constraint checking...
+            if (query.getConstraint().evaluate(bindings, taintCtx)) {
+                addMatch(query, funcToken, highFunc, bindings, callOp);
             }
         }
     }
-    
+
+    /**
+     * Match function name with strict rules.
+     * 
+     * Matching rules:
+     * - If pattern is a variable ($func), bind to any function name
+     * - If pattern is a literal, require exact match OR common wrapper patterns:
+     *   - __wrap_X matches X (linker wrapper)
+     *   - X_s matches X (safe variant like strcpy_s)
+     *   - __X matches X (internal variant)
+     * 
+     * This prevents false positives like av_mallocz matching malloc.
+     */
+    private boolean matchFunctionName(String calledName, String patternName, Map<String, Object> bindings) {
+        // Variable function name - bind to anything
+        if (patternName.startsWith("$")) {
+            Object boundFunc = bindings.get(patternName);
+            if (boundFunc != null) {
+                return calledName.equals(boundFunc);
+            }
+            bindings.put(patternName, calledName);
+            return true;
+        }
+        
+        // Exact match
+        if (calledName.equals(patternName)) {
+            return true;
+        }
+        
+        // Common wrapper patterns (strict)
+        // __wrap_malloc -> matches malloc
+        if (calledName.equals("__wrap_" + patternName)) {
+            return true;
+        }
+        
+        // malloc_s -> matches malloc (safe variants)
+        if (calledName.equals(patternName + "_s")) {
+            return true;
+        }
+        
+        // __malloc -> matches malloc (internal variants)
+        if (calledName.equals("__" + patternName)) {
+            return true;
+        }
+        
+        // No match - reject things like av_mallocz for malloc
+        return false;
+    }
+
     /**
      * Match a function call pattern against a statement
      * 
@@ -558,23 +1045,15 @@ public class TaintQueryMatcher {
      * must verify both calls free the SAME pointer.
      */
     private boolean matchFunctionCall(TaintQuery.FunctionCall fc, ClangStatement stmt,
-                                      HighFunction highFunc, Map<String, Object> bindings) {
+                                    HighFunction highFunc, Map<String, Object> bindings) {
         // Find function name token in statement
         ClangFuncNameToken funcToken = findFuncNameToken(stmt);
         if (funcToken == null) return false;
         
         String calledName = funcToken.getText();
         
-        // Check function name
-        if (fc.funcName.startsWith("$")) {
-            // Variable function name - check if already bound
-            Object boundFunc = bindings.get(fc.funcName);
-            if (boundFunc != null) {
-                if (!calledName.equals(boundFunc)) return false;
-            } else {
-                bindings.put(fc.funcName, calledName);
-            }
-        } else if (!calledName.equals(fc.funcName) && !calledName.contains(fc.funcName)) {
+        // Check function name with strict matching
+        if (!matchFunctionName(calledName, fc.funcName, bindings)) {
             return false;
         }
         
@@ -586,30 +1065,176 @@ public class TaintQueryMatcher {
                 String argPattern = fc.args.get(i);
                 if (argPattern.equals("...")) break;
                 
-                if (argPattern.startsWith("$")) {
-                    Varnode currentArg = inputs[i + 1];
-                    Object boundArg = bindings.get(argPattern);
-                    
-                    if (boundArg != null) {
-                        // Variable already bound - verify this argument matches
-                        if (boundArg instanceof Varnode boundVn) {
-                            if (!varnodeMatchesExact(currentArg, boundVn, highFunc)) {
-                                return false;  // Arguments don't match - not a true double-free/UAF
-                            }
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        // First binding of this variable
-                        bindings.put(argPattern, currentArg);
-                    }
+                Varnode currentArg = inputs[i + 1];
+                
+                if (!matchArgument(argPattern, currentArg, highFunc, bindings)) {
+                    return false;  // Argument doesn't match pattern
                 }
             }
         }
         
         return true;
     }
-    
+
+    /**
+     * Match assignment pattern with expression analysis.
+     * 
+     * This enhanced version handles patterns like "$size = $a * $b" by:
+     * 1. Finding the P-Code operation that defines the LHS variable
+     * 2. Checking if the RHS expression matches the expected pattern (e.g., multiplication)
+     * 3. Binding operands to pattern variables
+     */
+    private boolean matchAssignmentWithExpression(TaintQuery.Assignment assign, ClangStatement stmt,
+                                                HighFunction highFunc, Map<String, Object> bindings) {
+        Address stmtAddr = stmt.getMinAddress();
+        if (stmtAddr == null) return false;
+        
+        // Parse the RHS to determine what operation we're looking for
+        String rhs = assign.rhs;
+        
+        // Check for binary operation patterns like "$a * $b", "$a + $b", etc.
+        java.util.regex.Pattern binOpPattern = java.util.regex.Pattern.compile(
+            "^(\\$\\w+)\\s*([+\\-*/%&|^]|<<|>>)\\s*(\\$\\w+)$");
+        java.util.regex.Matcher binOpMatcher = binOpPattern.matcher(rhs);
+        
+        if (binOpMatcher.matches()) {
+            String leftVar = binOpMatcher.group(1);
+            String operator = binOpMatcher.group(2);
+            String rightVar = binOpMatcher.group(3);
+            
+            // Map operator to P-Code opcode
+            int targetOpcode = getOpcodeForOperator(operator);
+            if (targetOpcode == -1) return false;
+            
+            // Search for matching P-Code operation at this statement
+            Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
+            while (ops.hasNext()) {
+                PcodeOpAST op = ops.next();
+                if (op.getOpcode() == targetOpcode) {
+                    Varnode output = op.getOutput();
+                    Varnode input0 = op.getInput(0);
+                    Varnode input1 = op.getInput(1);
+                    
+                    if (output != null && input0 != null && input1 != null) {
+                        // Bind LHS
+                        if (assign.lhs.startsWith("$")) {
+                            bindings.put(assign.lhs, output);
+                        }
+                        // Bind operands
+                        bindings.put(leftVar, input0);
+                        bindings.put(rightVar, input1);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        
+        // Check for function call on RHS like "$ptr = malloc($size)"
+        java.util.regex.Pattern callPattern = java.util.regex.Pattern.compile(
+            "^(\\$?\\w+)\\s*\\((.*)\\)$");
+        java.util.regex.Matcher callMatcher = callPattern.matcher(rhs);
+        
+        if (callMatcher.matches()) {
+            String funcName = callMatcher.group(1);
+            String argsStr = callMatcher.group(2);
+            
+            // Find CALL operation and verify function name
+            Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
+            while (ops.hasNext()) {
+                PcodeOpAST op = ops.next();
+                if (op.getOpcode() == PcodeOp.CALL || op.getOpcode() == PcodeOp.CALLIND) {
+                    Varnode output = op.getOutput();
+                    Varnode target = op.getInput(0);
+                    
+                    // Get called function name
+                    String calledName = getCalledFunctionName(target, highFunc);
+                    if (calledName != null && matchFunctionName(calledName, funcName, bindings)) {
+                        // Bind LHS
+                        if (assign.lhs.startsWith("$") && output != null) {
+                            bindings.put(assign.lhs, output);
+                        }
+                        
+                        // Bind arguments
+                        List<String> args = parseArgumentList(argsStr);
+                        Varnode[] inputs = op.getInputs();
+                        for (int i = 0; i < args.size() && i + 1 < inputs.length; i++) {
+                            String argPattern = args.get(i);
+                            if (argPattern.startsWith("$")) {
+                                bindings.put(argPattern, inputs[i + 1]);
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        
+        // Fall back to simple assignment matching
+        return matchAssignment(assign, stmt, highFunc, bindings);
+    }
+
+    /**
+     * Map operator string to P-Code opcode
+     */
+    private int getOpcodeForOperator(String op) {
+        return switch (op) {
+            case "*" -> PcodeOp.INT_MULT;
+            case "+" -> PcodeOp.INT_ADD;
+            case "-" -> PcodeOp.INT_SUB;
+            case "/" -> PcodeOp.INT_DIV;
+            case "%" -> PcodeOp.INT_REM;
+            case "&" -> PcodeOp.INT_AND;
+            case "|" -> PcodeOp.INT_OR;
+            case "^" -> PcodeOp.INT_XOR;
+            case "<<" -> PcodeOp.INT_LEFT;
+            case ">>" -> PcodeOp.INT_RIGHT;
+            default -> -1;
+        };
+    }
+
+    /**
+     * Get the name of a called function from its target varnode
+     */
+    private String getCalledFunctionName(Varnode target, HighFunction highFunc) {
+        if (target == null) return null;
+        
+        if (target.isAddress()) {
+            Function func = program.getFunctionManager().getFunctionAt(target.getAddress());
+            if (func != null) {
+                return func.getName();
+            }
+        }
+        
+        // Try to resolve from high variable
+        HighVariable hv = target.getHigh();
+        if (hv != null && hv.getSymbol() != null) {
+            return hv.getSymbol().getName();
+        }
+        
+        return null;
+    }
+
+    // ============================================================================
+    // METHOD 11: parseArgumentList (NEW METHOD)
+    // ============================================================================
+
+    /**
+     * Parse a comma-separated argument list
+     */
+    private List<String> parseArgumentList(String argsStr) {
+        List<String> args = new ArrayList<>();
+        if (argsStr == null || argsStr.trim().isEmpty()) return args;
+        
+        for (String arg : argsStr.split(",")) {
+            args.add(arg.trim());
+        }
+        return args;
+    }
+
+
+
     /**
      * Match assignment pattern
      */
