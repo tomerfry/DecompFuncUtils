@@ -9,7 +9,7 @@ A Ghidra extension that enhances the decompiler with C++ reverse engineering uti
 ---
 
 ## Installin The Plugin (Or Any Other Plugin)
-- How to install the plugin from you download from the releases.
+- How to install the plugin you download from the releases.
 ![Installing The Plugin](installing_the_plugin.gif)
 
 
@@ -106,7 +106,3 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 ---
 
-## Acknowledgments
-
-- [Ghidra](https://ghidra-sre.org/) - NSA's software reverse engineering framework
-- The Ghidra development community
