@@ -6,17 +6,6 @@
  * brace-delimited scopes ({…}) such as if/else blocks, loops, and
  * function bodies.
  *
- * Implementation approach:
- *   - Discovers live DecompilerPanel instances via Window traversal.
- *   - Installs a custom margin JPanel that paints fold markers aligned with
- *     the FieldPanel's layout rows.
- *   - Parses scope boundaries from the decompiled text lines (brace matching).
- *   - Folding is achieved by wrapping the LayoutModel: a FilteringLayoutModel
- *     proxy sits between the FieldPanel and the real model. Collapsed rows are
- *     skipped in the proxy's index mapping.
- *   - The FieldPanel's model is swapped via reflection (setLayoutModel or
- *     field assignment), so the panel genuinely stops rendering hidden lines.
- *
  * Licensed under the Apache License 2.0 (same as the parent project).
  */
 
@@ -59,6 +48,8 @@ import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseListener;
 
+import javax.swing.BorderFactory;
+import javax.swing.BoxLayout;
 import javax.swing.JComponent;
 import javax.swing.JPanel;
 import javax.swing.JViewport;
@@ -80,10 +71,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * Plugin that adds collapsible scope regions to the Decompiler with clickable
- * +/− gutter markers.
- */
 //@formatter:off
 @PluginInfo(
     status = PluginStatus.RELEASED,
@@ -118,9 +105,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         toggleFoldAction = new DockingAction("Toggle Fold at Cursor", getName()) {
             @Override
             public void actionPerformed(ActionContext ctx) {
-                if (ctx instanceof DecompilerActionContext dac) {
-                    toggleFoldAtCursor(dac);
-                }
+                if (ctx instanceof DecompilerActionContext dac) toggleFoldAtCursor(dac);
             }
             @Override
             public boolean isEnabledForContext(ActionContext ctx) {
@@ -141,9 +126,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         foldAllAction = new DockingAction("Fold All Scopes", getName()) {
             @Override
             public void actionPerformed(ActionContext ctx) {
-                if (ctx instanceof DecompilerActionContext dac) {
-                    doSetAllFolds(dac, true);
-                }
+                if (ctx instanceof DecompilerActionContext dac) doSetAllFolds(dac, true);
             }
             @Override
             public boolean isEnabledForContext(ActionContext ctx) {
@@ -164,9 +147,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         unfoldAllAction = new DockingAction("Unfold All Scopes", getName()) {
             @Override
             public void actionPerformed(ActionContext ctx) {
-                if (ctx instanceof DecompilerActionContext dac) {
-                    doSetAllFolds(dac, false);
-                }
+                if (ctx instanceof DecompilerActionContext dac) doSetAllFolds(dac, false);
             }
             @Override
             public boolean isEnabledForContext(ActionContext ctx) {
@@ -193,14 +174,10 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         if (tool == null) return;
         Set<DecompilerPanel> livePanels = new HashSet<>();
         for (Window w : Window.getWindows()) {
-            if (w.isShowing()) {
-                findAllDecompilerPanels(w, livePanels);
-            }
+            if (w.isShowing()) findAllDecompilerPanels(w, livePanels);
         }
         for (DecompilerPanel panel : livePanels) {
-            if (!installedMargins.containsKey(panel)) {
-                installMargin(panel);
-            }
+            if (!installedMargins.containsKey(panel)) installMargin(panel);
         }
         Iterator<Map.Entry<DecompilerPanel, FoldMarginPanel>> it =
                 installedMargins.entrySet().iterator();
@@ -214,14 +191,9 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
     }
 
     private void findAllDecompilerPanels(Component c, Set<DecompilerPanel> out) {
-        if (c instanceof DecompilerPanel dp) {
-            out.add(dp);
-            return;
-        }
+        if (c instanceof DecompilerPanel dp) { out.add(dp); return; }
         if (c instanceof Container cont) {
-            for (Component child : cont.getComponents()) {
-                findAllDecompilerPanels(child, out);
-            }
+            for (Component child : cont.getComponents()) findAllDecompilerPanels(child, out);
         }
     }
 
@@ -239,31 +211,52 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         }
     }
 
+    /**
+     * Inject the fold-margin panel into the DecompilerPanel's WEST side.
+     *
+     * The DecompilerPanel uses BorderLayout. The WEST slot may contain
+     * an existing margin box (JPanel with BoxLayout) or may be empty.
+     * We always add our panel as the leftmost component.
+     */
     private void injectMarginComponent(DecompilerPanel panel, FoldMarginPanel margin) {
         try {
-            BorderLayout layout = (BorderLayout) panel.getLayout();
-            Component west = layout.getLayoutComponent(BorderLayout.WEST);
-
-            if (west instanceof JComponent box) {
-                box.add(margin, 0);
-                box.revalidate();
-                box.repaint();
-            } else {
-                JPanel wrapper = new JPanel(new BorderLayout());
-                wrapper.setOpaque(false);
-                wrapper.add(margin, BorderLayout.WEST);
-                if (west != null) {
-                    panel.remove(west);
-                    wrapper.add(west, BorderLayout.CENTER);
-                }
-                panel.add(wrapper, BorderLayout.WEST);
-                panel.revalidate();
-                panel.repaint();
-            }
-
             FieldPanel fp = getFieldPanel(panel);
             if (fp != null) {
                 margin.attachToFieldPanel(fp);
+            }
+
+            java.awt.LayoutManager lm = panel.getLayout();
+
+            if (lm instanceof BorderLayout bl) {
+                Component west = bl.getLayoutComponent(BorderLayout.WEST);
+
+                if (west instanceof JComponent box) {
+                    // Existing west container — prepend our margin
+                    box.add(margin, 0);
+                    box.revalidate();
+                    box.repaint();
+                    Msg.info(this, "Fold margin added to existing WEST box");
+                } else {
+                    // No existing west container — create wrapper
+                    JPanel wrapper = new JPanel();
+                    wrapper.setLayout(new BoxLayout(wrapper, BoxLayout.X_AXIS));
+                    wrapper.setOpaque(false);
+                    wrapper.add(margin);
+                    if (west != null) {
+                        panel.remove(west);
+                        wrapper.add(west);
+                    }
+                    panel.add(wrapper, BorderLayout.WEST);
+                    panel.revalidate();
+                    panel.repaint();
+                    Msg.info(this, "Fold margin injected as new WEST wrapper");
+                }
+            } else {
+                // Fallback: just add to the panel and hope for the best
+                panel.add(margin, BorderLayout.WEST);
+                panel.revalidate();
+                panel.repaint();
+                Msg.warn(this, "DecompilerPanel layout is not BorderLayout: " + lm);
             }
         } catch (Exception ex) {
             Msg.error(this, "Failed to inject fold margin component", ex);
@@ -278,8 +271,12 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         DecompilerPanel panel = findDecompilerPanelFromContext(ctx);
         FoldMarginPanel margin = (panel != null) ? installedMargins.get(panel) : null;
         if (margin == null) return;
-        int line = ctx.getLineNumber();
-        margin.toggleFoldAtVisibleLine(line);
+
+        // DecompilerActionContext.getLineNumber() is typically 1-based.
+        // Our internal visible line indices are 0-based.
+        int lineFromCtx = ctx.getLineNumber();
+        Msg.info(this, "Toggle fold: ctx.getLineNumber() = " + lineFromCtx);
+        margin.toggleFoldAtVisibleLine(lineFromCtx);
     }
 
     private void doSetAllFolds(DecompilerActionContext ctx, boolean collapsed) {
@@ -331,6 +328,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         try {
             Method m = FieldPanel.class.getMethod("setLayoutModel", LayoutModel.class);
             m.invoke(fp, model);
+            Msg.info(DecompilerCodeFoldingPlugin.class, "Model swapped via setLayoutModel()");
             return true;
         } catch (Exception ignored) {}
 
@@ -347,6 +345,8 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                 fp.invalidate();
                 fp.revalidate();
                 fp.repaint();
+                Msg.info(DecompilerCodeFoldingPlugin.class,
+                        "Model swapped via reflection field: " + fieldName);
                 return true;
             } catch (Exception ignored) {}
         }
@@ -365,9 +365,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             panelDiscoveryTimer.stop();
             panelDiscoveryTimer = null;
         }
-        for (FoldMarginPanel m : installedMargins.values()) {
-            m.dispose();
-        }
+        for (FoldMarginPanel m : installedMargins.values()) m.dispose();
         installedMargins.clear();
         if (toggleFoldAction != null) tool.removeAction(toggleFoldAction);
         if (foldAllAction != null) tool.removeAction(foldAllAction);
@@ -380,8 +378,8 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
     // =======================================================================
 
     static class FoldRegion {
-        final int startLine;
-        int endLine;
+        final int startLine;   // 0-based: line with '{'
+        int endLine;           // 0-based: line with '}'
         final int depth;
         boolean collapsed = false;
         final List<FoldRegion> children = new ArrayList<>();
@@ -391,20 +389,18 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             this.endLine = startLine;
             this.depth = depth;
         }
+
+        @Override
+        public String toString() {
+            return "Fold[" + startLine + ".." + endLine + " d=" + depth
+                    + (collapsed ? " COLLAPSED" : "") + "]";
+        }
     }
 
     // =======================================================================
     // FilteringLayoutModel
     // =======================================================================
 
-    /**
-     * LayoutModel proxy that hides collapsed lines.
-     * <p>
-     * IMPORTANT: This model does NOT listen to the delegate internally to avoid
-     * feedback loops. Instead, FoldMarginPanel manages the lifecycle:
-     * it listens to delegate changes separately and calls setHiddenLines()
-     * when needed.
-     */
     static class FilteringLayoutModel implements LayoutModel {
 
         private final LayoutModel delegate;
@@ -417,9 +413,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             rebuildFromDelegate();
         }
 
-        LayoutModel getDelegate() {
-            return delegate;
-        }
+        LayoutModel getDelegate() { return delegate; }
 
         void setHiddenLines(Set<Integer> hiddenOrigLines) {
             hiddenRealLines = new HashSet<>();
@@ -430,7 +424,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             notifyModelSizeChanged();
         }
 
-        void clearHiddenAndRebuild() {
+        void clearHidden() {
             hiddenRealLines = Collections.emptySet();
             rebuildFromDelegate();
             notifyModelSizeChanged();
@@ -441,9 +435,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             List<BigInteger> visible = new ArrayList<>();
             BigInteger idx = BigInteger.ZERO;
             while (idx.compareTo(realCount) < 0) {
-                if (!hiddenRealLines.contains(idx)) {
-                    visible.add(idx);
-                }
+                if (!hiddenRealLines.contains(idx)) visible.add(idx);
                 idx = idx.add(BigInteger.ONE);
             }
             visibleToReal = visible.toArray(new BigInteger[0]);
@@ -451,59 +443,28 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
 
         private BigInteger toReal(BigInteger visibleIndex) {
             int vi = visibleIndex.intValueExact();
-            if (vi >= 0 && vi < visibleToReal.length) {
-                return visibleToReal[vi];
-            }
+            if (vi >= 0 && vi < visibleToReal.length) return visibleToReal[vi];
             return visibleIndex;
         }
 
-        @Override
-        public BigInteger getNumIndexes() {
+        @Override public BigInteger getNumIndexes() {
             return BigInteger.valueOf(visibleToReal.length);
         }
-
-        @Override
-        public Layout getLayout(BigInteger index) {
+        @Override public Layout getLayout(BigInteger index) {
             return delegate.getLayout(toReal(index));
         }
-
-        @Override
-        public boolean isUniform() {
-            return delegate.isUniform();
-        }
-
-        @Override
-        public Dimension getPreferredViewSize() {
-            return delegate.getPreferredViewSize();
-        }
-
-        @Override
-        public BigInteger getIndexAfter(BigInteger index) {
+        @Override public boolean isUniform() { return delegate.isUniform(); }
+        @Override public Dimension getPreferredViewSize() { return delegate.getPreferredViewSize(); }
+        @Override public BigInteger getIndexAfter(BigInteger index) {
             BigInteger next = index.add(BigInteger.ONE);
-            if (next.compareTo(getNumIndexes()) >= 0) return null;
-            return next;
+            return next.compareTo(getNumIndexes()) >= 0 ? null : next;
         }
-
-        @Override
-        public BigInteger getIndexBefore(BigInteger index) {
-            if (index.compareTo(BigInteger.ONE) < 0) return null;
-            return index.subtract(BigInteger.ONE);
+        @Override public BigInteger getIndexBefore(BigInteger index) {
+            return index.compareTo(BigInteger.ONE) < 0 ? null : index.subtract(BigInteger.ONE);
         }
-
-        @Override
-        public void addLayoutModelListener(LayoutModelListener listener) {
-            listeners.add(listener);
-        }
-
-        @Override
-        public void removeLayoutModelListener(LayoutModelListener listener) {
-            listeners.remove(listener);
-        }
-
-        @Override
-        public void flushChanges() {
-            delegate.flushChanges();
-        }
+        @Override public void addLayoutModelListener(LayoutModelListener l) { listeners.add(l); }
+        @Override public void removeLayoutModelListener(LayoutModelListener l) { listeners.remove(l); }
+        @Override public void flushChanges() { delegate.flushChanges(); }
 
         private void notifyModelSizeChanged() {
             IndexMapper identity = value -> value;
@@ -519,7 +480,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
 
     class FoldMarginPanel extends JPanel implements MouseListener {
 
-        private static final int MARGIN_WIDTH = 16;
+        private static final int MARGIN_WIDTH = 18;
         private static final int ICON_SIZE = 9;
 
         private final DecompilerPanel decompPanel;
@@ -537,25 +498,15 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         private int[] visibleToOriginal = new int[0];
         private int[] originalToVisible = new int[0];
 
-        /** Listener we register on the ORIGINAL model to detect new decompilations. */
         private LayoutModelListener originalModelListener;
-
-        /**
-         * Guard: when true, we are inside applyFoldState() and should ignore
-         * any model-change callbacks that our own setHiddenLines triggers.
-         */
         private boolean applyingFoldState = false;
-
-        /**
-         * Tracks the delegate's getNumIndexes() so we can detect genuine
-         * decompilation changes vs. our own filtering changes.
-         */
         private BigInteger lastKnownDelegateSize = BigInteger.ZERO;
 
         FoldMarginPanel(DecompilerPanel decompPanel) {
             this.decompPanel = decompPanel;
-            setPreferredSize(new Dimension(MARGIN_WIDTH, 0));
+            setPreferredSize(new Dimension(MARGIN_WIDTH, Short.MAX_VALUE));
             setMinimumSize(new Dimension(MARGIN_WIDTH, 0));
+            setMaximumSize(new Dimension(MARGIN_WIDTH, Short.MAX_VALUE));
             setOpaque(true);
             addMouseListener(this);
             setToolTipText("");
@@ -566,20 +517,15 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             this.originalModel = fp.getLayoutModel();
             this.lastKnownDelegateSize = originalModel.getNumIndexes();
 
-            // Create filtering proxy — does NOT auto-listen to delegate
             filteringModel = new FilteringLayoutModel(originalModel);
-
-            // Swap FieldPanel to use our proxy
             modelSwapped = setFieldPanelModel(fp, filteringModel);
+
             if (!modelSwapped) {
                 Msg.warn(this, "Could not swap FieldPanel model — "
                         + "fold markers will show but lines won't hide.");
             }
 
-            // Listen to the ORIGINAL model directly.
-            // When the decompiler produces new output, the original model fires
-            // modelSizeChanged. We detect this by checking if the delegate's
-            // getNumIndexes() actually changed (vs our own filtering notification).
+            // Listen to original model for genuine decompilation changes
             originalModelListener = new LayoutModelListener() {
                 @Override
                 public void modelSizeChanged(IndexMapper indexMapper) {
@@ -590,7 +536,6 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                         SwingUtilities.invokeLater(() -> onNewDecompilation());
                     }
                 }
-
                 @Override
                 public void dataChanged(BigInteger start, BigInteger end) {
                     if (applyingFoldState) return;
@@ -603,32 +548,19 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             };
             originalModel.addLayoutModelListener(originalModelListener);
 
-            // Track FieldPanel resize → sync margin height
-            fp.addComponentListener(new ComponentAdapter() {
-                @Override
-                public void componentResized(ComponentEvent e) {
-                    syncHeight();
-                    repaint();
-                }
-            });
-
-            // Viewport scroll → repaint margin
+            // Track scroll for margin repaint
             Container parent = fp.getParent();
             if (parent instanceof JViewport vp) {
                 vp.addChangeListener(e -> repaint());
             }
 
-            onNewDecompilation();
-        }
+            // Track resize
+            fp.addComponentListener(new ComponentAdapter() {
+                @Override
+                public void componentResized(ComponentEvent e) { repaint(); }
+            });
 
-        private void syncHeight() {
-            if (fieldPanel != null) {
-                int fpH = fieldPanel.getHeight();
-                if (getPreferredSize().height != fpH) {
-                    setPreferredSize(new Dimension(MARGIN_WIDTH, fpH));
-                    revalidate();
-                }
-            }
+            onNewDecompilation();
         }
 
         void dispose() {
@@ -642,7 +574,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         }
 
         // -------------------------------------------------------------------
-        // New decompilation → reparse, reset folds
+        // New decompilation
         // -------------------------------------------------------------------
 
         private void onNewDecompilation() {
@@ -655,12 +587,16 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                 addAllToMap(r, regionByStartLine);
                 collectAllFlat(r, allRegionsFlat);
             }
+            Msg.info(this, "Parsed " + allRegionsFlat.size() + " fold regions from "
+                    + totalLines + " lines");
+            for (FoldRegion r : allRegionsFlat) {
+                Msg.info(this, "  " + r);
+            }
             applyFoldState();
-            syncHeight();
         }
 
         // -------------------------------------------------------------------
-        // Apply fold state → push to FilteringLayoutModel
+        // Apply fold state
         // -------------------------------------------------------------------
 
         private void applyFoldState() {
@@ -679,6 +615,9 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                     }
                 }
                 visibleToOriginal = vis.stream().mapToInt(Integer::intValue).toArray();
+
+                Msg.info(this, "Fold state: " + hiddenLines.size() + " hidden lines, "
+                        + visibleToOriginal.length + " visible lines");
 
                 if (filteringModel != null) {
                     filteringModel.setHiddenLines(hiddenLines);
@@ -743,11 +682,8 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                 for (char ch : cleaned.toCharArray()) {
                     if (ch == '{') {
                         FoldRegion r = new FoldRegion(i, stack.size());
-                        if (stack.isEmpty()) {
-                            topLevel.add(r);
-                        } else {
-                            stack.peek().children.add(r);
-                        }
+                        if (stack.isEmpty()) topLevel.add(r);
+                        else stack.peek().children.add(r);
                         stack.push(r);
                     } else if (ch == '}') {
                         if (!stack.isEmpty()) {
@@ -791,42 +727,56 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         // -------------------------------------------------------------------
 
         /**
-         * Toggle fold at a visible line index (from right-click menu / keyboard).
+         * Toggle fold at a visible line index.
          *
-         * Strategy:
-         *   1. Map visible line → original line.
-         *   2. If that original line is the startLine of a fold region → toggle it.
-         *   3. Otherwise, find the innermost NON-depth-0 enclosing region and
-         *      toggle it — but only if it's not already collapsed (to prevent
-         *      cascading collapses on repeated toggles at the same cursor spot).
-         *   4. If the innermost enclosing region IS collapsed and its startLine
-         *      is the current original line, expand it (re-toggle).
+         * The line parameter may be 0-based or 1-based depending on the source:
+         * - DecompilerActionContext.getLineNumber() is typically 1-based
+         * - Gutter click getVisibleLineAtY() is 0-based
+         *
+         * We try both the raw value and value-1 to find a matching region.
          */
-        void toggleFoldAtVisibleLine(int visibleLine) {
-            int origLine = toOriginalLine(visibleLine);
-
-            // 1. Exact match: cursor is on the '{' line of a fold region
-            FoldRegion exact = regionByStartLine.get(origLine);
-            if (exact != null) {
-                exact.collapsed = !exact.collapsed;
-                applyFoldState();
-                return;
+        void toggleFoldAtVisibleLine(int lineParam) {
+            // Try 0-based first, then 1-based adjusted
+            FoldRegion found = tryFindRegionAtVisible(lineParam);
+            if (found == null) {
+                found = tryFindRegionAtVisible(lineParam - 1);
+            }
+            if (found == null && lineParam + 1 < visibleToOriginal.length) {
+                found = tryFindRegionAtVisible(lineParam + 1);
             }
 
-            // 2. Find innermost enclosing region (skip depth-0 function body)
+            if (found != null) {
+                Msg.info(this, "Toggling " + found + " → " + (found.collapsed ? "EXPAND" : "COLLAPSE"));
+                found.collapsed = !found.collapsed;
+                applyFoldState();
+            } else {
+                Msg.info(this, "No fold region found for visible line " + lineParam);
+            }
+        }
+
+        /**
+         * Try to find a fold region at the given visible line index.
+         * Returns null if no region found or index is out of bounds.
+         */
+        private FoldRegion tryFindRegionAtVisible(int visibleLine) {
+            if (visibleLine < 0 || visibleLine >= visibleToOriginal.length) return null;
+            int origLine = visibleToOriginal[visibleLine];
+
+            // Exact match on startLine
+            FoldRegion exact = regionByStartLine.get(origLine);
+            if (exact != null) return exact;
+
+            // Innermost enclosing region (skip depth-0 function body)
             FoldRegion best = null;
             for (FoldRegion r : allRegionsFlat) {
-                if (r.depth == 0) continue; // never toggle function body via cursor
+                if (r.depth == 0) continue;
                 if (origLine > r.startLine && origLine <= r.endLine) {
                     if (best == null || r.depth > best.depth) {
                         best = r;
                     }
                 }
             }
-            if (best != null) {
-                best.collapsed = !best.collapsed;
-                applyFoldState();
-            }
+            return best;
         }
 
         void setAllFolds(boolean collapsed) {
@@ -837,7 +787,6 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         private void setAllFoldsRecursive(List<FoldRegion> list, boolean collapsed) {
             for (FoldRegion r : list) {
                 if (collapsed && r.depth == 0) {
-                    // Don't collapse the outermost function body
                     setAllFoldsRecursive(r.children, true);
                 } else {
                     r.collapsed = collapsed;
@@ -846,10 +795,16 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             }
         }
 
+        /**
+         * Collect hidden lines. When collapsed, we hide startLine+1 to endLine-1,
+         * keeping BOTH the opening '{' line AND the closing '}' line visible.
+         * This matches standard IDE folding behavior.
+         */
         private void collectHiddenLines(List<FoldRegion> list, Set<Integer> hidden) {
             for (FoldRegion r : list) {
                 if (r.collapsed) {
-                    for (int l = r.startLine + 1; l <= r.endLine; l++) {
+                    // Hide everything between '{' and '}', exclusive on both ends
+                    for (int l = r.startLine + 1; l < r.endLine; l++) {
                         hidden.add(l);
                     }
                 } else {
@@ -877,6 +832,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                         RenderingHints.VALUE_ANTIALIAS_ON);
 
+                // Background
                 Color bg = decompPanel.getBackground();
                 g2.setColor(bg != null ? bg : getBackground());
                 g2.fillRect(0, 0, getWidth(), getHeight());
@@ -912,7 +868,17 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                         if (r != null) {
                             paintFoldIcon(g2, screenY, rowHeight, r.collapsed);
                         } else {
-                            paintScopeLines(g2, origLine, screenY, rowHeight);
+                            // Check if this is the '}' line of a collapsed region
+                            boolean isClosingBrace = false;
+                            for (FoldRegion fr : allRegionsFlat) {
+                                if (fr.collapsed && fr.endLine == origLine) {
+                                    isClosingBrace = true;
+                                    break;
+                                }
+                            }
+                            if (!isClosingBrace) {
+                                paintScopeLines(g2, origLine, screenY, rowHeight);
+                            }
                         }
                     }
 
@@ -930,15 +896,18 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             int cy = y + rowHeight / 2;
             int half = ICON_SIZE / 2;
 
+            // Box outline
             g.setColor(new Color(140, 140, 140));
             g.drawRect(cx - half, cy - half, ICON_SIZE, ICON_SIZE);
+            // Box fill
             g.setColor(new Color(240, 240, 240));
             g.fillRect(cx - half + 1, cy - half + 1, ICON_SIZE - 1, ICON_SIZE - 1);
+            // +/- sign
             g.setColor(new Color(80, 80, 80));
             g.setStroke(new BasicStroke(1.2f));
-            g.drawLine(cx - half + 2, cy, cx + half - 2, cy);
+            g.drawLine(cx - half + 2, cy, cx + half - 2, cy); // horizontal bar (always)
             if (collapsed) {
-                g.drawLine(cx, cy - half + 2, cx, cy + half - 2);
+                g.drawLine(cx, cy - half + 2, cx, cy + half - 2); // vertical bar → '+'
             }
         }
 
@@ -947,7 +916,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             g.setStroke(new BasicStroke(1f));
             int cx = MARGIN_WIDTH / 2;
             for (FoldRegion r : allRegionsFlat) {
-                if (origLine > r.startLine && origLine <= r.endLine && !r.collapsed) {
+                if (!r.collapsed && origLine > r.startLine && origLine < r.endLine) {
                     g.drawLine(cx, y, cx, y + rowHeight);
                     break;
                 }
@@ -965,7 +934,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             FoldRegion r = regionByStartLine.get(origLine);
             if (r != null) {
                 int span = r.endLine - r.startLine;
-                return (r.collapsed ? "Expand" : "Collapse")
+                return (r.collapsed ? "[+] Expand" : "[-] Collapse")
                         + " scope (" + span + " lines)";
             }
             return null;
@@ -982,6 +951,8 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             int origLine = toOriginalLine(visLine);
             FoldRegion r = regionByStartLine.get(origLine);
             if (r != null) {
+                Msg.info(this, "Gutter click on " + r
+                        + " → " + (r.collapsed ? "EXPAND" : "COLLAPSE"));
                 r.collapsed = !r.collapsed;
                 applyFoldState();
             }
@@ -1015,14 +986,9 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
 
             while (idx.compareTo(numIndexes) < 0) {
                 Layout layout = activeModel.getLayout(idx);
-                if (layout == null) {
-                    idx = idx.add(BigInteger.ONE);
-                    continue;
-                }
+                if (layout == null) { idx = idx.add(BigInteger.ONE); continue; }
                 int rowH = layout.getHeight();
-                if (targetY >= y && targetY < y + rowH) {
-                    return lineIndex;
-                }
+                if (targetY >= y && targetY < y + rowH) return lineIndex;
                 y += rowH;
                 lineIndex++;
                 idx = idx.add(BigInteger.ONE);
