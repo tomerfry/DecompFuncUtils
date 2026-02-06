@@ -1,0 +1,1723 @@
+/*
+ * LibAFLFuzzerGeneratorPlugin
+ *
+ * Generates a complete Rust LibAFL QEMU-based fuzzing project from
+ * the current Ghidra analysis context.
+ *
+ * Features:
+ *   - Architecture auto-detection (ARM, AArch64, x86, x64, MIPS)
+ *   - External/imported function detection with interactive stub config
+ *   - Global state detection with initialization setup
+ *   - Memory map extraction
+ *   - String/dictionary extraction for seed corpus
+ *   - Decompiled code embedded as reference
+ *   - Windows/WSL/Docker support with cross-platform scripts
+ *
+ * Licensed under the Apache License 2.0.
+ */
+
+package decompfuncutils;
+
+import docking.ActionContext;
+import docking.action.DockingAction;
+import docking.action.KeyBindingData;
+import docking.action.MenuData;
+
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.plugin.PluginCategoryNames;
+import ghidra.app.plugin.ProgramPlugin;
+import ghidra.app.plugin.core.decompile.DecompilerActionContext;
+import ghidra.framework.plugintool.*;
+import ghidra.framework.plugintool.util.PluginStatus;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressFactory;
+import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.lang.Language;
+import ghidra.program.model.lang.Processor;
+import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.symbol.*;
+import ghidra.util.Msg;
+import ghidra.util.task.TaskMonitor;
+
+import java.awt.*;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.border.TitledBorder;
+import javax.swing.table.AbstractTableModel;
+import javax.swing.table.DefaultTableCellRenderer;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+
+//@formatter:off
+@PluginInfo(
+    status = PluginStatus.RELEASED,
+    packageName = "DecompFuncUtils",
+    category = PluginCategoryNames.ANALYSIS,
+    shortDescription = "LibAFL Fuzzer Generator",
+    description = "Generates a complete Rust LibAFL QEMU-based fuzzing project "
+                + "from the current binary and function context."
+)
+//@formatter:on
+public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
+
+    private DockingAction generateAction;
+    private DockingAction generateFromFuncAction;
+
+    public LibAFLFuzzerGeneratorPlugin(PluginTool tool) {
+        super(tool);
+        createActions();
+    }
+
+    // ===================================================================
+    // Actions
+    // ===================================================================
+
+    private void createActions() {
+        generateAction = new DockingAction("Generate LibAFL Fuzzer", getName()) {
+            @Override
+            public void actionPerformed(ActionContext ctx) { generateFuzzer(null); }
+            @Override
+            public boolean isEnabledForContext(ActionContext ctx) {
+                return currentProgram != null;
+            }
+            @Override
+            public boolean isAddToPopup(ActionContext ctx) { return false; }
+        };
+        generateAction.setMenuBarData(
+                new MenuData(new String[] { "Tools", "Generate LibAFL Fuzzer..." }));
+        generateAction.setKeyBindingData(
+                new KeyBindingData(KeyEvent.VK_F,
+                        InputEvent.CTRL_DOWN_MASK | InputEvent.ALT_DOWN_MASK));
+        generateAction.setDescription(
+                "Generate a LibAFL QEMU fuzzing project for the current binary");
+        tool.addAction(generateAction);
+
+        generateFromFuncAction = new DockingAction(
+                "Generate LibAFL Fuzzer for Function", getName()) {
+            @Override
+            public void actionPerformed(ActionContext ctx) {
+                Function func = findFunctionFromContext(ctx);
+                generateFuzzer(func);
+            }
+            @Override
+            public boolean isEnabledForContext(ActionContext ctx) {
+                return currentProgram != null;
+            }
+            @Override
+            public boolean isAddToPopup(ActionContext ctx) {
+                return ctx instanceof DecompilerActionContext;
+            }
+        };
+        generateFromFuncAction.setPopupMenuData(
+                new MenuData(new String[] { "Generate LibAFL Fuzzer for Function" },
+                        null, "Decompile"));
+        tool.addAction(generateFromFuncAction);
+    }
+
+    private Function findFunctionFromContext(ActionContext ctx) {
+        if (currentProgram == null) return null;
+        try {
+            if (ctx instanceof DecompilerActionContext dac) {
+                Address addr = dac.getAddress();
+                if (addr != null)
+                    return currentProgram.getFunctionManager().getFunctionContaining(addr);
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    // ===================================================================
+    // Data structures
+    // ===================================================================
+
+    enum TargetArch {
+        ARM("arm"), AARCH64("aarch64"), X86("i386"), X86_64("x86_64"),
+        MIPS("mips"), MIPSEL("mipsel"), PPC("ppc"), UNKNOWN("x86_64");
+        final String qemuName;
+        TargetArch(String qemuName) { this.qemuName = qemuName; }
+    }
+
+    enum ExternAction {
+        STUB_RETURN("Stub (return 0)"),
+        STUB_PASSTHROUGH("Passthrough (nop)"),
+        HOOK_CUSTOM("Custom hook"),
+        SKIP("Skip (don't touch)");
+        final String label;
+        ExternAction(String label) { this.label = label; }
+        @Override public String toString() { return label; }
+    }
+
+    static class ExternFuncInfo {
+        String name;
+        Address address;      // thunk or PLT address
+        String library;       // originating library if known
+        ExternAction action = ExternAction.SKIP;
+        String customHookCode = "";  // Rust code for HOOK_CUSTOM
+
+        ExternFuncInfo(String name, Address address, String library) {
+            this.name = name;
+            this.address = address;
+            this.library = library != null ? library : "unknown";
+        }
+    }
+
+    static class GlobalRef {
+        String name;
+        Address address;
+        long size;
+        String dataTypeName;
+        boolean initialize = false;
+        String initValue = "0";   // hex or literal
+
+        GlobalRef(String name, Address address, long size, String dataTypeName) {
+            this.name = name;
+            this.address = address;
+            this.size = size;
+            this.dataTypeName = dataTypeName;
+        }
+    }
+
+    static class MemRegion {
+        String name;
+        long start;
+        long end;
+        boolean read, write, execute;
+
+        MemRegion(String name, long start, long end, boolean r, boolean w, boolean x) {
+            this.name = name; this.start = start; this.end = end;
+            this.read = r; this.write = w; this.execute = x;
+        }
+    }
+
+    static class FuzzerConfig {
+        String projectName;
+        String targetBinaryPath;
+        TargetArch arch;
+        Function targetFunction;
+        long entryAddress;
+        long exitAddress;
+        boolean useSnapshots = true;
+        boolean useCmpLog = true;
+        boolean generateDictionary = true;
+        int maxInputSize = 4096;
+        List<MemRegion> memoryMap = new ArrayList<>();
+        String decompiledCode;
+        List<String> seedStrings = new ArrayList<>();
+        List<ExternFuncInfo> externalFunctions = new ArrayList<>();
+        List<GlobalRef> globals = new ArrayList<>();
+    }
+
+    // ===================================================================
+    // Main generation flow
+    // ===================================================================
+
+    private void generateFuzzer(Function targetFunc) {
+        if (currentProgram == null) {
+            Msg.showError(this, null, "Error", "No program loaded.");
+            return;
+        }
+
+        // --- Step 1: Choose output directory ---
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Select output directory for LibAFL project");
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        chooser.setApproveButtonText("Generate Here");
+        if (chooser.showSaveDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        File outputDir = chooser.getSelectedFile();
+
+        // --- Step 2: Build config from analysis ---
+        FuzzerConfig config = buildInitialConfig(targetFunc);
+
+        // --- Step 3: Detect externals & globals ---
+        if (targetFunc != null) {
+            config.externalFunctions = detectExternalCalls(targetFunc);
+            config.globals = detectReferencedGlobals(targetFunc);
+        } else {
+            config.externalFunctions = detectAllExternalFunctions();
+            config.globals = new ArrayList<>();
+        }
+
+        // --- Step 4: Show interactive config wizard ---
+        if (!showConfigWizard(config)) return; // user cancelled
+
+        // --- Step 5: Generate project ---
+        try {
+            Path projectDir = outputDir.toPath().resolve(config.projectName);
+            generateProject(projectDir, config);
+            Msg.showInfo(this, null, "LibAFL Fuzzer Generated",
+                    "Project generated at:\n" + projectDir.toAbsolutePath()
+                    + "\n\nSee README.md for build and run instructions.");
+        } catch (Exception ex) {
+            Msg.showError(this, null, "Generation Error",
+                    "Failed to generate fuzzer: " + ex.getMessage(), ex);
+        }
+    }
+
+    private FuzzerConfig buildInitialConfig(Function targetFunc) {
+        FuzzerConfig config = new FuzzerConfig();
+        config.projectName = sanitizeName(currentProgram.getName()) + "_fuzzer";
+        config.arch = detectArch();
+        config.targetFunction = targetFunc;
+        config.memoryMap = extractMemoryMap();
+        config.seedStrings = extractInterestingStrings(50);
+        config.targetBinaryPath = currentProgram.getExecutablePath();
+
+        if (targetFunc != null) {
+            config.entryAddress = targetFunc.getEntryPoint().getOffset();
+            config.exitAddress = findFunctionExitAddress(targetFunc);
+            config.decompiledCode = decompileFunction(targetFunc);
+        } else {
+            Address entry = currentProgram.getMinAddress();
+            Symbol sym = findSymbol("main");
+            if (sym == null) sym = findSymbol("_start");
+            if (sym != null) entry = sym.getAddress();
+            config.entryAddress = entry.getOffset();
+            config.exitAddress = 0;
+        }
+        return config;
+    }
+
+    // ===================================================================
+    // External function detection
+    // ===================================================================
+
+    private List<ExternFuncInfo> detectExternalCalls(Function targetFunc) {
+        List<ExternFuncInfo> externs = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+
+        if (targetFunc == null) return externs;
+
+        // Walk all called functions from the target
+        Set<Function> called = targetFunc.getCalledFunctions(TaskMonitor.DUMMY);
+        for (Function callee : called) {
+            if (seen.contains(callee.getName())) continue;
+            seen.add(callee.getName());
+
+            if (callee.isExternal() || callee.isThunk()) {
+                String lib = "unknown";
+                if (callee.isExternal()) {
+                    ExternalLocation extLoc = callee.getExternalLocation();
+                    if (extLoc != null && extLoc.getLibraryName() != null) {
+                        lib = extLoc.getLibraryName();
+                    }
+                } else if (callee.isThunk()) {
+                    Function thunked = callee.getThunkedFunction(true);
+                    if (thunked != null && thunked.isExternal()) {
+                        ExternalLocation extLoc = thunked.getExternalLocation();
+                        if (extLoc != null && extLoc.getLibraryName() != null) {
+                            lib = extLoc.getLibraryName();
+                        }
+                    }
+                }
+
+                ExternFuncInfo info = new ExternFuncInfo(
+                        callee.getName(), callee.getEntryPoint(), lib);
+
+                // Auto-suggest action based on function name
+                String name = callee.getName().toLowerCase(Locale.ROOT);
+                if (name.contains("malloc") || name.contains("calloc")
+                        || name.contains("realloc") || name.contains("free")
+                        || name.contains("memcpy") || name.contains("memset")
+                        || name.contains("strlen") || name.contains("strcmp")
+                        || name.contains("printf") || name.contains("puts")
+                        || name.contains("fprintf") || name.contains("sprintf")) {
+                    info.action = ExternAction.SKIP; // libc functions handled by QEMU
+                } else {
+                    info.action = ExternAction.STUB_RETURN;
+                }
+
+                externs.add(info);
+            }
+        }
+        return externs;
+    }
+
+    private List<ExternFuncInfo> detectAllExternalFunctions() {
+        List<ExternFuncInfo> externs = new ArrayList<>();
+        if (currentProgram == null) return externs;
+        SymbolTable symTable = currentProgram.getSymbolTable();
+        SymbolIterator iter = symTable.getExternalSymbols();
+        int count = 0;
+        while (iter.hasNext() && count < 500) {
+            Symbol sym = iter.next();
+            if (sym.getSymbolType() == SymbolType.FUNCTION) {
+                String lib = "unknown";
+                try {
+                    ExternalLocation ext = currentProgram.getExternalManager()
+                            .getExternalLocation(sym);
+                    if (ext != null && ext.getLibraryName() != null)
+                        lib = ext.getLibraryName();
+                } catch (Exception ignored) {}
+
+                externs.add(new ExternFuncInfo(sym.getName(), sym.getAddress(), lib));
+                count++;
+            }
+        }
+        return externs;
+    }
+
+    // ===================================================================
+    // Global state detection
+    // ===================================================================
+
+    private List<GlobalRef> detectReferencedGlobals(Function func) {
+        List<GlobalRef> globals = new ArrayList<>();
+        if (func == null || currentProgram == null) return globals;
+
+        Set<Address> seen = new LinkedHashSet<>();
+        Listing listing = currentProgram.getListing();
+
+        // Walk instructions in function and find data references
+        AddressSetView body = func.getBody();
+        InstructionIterator instrIter = listing.getInstructions(body, true);
+
+        while (instrIter.hasNext()) {
+            Instruction instr = instrIter.next();
+            Reference[] refs = instr.getReferencesFrom();
+            for (Reference ref : refs) {
+                if (ref.getReferenceType().isData()) {
+                    Address target = ref.getToAddress();
+                    if (seen.contains(target)) continue;
+                    seen.add(target);
+
+                    // Check if it's a global data reference
+                    Data data = listing.getDefinedDataAt(target);
+                    if (data != null) {
+                        String name = null;
+                        Symbol sym = currentProgram.getSymbolTable()
+                                .getPrimarySymbol(target);
+                        if (sym != null) name = sym.getName();
+                        if (name == null) name = "DAT_" + target.toString();
+
+                        DataType dt = data.getDataType();
+                        long size = data.getLength();
+                        globals.add(new GlobalRef(name, target, size,
+                                dt != null ? dt.getName() : "undefined"));
+                    }
+                }
+            }
+        }
+        return globals;
+    }
+
+    // ===================================================================
+    // Config wizard (multi-tab dialog)
+    // ===================================================================
+
+    private boolean showConfigWizard(FuzzerConfig config) {
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.setPreferredSize(new Dimension(750, 500));
+
+        // --- Tab 1: General ---
+        JPanel generalTab = createGeneralTab(config);
+        tabs.addTab("General", generalTab);
+
+        // --- Tab 2: External Functions ---
+        JPanel externsTab = createExternsTab(config);
+        tabs.addTab("External Functions (" + config.externalFunctions.size() + ")",
+                externsTab);
+
+        // --- Tab 3: Global State ---
+        JPanel globalsTab = createGlobalsTab(config);
+        tabs.addTab("Globals (" + config.globals.size() + ")", globalsTab);
+
+        // --- Tab 4: Platform ---
+        JPanel platformTab = createPlatformTab(config);
+        tabs.addTab("Platform / Build", platformTab);
+
+        int result = JOptionPane.showConfirmDialog(null, tabs,
+                "LibAFL Fuzzer Configuration",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+
+        return result == JOptionPane.OK_OPTION;
+    }
+
+    // --- General tab ---
+
+    private JPanel createGeneralTab(FuzzerConfig config) {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(new EmptyBorder(10, 10, 10, 10));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(4, 4, 4, 4);
+        gbc.anchor = GridBagConstraints.WEST;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        int row = 0;
+
+        JTextField nameField = addLabeledField(panel, gbc, row++,
+                "Project name:", config.projectName);
+        JTextField binaryField = addLabeledField(panel, gbc, row++,
+                "Target binary:", config.targetBinaryPath);
+        JLabel archLabel = addLabeledInfo(panel, gbc, row++,
+                "Architecture:", config.arch.qemuName);
+        JLabel funcLabel = addLabeledInfo(panel, gbc, row++,
+                "Target:",
+                config.targetFunction != null
+                        ? config.targetFunction.getName() + " @ 0x"
+                            + Long.toHexString(config.entryAddress)
+                        : "Whole binary (from entry/main)");
+        JTextField entryField = addLabeledField(panel, gbc, row++,
+                "Entry address:", String.format("0x%x", config.entryAddress));
+        JTextField exitField = addLabeledField(panel, gbc, row++,
+                "Exit address:",
+                config.exitAddress != 0
+                        ? String.format("0x%x", config.exitAddress) : "auto");
+        JTextField maxSizeField = addLabeledField(panel, gbc, row++,
+                "Max input size:", String.valueOf(config.maxInputSize));
+
+        gbc.gridx = 0; gbc.gridy = row++; gbc.gridwidth = 2;
+        panel.add(Box.createVerticalStrut(8), gbc);
+
+        JCheckBox snapshotCheck = new JCheckBox("Use snapshots (fast state reset)",
+                config.useSnapshots);
+        gbc.gridy = row++;
+        panel.add(snapshotCheck, gbc);
+
+        JCheckBox cmplogCheck = new JCheckBox("Enable CmpLog (comparison coverage)",
+                config.useCmpLog);
+        gbc.gridy = row++;
+        panel.add(cmplogCheck, gbc);
+
+        JCheckBox dictCheck = new JCheckBox("Generate dictionary from binary strings",
+                config.generateDictionary);
+        gbc.gridy = row++;
+        panel.add(dictCheck, gbc);
+
+        // Fill remaining space
+        gbc.gridy = row; gbc.weighty = 1.0;
+        panel.add(Box.createGlue(), gbc);
+
+        // Wire values back on OK (we read them when dialog closes)
+        // Store references so we can read them later
+        panel.putClientProperty("nameField", nameField);
+        panel.putClientProperty("binaryField", binaryField);
+        panel.putClientProperty("entryField", entryField);
+        panel.putClientProperty("exitField", exitField);
+        panel.putClientProperty("maxSizeField", maxSizeField);
+        panel.putClientProperty("snapshotCheck", snapshotCheck);
+        panel.putClientProperty("cmplogCheck", cmplogCheck);
+        panel.putClientProperty("dictCheck", dictCheck);
+        panel.putClientProperty("config", config);
+
+        // Read values when the panel's parent dialog closes
+        panel.addHierarchyListener(e -> {
+            if ((e.getChangeFlags() & java.awt.event.HierarchyEvent.SHOWING_CHANGED) != 0
+                    && !panel.isShowing()) {
+                // Dialog closing — read values back into config
+                config.projectName = nameField.getText().trim();
+                config.targetBinaryPath = binaryField.getText().trim();
+                try { config.entryAddress = Long.decode(entryField.getText().trim()); }
+                catch (Exception ignored) {}
+                String exitText = exitField.getText().trim();
+                if (!"auto".equalsIgnoreCase(exitText) && !exitText.isEmpty()) {
+                    try { config.exitAddress = Long.decode(exitText); }
+                    catch (Exception ignored) {}
+                }
+                try { config.maxInputSize = Integer.parseInt(maxSizeField.getText().trim()); }
+                catch (Exception ignored) {}
+                config.useSnapshots = snapshotCheck.isSelected();
+                config.useCmpLog = cmplogCheck.isSelected();
+                config.generateDictionary = dictCheck.isSelected();
+            }
+        });
+
+        return panel;
+    }
+
+    private JTextField addLabeledField(JPanel panel, GridBagConstraints gbc,
+                                       int row, String label, String value) {
+        gbc.gridx = 0; gbc.gridy = row; gbc.gridwidth = 1; gbc.weightx = 0;
+        panel.add(new JLabel(label), gbc);
+        JTextField field = new JTextField(value, 35);
+        gbc.gridx = 1; gbc.weightx = 1.0;
+        panel.add(field, gbc);
+        return field;
+    }
+
+    private JLabel addLabeledInfo(JPanel panel, GridBagConstraints gbc,
+                                  int row, String label, String value) {
+        gbc.gridx = 0; gbc.gridy = row; gbc.gridwidth = 1; gbc.weightx = 0;
+        panel.add(new JLabel(label), gbc);
+        JLabel info = new JLabel(value);
+        info.setFont(info.getFont().deriveFont(Font.BOLD));
+        gbc.gridx = 1; gbc.weightx = 1.0;
+        panel.add(info, gbc);
+        return info;
+    }
+
+    // --- External Functions tab ---
+
+    private JPanel createExternsTab(FuzzerConfig config) {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(new EmptyBorder(10, 10, 10, 10));
+
+        if (config.externalFunctions.isEmpty()) {
+            panel.add(new JLabel(
+                    "<html><i>No external function calls detected in the target.</i></html>"),
+                    BorderLayout.CENTER);
+            return panel;
+        }
+
+        JLabel desc = new JLabel("<html>External functions called by the target. "
+                + "Choose how each should be handled during fuzzing:<br>"
+                + "<b>Stub</b> = replace with return 0, "
+                + "<b>Skip</b> = let QEMU handle it (libc etc.), "
+                + "<b>Hook</b> = custom Rust code.</html>");
+        desc.setBorder(new EmptyBorder(0, 0, 8, 0));
+        panel.add(desc, BorderLayout.NORTH);
+
+        // Table model
+        String[] columns = { "Function", "Library", "Address", "Action" };
+        AbstractTableModel model = new AbstractTableModel() {
+            @Override public int getRowCount() { return config.externalFunctions.size(); }
+            @Override public int getColumnCount() { return 4; }
+            @Override public String getColumnName(int col) { return columns[col]; }
+            @Override public Object getValueAt(int row, int col) {
+                ExternFuncInfo info = config.externalFunctions.get(row);
+                return switch (col) {
+                    case 0 -> info.name;
+                    case 1 -> info.library;
+                    case 2 -> info.address != null ? info.address.toString() : "N/A";
+                    case 3 -> info.action;
+                    default -> "";
+                };
+            }
+            @Override public boolean isCellEditable(int row, int col) { return col == 3; }
+            @Override public void setValueAt(Object val, int row, int col) {
+                if (col == 3 && val instanceof ExternAction ea) {
+                    config.externalFunctions.get(row).action = ea;
+                }
+            }
+            @Override public Class<?> getColumnClass(int col) {
+                return col == 3 ? ExternAction.class : String.class;
+            }
+        };
+
+        JTable table = new JTable(model);
+        table.getColumnModel().getColumn(0).setPreferredWidth(180);
+        table.getColumnModel().getColumn(1).setPreferredWidth(120);
+        table.getColumnModel().getColumn(2).setPreferredWidth(100);
+        table.getColumnModel().getColumn(3).setPreferredWidth(150);
+
+        // Combo box editor for Action column
+        JComboBox<ExternAction> combo = new JComboBox<>(ExternAction.values());
+        table.getColumnModel().getColumn(3).setCellEditor(
+                new DefaultCellEditor(combo));
+
+        panel.add(new JScrollPane(table), BorderLayout.CENTER);
+
+        // Bulk action buttons
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton stubAll = new JButton("Stub All Non-libc");
+        stubAll.addActionListener(e -> {
+            for (ExternFuncInfo info : config.externalFunctions) {
+                String n = info.name.toLowerCase(Locale.ROOT);
+                boolean isLibc = n.contains("malloc") || n.contains("free")
+                        || n.contains("memcpy") || n.contains("memset")
+                        || n.contains("printf") || n.contains("puts")
+                        || n.contains("strlen") || n.contains("strcmp")
+                        || n.contains("calloc") || n.contains("realloc");
+                info.action = isLibc ? ExternAction.SKIP : ExternAction.STUB_RETURN;
+            }
+            model.fireTableDataChanged();
+        });
+        JButton skipAll = new JButton("Skip All");
+        skipAll.addActionListener(e -> {
+            for (ExternFuncInfo info : config.externalFunctions)
+                info.action = ExternAction.SKIP;
+            model.fireTableDataChanged();
+        });
+        buttons.add(stubAll);
+        buttons.add(skipAll);
+        panel.add(buttons, BorderLayout.SOUTH);
+
+        return panel;
+    }
+
+    // --- Globals tab ---
+
+    private JPanel createGlobalsTab(FuzzerConfig config) {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(new EmptyBorder(10, 10, 10, 10));
+
+        if (config.globals.isEmpty()) {
+            panel.add(new JLabel(
+                    "<html><i>No global data references detected in the target function."
+                    + "<br>If the function uses global state, you may need to set it up "
+                    + "manually in harness.rs.</i></html>"),
+                    BorderLayout.CENTER);
+            return panel;
+        }
+
+        JLabel desc = new JLabel("<html>Global variables referenced by the target function. "
+                + "Check <b>Init</b> to write an initial value before each fuzz iteration. "
+                + "Values in hex (e.g. 0x41414141) or decimal.</html>");
+        desc.setBorder(new EmptyBorder(0, 0, 8, 0));
+        panel.add(desc, BorderLayout.NORTH);
+
+        String[] columns = { "Init?", "Name", "Address", "Type", "Size", "Init Value" };
+        AbstractTableModel model = new AbstractTableModel() {
+            @Override public int getRowCount() { return config.globals.size(); }
+            @Override public int getColumnCount() { return 6; }
+            @Override public String getColumnName(int col) { return columns[col]; }
+            @Override public Object getValueAt(int row, int col) {
+                GlobalRef g = config.globals.get(row);
+                return switch (col) {
+                    case 0 -> g.initialize;
+                    case 1 -> g.name;
+                    case 2 -> g.address.toString();
+                    case 3 -> g.dataTypeName;
+                    case 4 -> g.size;
+                    case 5 -> g.initValue;
+                    default -> "";
+                };
+            }
+            @Override public boolean isCellEditable(int row, int col) {
+                return col == 0 || col == 5;
+            }
+            @Override public void setValueAt(Object val, int row, int col) {
+                GlobalRef g = config.globals.get(row);
+                if (col == 0) g.initialize = (Boolean) val;
+                else if (col == 5) g.initValue = val.toString();
+            }
+            @Override public Class<?> getColumnClass(int col) {
+                if (col == 0) return Boolean.class;
+                if (col == 4) return Long.class;
+                return String.class;
+            }
+        };
+
+        JTable table = new JTable(model);
+        table.getColumnModel().getColumn(0).setPreferredWidth(40);
+        table.getColumnModel().getColumn(1).setPreferredWidth(160);
+        table.getColumnModel().getColumn(2).setPreferredWidth(100);
+        table.getColumnModel().getColumn(3).setPreferredWidth(90);
+        table.getColumnModel().getColumn(4).setPreferredWidth(50);
+        table.getColumnModel().getColumn(5).setPreferredWidth(120);
+        panel.add(new JScrollPane(table), BorderLayout.CENTER);
+
+        return panel;
+    }
+
+    // --- Platform tab ---
+
+    private JPanel createPlatformTab(FuzzerConfig config) {
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.setBorder(new EmptyBorder(10, 10, 10, 10));
+
+        JLabel info = new JLabel("<html><b>Platform Notes</b><br><br>"
+                + "LibAFL's QEMU usermode backend requires <b>Linux</b>. "
+                + "The generated project includes support for:<br><br>"
+                + "• <b>Native Linux</b> — build and run directly<br>"
+                + "• <b>WSL2 on Windows</b> — run.sh works inside WSL<br>"
+                + "• <b>Docker</b> — Dockerfile included for any platform<br><br>"
+                + "The generated <code>Dockerfile</code> and <code>docker-run.sh</code> "
+                + "handle all dependencies automatically.</html>");
+        info.setAlignmentX(Component.LEFT_ALIGNMENT);
+        panel.add(info);
+        panel.add(Box.createVerticalStrut(16));
+
+        JCheckBox dockerCheck = new JCheckBox("Generate Dockerfile + docker-run scripts",
+                true);
+        dockerCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
+        panel.add(dockerCheck);
+
+        JCheckBox wslCheck = new JCheckBox("Generate WSL launch script (for Windows)",
+                true);
+        wslCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
+        panel.add(wslCheck);
+
+        panel.add(Box.createVerticalGlue());
+
+        // Store for later
+        panel.putClientProperty("dockerCheck", dockerCheck);
+        panel.putClientProperty("wslCheck", wslCheck);
+
+        return panel;
+    }
+
+    // ===================================================================
+    // Project generation
+    // ===================================================================
+
+    private void generateProject(Path projectDir, FuzzerConfig config)
+            throws IOException {
+        Files.createDirectories(projectDir);
+        Files.createDirectories(projectDir.resolve("src"));
+        Files.createDirectories(projectDir.resolve("corpus"));
+        Files.createDirectories(projectDir.resolve("crashes"));
+
+        writeFile(projectDir.resolve("Cargo.toml"), genCargoToml(config));
+        writeFile(projectDir.resolve("src/main.rs"), genMainRs(config));
+        writeFile(projectDir.resolve("src/harness.rs"), genHarnessRs(config));
+        writeFile(projectDir.resolve("src/externals.rs"), genExternalsRs(config));
+        writeFile(projectDir.resolve("src/globals.rs"), genGlobalsRs(config));
+        writeFile(projectDir.resolve("run.ps1"), genRunPs1(config));
+        writeFile(projectDir.resolve("run.sh"), genRunSh(config));
+        writeFile(projectDir.resolve("Dockerfile"), genDockerfile(config));
+        writeFile(projectDir.resolve(".dockerignore"), genDockerIgnore(config));
+        writeFile(projectDir.resolve("README.md"), genReadme(config));
+
+        generateSeedCorpus(projectDir.resolve("corpus"), config);
+        if (config.generateDictionary) {
+            writeFile(projectDir.resolve("dictionary.txt"), genDictionary(config));
+        }
+
+        try { projectDir.resolve("run.sh").toFile().setExecutable(true); } catch (Exception ignored) {}
+    }
+
+    // ===================================================================
+    // Cargo.toml
+    // ===================================================================
+
+    private String genCargoToml(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("[package]\n");
+        s.append("name = \"").append(config.projectName).append("\"\n");
+        s.append("version = \"0.1.0\"\n");
+        s.append("edition = \"2021\"\n");
+        s.append("publish = false\n\n");
+        s.append("# Auto-generated by Ghidra LibAFL Fuzzer Generator\n");
+        s.append("# Target: ").append(config.targetBinaryPath).append("\n");
+        s.append("# Arch: ").append(config.arch.qemuName).append("\n\n");
+        s.append("[dependencies]\n");
+        s.append("libafl = { version = \"0.15\", features = [\"std\", \"derive\", \"llmp_compression\"] }\n");
+        s.append("libafl_bolts = { version = \"0.15\", features = [\"std\"] }\n");
+        s.append("libafl_qemu = { version = \"0.15\", features = [\"usermode\"] }\n");
+        s.append("libafl_qemu_sys = { version = \"0.15\" }\n");
+        s.append("libafl_targets = { version = \"0.15\", features = [\"std\"] }\n");
+        s.append("log = \"0.4\"\n");
+        s.append("env_logger = \"0.11\"\n\n");
+        s.append("[profile.release]\n");
+        s.append("opt-level = 3\n");
+        s.append("lto = \"thin\"\n");
+        s.append("codegen-units = 1\n");
+        s.append("debug = true\n");
+        return s.toString();
+    }
+
+    // ===================================================================
+    // src/main.rs
+    // ===================================================================
+
+    private String genMainRs(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("//! LibAFL QEMU fuzzer — auto-generated from Ghidra.\n");
+        s.append("//! Target: ").append(config.targetBinaryPath).append("\n");
+        if (config.targetFunction != null) {
+            s.append("//! Function: ").append(config.targetFunction.getName())
+             .append(" @ 0x").append(Long.toHexString(config.entryAddress)).append("\n");
+        }
+        s.append("//! Arch: ").append(config.arch.qemuName).append("\n\n");
+
+        s.append("use std::{env, path::PathBuf, process, time::Duration};\n\n");
+        s.append("use libafl::{\n");
+        s.append("    corpus::{InMemoryCorpus, OnDiskCorpus},\n");
+        s.append("    events::SimpleEventManager,\n");
+        s.append("    executors::ExitKind,\n");
+        s.append("    feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},\n");
+        s.append("    fuzzer::{Fuzzer, StdFuzzer},\n");
+        s.append("    generators::RandBytesGenerator,\n");
+        s.append("    monitors::SimpleMonitor,\n");
+        s.append("    mutators::{havoc_mutations, scheduled::StdScheduledMutator, Tokens},\n");
+        s.append("    observers::{CanTrack, HitcountsMapObserver, TimeObserver, StdMapObserver},\n");
+        s.append("    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},\n");
+        s.append("    stages::StdMutationalStage,\n");
+        s.append("    state::StdState,\n");
+        s.append("    HasMetadata,\n");
+        s.append("};\n");
+        s.append("use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};\n");
+        s.append("use libafl_qemu::{\n");
+        s.append("    elf::EasyElf, emu::Emulator, executor::QemuExecutor,\n");
+        s.append("    GuestAddr, GuestReg, MmapPerms, Qemu, QemuExitReason, Regs,\n");
+        s.append("};\n\n");
+        s.append("mod harness;\n");
+        s.append("mod externals;\n");
+        s.append("mod globals;\n\n");
+
+        s.append("const TARGET_ENTRY: GuestAddr = 0x")
+         .append(Long.toHexString(config.entryAddress)).append(";\n");
+        if (config.exitAddress != 0) {
+            s.append("const TARGET_EXIT: GuestAddr = 0x")
+             .append(Long.toHexString(config.exitAddress)).append(";\n");
+        }
+        s.append("const MAX_INPUT_SIZE: usize = ").append(config.maxInputSize).append(";\n");
+        s.append("const MAP_SIZE: usize = 65536;\n\n");
+
+        s.append("fn main() {\n");
+        s.append("    env_logger::init();\n\n");
+        s.append("    let args: Vec<String> = env::args().collect();\n");
+        s.append("    let qemu_args: Vec<String> = if let Some(pos) = args.iter().position(|a| a == \"--\") {\n");
+        s.append("        args[pos + 1..].to_vec()\n");
+        s.append("    } else {\n");
+        s.append("        eprintln!(\"Usage: {} -- <target_binary> [args]\", args[0]);\n");
+        s.append("        process::exit(1);\n");
+        s.append("    };\n\n");
+
+        s.append("    let emu = Emulator::builder().qemu_cli(qemu_args).build()\n");
+        s.append("        .expect(\"Failed to initialize QEMU\");\n");
+        s.append("    let qemu = emu.qemu();\n\n");
+
+        s.append("    // Set breakpoint at target entry and run to it\n");
+        s.append("    qemu.set_breakpoint(TARGET_ENTRY);\n");
+        s.append("    unsafe { qemu.run() };\n");
+        s.append("    log::info!(\"Reached target entry @ {:#x}\", TARGET_ENTRY);\n");
+        s.append("    qemu.remove_breakpoint(TARGET_ENTRY);\n\n");
+
+        s.append("    // Install external function hooks/stubs\n");
+        s.append("    externals::install_hooks(&qemu);\n\n");
+
+        if (config.exitAddress != 0) {
+            s.append("    let exit_bp = TARGET_EXIT;\n");
+        } else {
+            s.append("    let exit_bp = harness::find_exit_address(&qemu, TARGET_ENTRY);\n");
+        }
+        s.append("    qemu.set_breakpoint(exit_bp);\n\n");
+
+        s.append("    // Map input buffer in guest\n");
+        s.append("    let input_addr = qemu.map_private(0, MAX_INPUT_SIZE, MmapPerms::ReadWrite)\n");
+        s.append("        .expect(\"Failed to mmap input buffer\");\n\n");
+
+        s.append("    // Setup target state (registers, args, globals)\n");
+        s.append("    harness::setup_target_state(&qemu, input_addr, MAX_INPUT_SIZE);\n");
+        s.append("    globals::initialize_globals(&qemu);\n\n");
+
+        // Standard fuzzer setup
+        s.append("    let mut edges_shmem = vec![0u8; MAP_SIZE];\n");
+        s.append("    let edges_observer = unsafe {\n");
+        s.append("        HitcountsMapObserver::new(StdMapObserver::from_mut_slice(\"edges\", &mut edges_shmem))\n");
+        s.append("    };\n");
+        s.append("    let time_observer = TimeObserver::new(\"time\");\n");
+        s.append("    let mut feedback = MaxMapFeedback::new(&edges_observer);\n");
+        s.append("    let mut objective = CrashFeedback::new();\n\n");
+
+        s.append("    let mut state = StdState::new(\n");
+        s.append("        StdRand::with_seed(current_nanos()),\n");
+        s.append("        InMemoryCorpus::new(),\n");
+        s.append("        OnDiskCorpus::new(PathBuf::from(\"./crashes\")).unwrap(),\n");
+        s.append("        &mut feedback, &mut objective,\n");
+        s.append("    ).unwrap();\n\n");
+
+        if (config.generateDictionary) {
+            s.append("    // Load dictionary\n");
+            s.append("    if let Ok(data) = std::fs::read_to_string(\"dictionary.txt\") {\n");
+            s.append("        let mut tokens = Tokens::new();\n");
+            s.append("        for line in data.lines() {\n");
+            s.append("            let t = line.trim();\n");
+            s.append("            if !t.is_empty() && !t.starts_with('#') {\n");
+            s.append("                tokens.add_token(&t.trim_matches('\"').as_bytes().to_vec());\n");
+            s.append("            }\n");
+            s.append("        }\n");
+            s.append("        if !tokens.is_empty() { state.add_metadata(tokens); }\n");
+            s.append("    }\n\n");
+        }
+
+        s.append("    let monitor = SimpleMonitor::new(|s| println!(\"{s}\"));\n");
+        s.append("    let mut mgr = SimpleEventManager::new(monitor);\n");
+        s.append("    let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());\n");
+        s.append("    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);\n\n");
+
+        s.append("    let mut executor = QemuExecutor::new(\n");
+        s.append("        emu, &mut harness::harness_fn,\n");
+        s.append("        tuple_list!(edges_observer, time_observer),\n");
+        s.append("        &mut fuzzer, &mut state, &mut mgr,\n");
+        s.append("        Duration::from_secs(5),\n");
+        s.append("    ).expect(\"Failed to create executor\");\n\n");
+
+        s.append("    let corpus_dir = PathBuf::from(\"./corpus\");\n");
+        s.append("    if corpus_dir.exists() {\n");
+        s.append("        let _ = state.load_initial_inputs(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir]);\n");
+        s.append("    }\n");
+        s.append("    if state.corpus().count() == 0 {\n");
+        s.append("        let mut gen = RandBytesGenerator::new(MAX_INPUT_SIZE);\n");
+        s.append("        state.generate_initial_inputs(&mut fuzzer, &mut executor, &mut gen, &mut mgr, 256)\n");
+        s.append("            .expect(\"Failed to generate seeds\");\n");
+        s.append("    }\n\n");
+
+        s.append("    let mutator = StdScheduledMutator::new(havoc_mutations());\n");
+        s.append("    let mut stages = tuple_list!(StdMutationalStage::new(mutator));\n\n");
+
+        s.append("    println!(\"[*] Starting fuzzing...\");\n");
+        s.append("    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)\n");
+        s.append("        .expect(\"Fuzz loop failed\");\n");
+        s.append("}\n");
+
+        return s.toString();
+    }
+
+    // ===================================================================
+    // src/harness.rs
+    // ===================================================================
+
+    private String genHarnessRs(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("//! Target-specific harness. Auto-generated from Ghidra.\n\n");
+        s.append("use libafl::executors::ExitKind;\n");
+        s.append("use libafl::inputs::{BytesInput, HasTargetBytes};\n");
+        s.append("use libafl_qemu::{GuestAddr, GuestReg, Qemu, QemuExitReason, Regs};\n");
+        s.append("use libafl_bolts::AsSlice;\n\n");
+
+        s.append("static mut INPUT_ADDR: GuestAddr = 0;\n");
+        s.append("static mut INPUT_MAX_SIZE: usize = 0;\n\n");
+
+        // Decompiled code as reference
+        if (config.decompiledCode != null && !config.decompiledCode.isEmpty()) {
+            s.append("/*\n * Decompiled target (from Ghidra):\n");
+            for (String line : config.decompiledCode.split("\n")) {
+                s.append(" * ").append(line).append("\n");
+            }
+            s.append(" */\n\n");
+        }
+
+        // Memory map reference
+        s.append("// Memory map:\n");
+        for (MemRegion r : config.memoryMap) {
+            s.append(String.format("//   %-20s 0x%08x - 0x%08x %s%s%s\n",
+                    r.name, r.start, r.end,
+                    r.read ? "R" : "-", r.write ? "W" : "-", r.execute ? "X" : "-"));
+        }
+        s.append("\n");
+
+        // setup_target_state
+        s.append("pub fn setup_target_state(qemu: &Qemu, input_addr: GuestAddr, max_size: usize) {\n");
+        s.append("    unsafe { INPUT_ADDR = input_addr; INPUT_MAX_SIZE = max_size; }\n\n");
+        s.append("    // Set function arguments → (input_ptr, input_len)\n");
+        s.append("    // Adjust for actual function signature.\n");
+        switch (config.arch) {
+            case ARM: case AARCH64:
+                s.append("    let _ = qemu.write_reg(Regs::R0, input_addr);\n");
+                s.append("    let _ = qemu.write_reg(Regs::R1, max_size as GuestReg);\n");
+                break;
+            case X86:
+                s.append("    let sp: GuestAddr = qemu.read_reg(Regs::Esp).unwrap();\n");
+                s.append("    let _ = qemu.write_mem(sp + 4, &input_addr.to_le_bytes());\n");
+                s.append("    let _ = qemu.write_mem(sp + 8, &(max_size as u32).to_le_bytes());\n");
+                break;
+            case X86_64:
+                s.append("    let _ = qemu.write_reg(Regs::Rdi, input_addr);\n");
+                s.append("    let _ = qemu.write_reg(Regs::Rsi, max_size as GuestReg);\n");
+                break;
+            case MIPS: case MIPSEL:
+                s.append("    let _ = qemu.write_reg(Regs::A0, input_addr);\n");
+                s.append("    let _ = qemu.write_reg(Regs::A1, max_size as GuestReg);\n");
+                break;
+            default:
+                s.append("    // TODO: set registers for your calling convention\n");
+        }
+        s.append("}\n\n");
+
+        // find_exit_address
+        s.append("pub fn find_exit_address(qemu: &Qemu, _entry: GuestAddr) -> GuestAddr {\n");
+        switch (config.arch) {
+            case ARM: case AARCH64:
+                s.append("    let lr: GuestAddr = qemu.read_reg(Regs::Lr).unwrap();\n");
+                s.append("    log::info!(\"Exit address (LR): {:#x}\", lr);\n    lr\n");
+                break;
+            case X86:
+                s.append("    let sp: GuestAddr = qemu.read_reg(Regs::Esp).unwrap();\n");
+                s.append("    let mut buf = [0u8; 4];\n");
+                s.append("    let _ = qemu.read_mem(sp, &mut buf);\n");
+                s.append("    let ret = u32::from_le_bytes(buf) as GuestAddr;\n");
+                s.append("    log::info!(\"Exit address (ret): {:#x}\", ret);\n    ret\n");
+                break;
+            case X86_64:
+                s.append("    let sp: GuestAddr = qemu.read_reg(Regs::Rsp).unwrap();\n");
+                s.append("    let mut buf = [0u8; 8];\n");
+                s.append("    let _ = qemu.read_mem(sp, &mut buf);\n");
+                s.append("    let ret = u64::from_le_bytes(buf) as GuestAddr;\n");
+                s.append("    log::info!(\"Exit address (ret): {:#x}\", ret);\n    ret\n");
+                break;
+            default:
+                s.append("    log::warn!(\"Cannot auto-detect exit; using entry+0x1000\");\n");
+                s.append("    _entry + 0x1000\n");
+        }
+        s.append("}\n\n");
+
+        // harness_fn — simplified signature using impl trait
+        s.append("/// Per-iteration harness function.\n");
+        s.append("pub fn harness_fn(emu: &mut impl libafl_qemu::IsEmuExitHandler, input: &BytesInput) -> ExitKind {\n");
+        s.append("    let qemu = emu.qemu();\n");
+        s.append("    let target = input.target_bytes();\n");
+        s.append("    let bytes = target.as_slice();\n");
+        s.append("    let len = bytes.len().min(unsafe { INPUT_MAX_SIZE });\n");
+        s.append("    if len == 0 { return ExitKind::Ok; }\n\n");
+        s.append("    unsafe { let _ = qemu.write_mem(INPUT_ADDR, &bytes[..len]); }\n\n");
+        s.append("    // Update length argument\n");
+        switch (config.arch) {
+            case ARM: case AARCH64:
+                s.append("    let _ = qemu.write_reg(Regs::R1, len as GuestReg);\n"); break;
+            case X86_64:
+                s.append("    let _ = qemu.write_reg(Regs::Rsi, len as GuestReg);\n"); break;
+            case X86:
+                s.append("    let sp: GuestAddr = qemu.read_reg(Regs::Esp).unwrap();\n");
+                s.append("    let _ = qemu.write_mem(sp + 8, &(len as u32).to_le_bytes());\n"); break;
+            case MIPS: case MIPSEL:
+                s.append("    let _ = qemu.write_reg(Regs::A1, len as GuestReg);\n"); break;
+            default: s.append("    // TODO: update length arg\n");
+        }
+        s.append("\n    // Initialize globals before each iteration\n");
+        s.append("    crate::globals::initialize_globals(&qemu);\n\n");
+        s.append("    unsafe {\n");
+        s.append("        match qemu.run() {\n");
+        s.append("            Ok(QemuExitReason::Breakpoint(_)) => ExitKind::Ok,\n");
+        s.append("            Ok(QemuExitReason::End(_)) => ExitKind::Ok,\n");
+        s.append("            Err(_) => ExitKind::Crash,\n");
+        s.append("            _ => ExitKind::Ok,\n");
+        s.append("        }\n    }\n}\n");
+        return s.toString();
+    }
+
+    // ===================================================================
+    // src/externals.rs — external function stubs/hooks
+    // ===================================================================
+
+    private String genExternalsRs(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("//! External function stubs and hooks.\n");
+        s.append("//! Auto-generated from Ghidra import analysis.\n\n");
+        s.append("use libafl_qemu::{GuestAddr, GuestReg, Qemu, Regs};\n\n");
+
+        s.append("pub fn install_hooks(qemu: &Qemu) {\n");
+
+        boolean hasStubs = false;
+        for (ExternFuncInfo ext : config.externalFunctions) {
+            if (ext.action == ExternAction.SKIP) continue;
+            hasStubs = true;
+
+            String addrStr = ext.address != null
+                    ? "0x" + Long.toHexString(ext.address.getOffset())
+                    : "0 /* FIXME: unknown address */";
+
+            s.append("\n    // ").append(ext.name)
+             .append(" (").append(ext.library).append(")\n");
+
+            switch (ext.action) {
+                case STUB_RETURN:
+                    s.append("    // Stub: set return value to 0 and skip\n");
+                    s.append("    qemu.set_breakpoint(").append(addrStr).append(");\n");
+                    s.append("    // When hit, the hook handler should:\n");
+                    s.append("    //   1. Set return register to 0\n");
+                    s.append("    //   2. Set PC to return address\n");
+                    s.append("    log::info!(\"Stub installed for ").append(ext.name)
+                     .append(" @ {:#x}\", ").append(addrStr).append(");\n");
+                    break;
+                case STUB_PASSTHROUGH:
+                    s.append("    // Passthrough: function executes normally in QEMU\n");
+                    s.append("    log::info!(\"Passthrough for ").append(ext.name).append("\");\n");
+                    break;
+                case HOOK_CUSTOM:
+                    s.append("    // Custom hook — implement your logic here\n");
+                    s.append("    qemu.set_breakpoint(").append(addrStr).append(");\n");
+                    if (!ext.customHookCode.isEmpty()) {
+                        s.append("    ").append(ext.customHookCode).append("\n");
+                    } else {
+                        s.append("    // TODO: Add custom hook code for ").append(ext.name).append("\n");
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        if (!hasStubs) {
+            s.append("    // No stubs configured — all externals handled by QEMU's libc\n");
+            s.append("    log::info!(\"No external function hooks installed\");\n");
+        }
+
+        s.append("}\n\n");
+
+        // Document all externals
+        s.append("// All detected external functions:\n");
+        for (ExternFuncInfo ext : config.externalFunctions) {
+            s.append(String.format("//   %-30s %-15s %s  [%s]\n",
+                    ext.name, ext.library,
+                    ext.address != null ? ext.address.toString() : "N/A",
+                    ext.action.label));
+        }
+
+        return s.toString();
+    }
+
+    // ===================================================================
+    // src/globals.rs — global state initialization
+    // ===================================================================
+
+    private String genGlobalsRs(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("//! Global state initialization.\n");
+        s.append("//! Auto-generated from Ghidra data reference analysis.\n\n");
+        s.append("use libafl_qemu::{GuestAddr, Qemu};\n\n");
+
+        s.append("/// Initialize global variables before each fuzz iteration.\n");
+        s.append("/// This ensures deterministic state for reproducibility.\n");
+        s.append("pub fn initialize_globals(qemu: &Qemu) {\n");
+
+        boolean hasInits = false;
+        for (GlobalRef g : config.globals) {
+            if (!g.initialize) continue;
+            hasInits = true;
+
+            s.append("\n    // ").append(g.name)
+             .append(" (").append(g.dataTypeName)
+             .append(", ").append(g.size).append(" bytes)\n");
+            s.append("    {\n");
+            s.append("        let addr: GuestAddr = 0x")
+             .append(Long.toHexString(g.address.getOffset())).append(";\n");
+
+            // Parse init value
+            String val = g.initValue.trim();
+            if (g.size <= 8) {
+                s.append("        let value: u64 = ").append(val).append(";\n");
+                s.append("        let bytes = value.to_le_bytes();\n");
+                s.append("        let _ = qemu.write_mem(addr, &bytes[..").append(g.size).append("]);\n");
+            } else {
+                s.append("        // Zero-fill ").append(g.size).append(" bytes\n");
+                s.append("        let zeros = vec![0u8; ").append(g.size).append("];\n");
+                s.append("        let _ = qemu.write_mem(addr, &zeros);\n");
+            }
+            s.append("    }\n");
+        }
+
+        if (!hasInits) {
+            s.append("    // No globals configured for initialization.\n");
+            s.append("    // Use the Globals tab in the generator to select variables.\n");
+            s.append("    let _ = qemu; // suppress unused warning\n");
+        }
+
+        s.append("}\n\n");
+
+        // Document all detected globals
+        s.append("// All detected global references:\n");
+        for (GlobalRef g : config.globals) {
+            s.append(String.format("//   %-25s @ %-12s  %-15s  %d bytes  %s\n",
+                    g.name, g.address, g.dataTypeName, g.size,
+                    g.initialize ? "[INIT=" + g.initValue + "]" : ""));
+        }
+
+        return s.toString();
+    }
+
+    // ===================================================================
+    // Dockerfile
+    // ===================================================================
+
+    private String genDockerfile(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("# ").append(config.projectName).append(" — LibAFL QEMU Fuzzer\n");
+        s.append("# Multi-stage build: compiles QEMU + fuzzer, produces slim runtime image.\n\n");
+
+        s.append("FROM rust:1.82-bookworm AS builder\n\n");
+
+        s.append("# All build dependencies (cmake, ninja, python3-venv, QEMU libs)\n");
+        s.append("RUN apt-get update && apt-get install -y --no-install-recommends \\\n");
+        s.append("    build-essential cmake ninja-build pkg-config \\\n");
+        s.append("    python3 python3-venv python3-pip python3-setuptools \\\n");
+        s.append("    libglib2.0-dev libpixman-1-dev libslirp-dev \\\n");
+        s.append("    && rm -rf /var/lib/apt/lists/*\n\n");
+
+        s.append("WORKDIR /fuzzer\n");
+        s.append("COPY Cargo.toml .\n");
+        s.append("COPY src/ src/\n\n");
+
+        s.append("# Build (compiles QEMU from source — takes ~15 min first time)\n");
+        s.append("RUN cargo build --release 2>&1 | tail -20\n\n");
+
+        s.append("# --- Runtime stage ---\n");
+        s.append("FROM debian:bookworm-slim\n\n");
+        s.append("RUN apt-get update && apt-get install -y --no-install-recommends \\\n");
+        s.append("    libglib2.0-0 libpixman-1-0 libslirp0 \\\n");
+        s.append("    && rm -rf /var/lib/apt/lists/*\n\n");
+        s.append("WORKDIR /fuzzer\n");
+        s.append("COPY --from=builder /fuzzer/target/release/").append(config.projectName).append(" .\n");
+        s.append("COPY corpus/ corpus/\n");
+        s.append("COPY crashes/ crashes/\n");
+        if (config.generateDictionary) {
+            s.append("COPY dictionary.txt .\n");
+        }
+        s.append("\n# Mount your target binary at runtime:\n");
+        s.append("#   docker run -v /path/to/binary:/fuzzer/target_binary ...\n");
+        s.append("ENV RUST_LOG=info\n");
+        s.append("ENTRYPOINT [\"./").append(config.projectName).append("\"]\n");
+        s.append("CMD [\"--\", \"./target_binary\"]\n");
+        return s.toString();
+    }
+
+    // ===================================================================
+    // Scripts
+    // ===================================================================
+
+    private String genRunSh(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("#!/bin/bash\n");
+        s.append("# ").append(config.projectName).append(" — LibAFL QEMU Fuzzer\n");
+        s.append("# Works on native Linux and WSL2.\n");
+        s.append("set -e\n\n");
+
+        // Detect WSL and warn about /mnt/c performance
+        s.append("# --- Warn if building on Windows filesystem (slow) ---\n");
+        s.append("if [[ \"$(pwd)\" == /mnt/c/* ]] || [[ \"$(pwd)\" == /mnt/d/* ]]; then\n");
+        s.append("    echo \"\"\n");
+        s.append("    echo \"[!] WARNING: You are building on the Windows filesystem (/mnt/c/...).\"\n");
+        s.append("    echo \"    This is ~10x slower than building on the WSL native filesystem.\"\n");
+        s.append("    echo \"    Recommended: cp -r $(pwd) ~/").append(config.projectName).append(" && cd ~/").append(config.projectName).append("\"\n");
+        s.append("    echo \"\"\n");
+        s.append("fi\n\n");
+
+        // Dependency check
+        s.append("# --- Check dependencies ---\n");
+        s.append("MISSING=\"\"\n");
+        s.append("command -v cargo  >/dev/null 2>&1 || MISSING=\"$MISSING rust/cargo\"\n");
+        s.append("command -v cmake  >/dev/null 2>&1 || MISSING=\"$MISSING cmake\"\n");
+        s.append("command -v ninja  >/dev/null 2>&1 || MISSING=\"$MISSING ninja-build\"\n");
+        s.append("command -v python3 >/dev/null 2>&1 || MISSING=\"$MISSING python3\"\n");
+        s.append("command -v pkg-config >/dev/null 2>&1 || MISSING=\"$MISSING pkg-config\"\n");
+        s.append("python3 -c 'import ensurepip' 2>/dev/null || MISSING=\"$MISSING python3-venv\"\n\n");
+
+        // Check libraries
+        s.append("pkg-config --exists glib-2.0 2>/dev/null || MISSING=\"$MISSING libglib2.0-dev\"\n");
+        s.append("pkg-config --exists pixman-1 2>/dev/null || MISSING=\"$MISSING libpixman-1-dev\"\n\n");
+
+        s.append("if [ -n \"$MISSING\" ]; then\n");
+        s.append("    echo \"\"\n");
+        s.append("    echo \"[!] Missing dependencies:$MISSING\"\n");
+        s.append("    echo \"\"\n");
+        s.append("    echo \"    Install them with:\"\n");
+        s.append("    echo \"    sudo apt update && sudo apt install -y \\\\\"\n");
+        s.append("    echo \"        build-essential cmake ninja-build python3 python3-venv \\\\\"\n");
+        s.append("    echo \"        python3-pip libglib2.0-dev libpixman-1-dev libslirp-dev pkg-config\"\n");
+        s.append("    echo \"\"\n");
+        s.append("    if command -v apt >/dev/null 2>&1; then\n");
+        s.append("        read -p \"    Install now? [Y/n] \" -n 1 -r\n");
+        s.append("        echo\n");
+        s.append("        if [[ ! $REPLY =~ ^[Nn]$ ]]; then\n");
+        s.append("            sudo apt update\n");
+        s.append("            sudo apt install -y build-essential cmake ninja-build python3 python3-venv \\\n");
+        s.append("                python3-pip libglib2.0-dev libpixman-1-dev libslirp-dev pkg-config\n");
+        s.append("        else\n");
+        s.append("            exit 1\n");
+        s.append("        fi\n");
+        s.append("    else\n");
+        s.append("        exit 1\n");
+        s.append("    fi\n");
+        s.append("fi\n\n");
+
+        // Check Rust
+        s.append("if ! command -v cargo >/dev/null 2>&1; then\n");
+        s.append("    echo \"[!] Rust not found. Installing via rustup...\"\n");
+        s.append("    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n");
+        s.append("    source \"$HOME/.cargo/env\"\n");
+        s.append("fi\n\n");
+
+        // Build
+        s.append("echo \"[*] Building (first build compiles QEMU — this takes 10-20 min)...\"\n");
+        s.append("cargo build --release\n\n");
+
+        // Run
+        s.append("echo \"\"\n");
+        s.append("echo \"[*] Starting fuzzer\"\n");
+        s.append("echo \"    Arch:   ").append(config.arch.qemuName).append("\"\n");
+        s.append("echo \"    Entry:  0x").append(Long.toHexString(config.entryAddress)).append("\"\n");
+        s.append("echo \"\"\n");
+        s.append("RUST_LOG=info ./target/release/").append(config.projectName);
+        s.append(" -- \"${1:-").append(config.targetBinaryPath).append("}\" \"${@:2}\"\n");
+
+        return s.toString();
+    }
+
+    private String genRunBat(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("@echo off\n");
+        s.append("REM ").append(config.projectName).append(" - LibAFL QEMU Fuzzer\n");
+        s.append("REM LibAFL QEMU requires Linux. This script launches via WSL or Docker.\n");
+        s.append("REM For best results, copy the project into WSL and run run.sh directly.\n\n");
+
+        s.append("where wsl >nul 2>nul\n");
+        s.append("if %errorlevel% equ 0 (\n");
+        s.append("    echo [*] Launching via WSL...\n");
+        s.append("    echo     NOTE: Building on /mnt/c is slow. For faster builds:\n");
+        s.append("    echo       wsl cp -r \"%~dp0\" ~/").append(config.projectName).append("\n");
+        s.append("    echo       wsl bash -c \"cd ~/").append(config.projectName).append(" ^&^& bash run.sh\"\n");
+        s.append("    echo.\n");
+        s.append("    wsl bash -lc \"cd '$(wslpath '%~dp0')' && bash run.sh %*\"\n");
+        s.append(") else (\n");
+        s.append("    where docker >nul 2>nul\n");
+        s.append("    if %errorlevel% equ 0 (\n");
+        s.append("        echo [*] WSL not found. Using Docker...\n");
+        s.append("        docker build -t ").append(config.projectName).append(" \"%~dp0\"\n");
+        s.append("        docker run --rm -it -v \"%cd%\\corpus:/fuzzer/corpus\" ");
+        s.append("-v \"%cd%\\crashes:/fuzzer/crashes\" ");
+        s.append(config.projectName).append(" -- %*\n");
+        s.append("    ) else (\n");
+        s.append("        echo [!] Neither WSL nor Docker found.\n");
+        s.append("        echo     LibAFL QEMU requires Linux. Please install one of:\n");
+        s.append("        echo       - WSL2: wsl --install\n");
+        s.append("        echo       - Docker Desktop: https://docker.com/products/docker-desktop/\n");
+        s.append("        exit /b 1\n");
+        s.append("    )\n");
+        s.append(")\n");
+        return s.toString();
+    }
+
+    private String genDockerIgnore(FuzzerConfig config) {
+        return "target/\ncrashes/*\n*.exe\n*.pdb\n.git/\n";
+    }
+
+    /**
+     * PowerShell script — native Windows entry point.
+     * Uses Docker under the hood (no WSL needed).
+     */
+    private String genRunPs1(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("# ").append(config.projectName).append(" - LibAFL QEMU Fuzzer\n");
+        s.append("# Usage: .\\run.ps1 -TargetBinary <path> [-Rebuild] [-Shell]\n");
+        s.append("#\n");
+        s.append("# LibAFL QEMU requires Linux. This script uses Docker transparently.\n");
+        s.append("# Prerequisite: Docker Desktop (https://docker.com/products/docker-desktop/)\n\n");
+
+        s.append("param(\n");
+        s.append("    [Parameter(Mandatory=$true)]\n");
+        s.append("    [string]$TargetBinary,\n");
+        s.append("    [switch]$Rebuild,\n");
+        s.append("    [switch]$Shell\n");
+        s.append(")\n\n");
+
+        s.append("$ErrorActionPreference = \"Stop\"\n");
+        s.append("$ImageName = \"").append(config.projectName).append("\"\n");
+        s.append("$ProjectDir = $PSScriptRoot\n\n");
+
+        // Docker check
+        s.append("# --- Check Docker ---\n");
+        s.append("if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {\n");
+        s.append("    Write-Host \"`n[!] Docker not found.\" -ForegroundColor Red\n");
+        s.append("    Write-Host \"    Install Docker Desktop: https://docker.com/products/docker-desktop/\"\n");
+        s.append("    Write-Host \"    Or use WSL: wsl bash run.sh`n\"\n");
+        s.append("    exit 1\n");
+        s.append("}\n");
+        s.append("$null = docker info 2>&1\n");
+        s.append("if ($LASTEXITCODE -ne 0) {\n");
+        s.append("    Write-Host \"`n[!] Docker daemon not running. Start Docker Desktop first.`n\" -ForegroundColor Red\n");
+        s.append("    exit 1\n");
+        s.append("}\n\n");
+
+        // Build image
+        s.append("# --- Build image (cached after first run) ---\n");
+        s.append("$imageExists = docker images -q $ImageName 2>$null\n");
+        s.append("if ($Rebuild -or -not $imageExists) {\n");
+        s.append("    Write-Host \"`n[*] Building Docker image (first time takes ~15 min)...\" -ForegroundColor Cyan\n");
+        s.append("    docker build -t $ImageName $ProjectDir\n");
+        s.append("    if ($LASTEXITCODE -ne 0) { Write-Host \"[!] Build failed.\" -ForegroundColor Red; exit 1 }\n");
+        s.append("    Write-Host \"[+] Image ready.`n\" -ForegroundColor Green\n");
+        s.append("} else {\n");
+        s.append("    Write-Host \"[*] Using cached image (use -Rebuild to force rebuild)\" -ForegroundColor DarkGray\n");
+        s.append("}\n\n");
+
+        // Resolve binary
+        s.append("# --- Resolve target binary ---\n");
+        s.append("$resolved = Resolve-Path $TargetBinary\n");
+        s.append("$binaryName = Split-Path $resolved -Leaf\n");
+        s.append("$binaryDir  = Split-Path $resolved -Parent\n\n");
+
+        // Ensure corpus/crashes dirs
+        s.append("$corpusDir = Join-Path $ProjectDir \"corpus\"\n");
+        s.append("$crashDir  = Join-Path $ProjectDir \"crashes\"\n");
+        s.append("if (-not (Test-Path $corpusDir)) { $null = New-Item -ItemType Directory $corpusDir }\n");
+        s.append("if (-not (Test-Path $crashDir))  { $null = New-Item -ItemType Directory $crashDir }\n\n");
+
+        // Run
+        s.append("# --- Run ---\n");
+        s.append("$dockerArgs = @(\n");
+        s.append("    \"run\", \"--rm\", \"-it\",\n");
+        s.append("    \"-v\", \"${binaryDir}:/target:ro\",\n");
+        s.append("    \"-v\", \"${corpusDir}:/fuzzer/corpus\",\n");
+        s.append("    \"-v\", \"${crashDir}:/fuzzer/crashes\"\n");
+        s.append(")\n\n");
+
+        s.append("if ($Shell) {\n");
+        s.append("    Write-Host \"[*] Opening shell in container...\" -ForegroundColor Cyan\n");
+        s.append("    & docker @dockerArgs --entrypoint /bin/bash $ImageName\n");
+        s.append("} else {\n");
+        s.append("    Write-Host \"[*] Starting fuzzer\" -ForegroundColor Green\n");
+        s.append("    Write-Host \"    Binary: $resolved\"\n");
+        s.append("    Write-Host \"    Arch:   ").append(config.arch.qemuName).append("\"\n");
+        s.append("    Write-Host \"    Entry:  0x").append(Long.toHexString(config.entryAddress)).append("`n\"\n");
+        s.append("    & docker @dockerArgs $ImageName \"--\" \"/target/$binaryName\"\n");
+        s.append("}\n");
+
+        return s.toString();
+    }
+
+    // ===================================================================
+    // Dictionary + Corpus
+    // ===================================================================
+
+    private String genDictionary(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("# Dictionary from Ghidra string analysis\n\n");
+        for (String str : config.seedStrings) {
+            String escaped = str.replace("\\", "\\\\").replace("\"", "\\\"");
+            if (escaped.length() <= 64) s.append("\"").append(escaped).append("\"\n");
+        }
+        s.append("\n# Common edge-case tokens\n");
+        s.append("\"\\x00\\x00\\x00\\x00\"\n");
+        s.append("\"\\xff\\xff\\xff\\xff\"\n");
+        s.append("\"\\x7f\\xff\\xff\\xff\"\n");
+        s.append("\"\\x80\\x00\\x00\\x00\"\n");
+        return s.toString();
+    }
+
+    private void generateSeedCorpus(Path corpusDir, FuzzerConfig config)
+            throws IOException {
+        Files.write(corpusDir.resolve("seed_zeros"), new byte[64]);
+        byte[] inc = new byte[256];
+        for (int i = 0; i < 256; i++) inc[i] = (byte) i;
+        Files.write(corpusDir.resolve("seed_incremental"), inc);
+        int n = 3;
+        for (int i = 0; i < Math.min(config.seedStrings.size(), 10); i++) {
+            String str = config.seedStrings.get(i);
+            if (str.length() >= 4) {
+                Files.writeString(corpusDir.resolve("seed_str_" + n++), str);
+            }
+        }
+        byte[] ints = new byte[32];
+        putInt(ints, 0, 0); putInt(ints, 4, 1); putInt(ints, 8, -1);
+        putInt(ints, 12, Integer.MAX_VALUE); putInt(ints, 16, Integer.MIN_VALUE);
+        putInt(ints, 20, 0x41414141); putInt(ints, 24, 0xdeadbeef);
+        Files.write(corpusDir.resolve("seed_ints"), ints);
+    }
+
+    private void putInt(byte[] buf, int off, int val) {
+        buf[off] = (byte)(val); buf[off+1] = (byte)(val>>8);
+        buf[off+2] = (byte)(val>>16); buf[off+3] = (byte)(val>>24);
+    }
+
+    // ===================================================================
+    // README
+    // ===================================================================
+
+    private String genReadme(FuzzerConfig config) {
+        StringBuilder s = new StringBuilder();
+        s.append("# ").append(config.projectName).append("\n\n");
+        s.append("Auto-generated LibAFL QEMU fuzzer.\n\n");
+        s.append("## Target\n\n");
+        s.append("| | |\n|---|---|\n");
+        s.append("| Binary | `").append(config.targetBinaryPath).append("` |\n");
+        s.append("| Architecture | ").append(config.arch.qemuName).append(" |\n");
+        s.append("| Entry | `0x").append(Long.toHexString(config.entryAddress)).append("` |\n");
+        if (config.targetFunction != null) {
+            s.append("| Function | `").append(config.targetFunction.getName()).append("` |\n");
+        }
+        s.append("\n");
+
+        s.append("## Quick Start\n\n");
+        s.append("> LibAFL QEMU requires a Linux environment. Choose the option that fits your setup.\n\n");
+
+        // Windows PowerShell (Docker)
+        s.append("### Windows — PowerShell + Docker (easiest)\n\n");
+        s.append("Requires: [Docker Desktop](https://docker.com/products/docker-desktop/)\n\n");
+        s.append("```powershell\n");
+        s.append(".\\run.ps1 -TargetBinary .\\path\\to\\binary\n\n");
+        s.append("# First run builds the Docker image (~15 min), then cached.\n");
+        s.append("# Use -Rebuild to force rebuild, -Shell to get a bash shell inside.\n");
+        s.append("```\n\n");
+
+        // Windows CMD (WSL fallback)
+        s.append("### Windows — CMD/bat via WSL\n\n");
+        s.append("```cmd\n");
+        s.append("run.bat path\\to\\binary\n");
+        s.append("```\n\n");
+
+        // WSL direct
+        s.append("### WSL2 (fastest builds)\n\n");
+        s.append("```bash\n");
+        s.append("# Copy project to WSL filesystem for 10x faster builds:\n");
+        s.append("cp -r /mnt/c/.../").append(config.projectName).append(" ~/").append(config.projectName).append("\n");
+        s.append("cd ~/").append(config.projectName).append("\n\n");
+        s.append("# run.sh auto-checks and offers to install missing deps\n");
+        s.append("bash run.sh ./target_binary\n");
+        s.append("```\n\n");
+
+        // Native Linux
+        s.append("### Native Linux\n\n");
+        s.append("```bash\n");
+        s.append("# run.sh handles dependency checks automatically\n");
+        s.append("bash run.sh ./target_binary\n\n");
+        s.append("# Or manually:\n");
+        s.append("sudo apt install build-essential cmake ninja-build python3 python3-venv \\\n");
+        s.append("    libglib2.0-dev libpixman-1-dev libslirp-dev pkg-config\n");
+        s.append("cargo build --release\n");
+        s.append("RUST_LOG=info ./target/release/").append(config.projectName);
+        s.append(" -- ./target_binary\n");
+        s.append("```\n\n");
+
+        s.append("## Project Files\n\n");
+        s.append("| File | Purpose |\n|---|---|\n");
+        s.append("| `run.ps1` | **Windows entry point** — PowerShell + Docker |\n");
+        s.append("| `run.bat` | CMD wrapper — uses WSL or Docker |\n");
+        s.append("| `run.sh` | **Linux/WSL entry point** — auto-installs deps |\n");
+        s.append("| `Dockerfile` | Self-contained Linux build environment |\n");
+        s.append("| `src/harness.rs` | Target-specific harness (**edit this**) |\n");
+        s.append("| `src/externals.rs` | External function stubs/hooks |\n");
+        s.append("| `src/globals.rs` | Global variable initialization |\n");
+        s.append("| `dictionary.txt` | Token dictionary for mutations |\n");
+        s.append("| `corpus/` | Seed inputs |\n");
+        s.append("| `crashes/` | Crash-triggering inputs (output) |\n\n");
+
+        if (!config.externalFunctions.isEmpty()) {
+            s.append("## External Functions\n\n");
+            s.append("| Function | Library | Action |\n|---|---|---|\n");
+            for (ExternFuncInfo ext : config.externalFunctions) {
+                s.append("| `").append(ext.name).append("` | ")
+                 .append(ext.library).append(" | ")
+                 .append(ext.action.label).append(" |\n");
+            }
+            s.append("\n");
+        }
+
+        if (!config.globals.isEmpty()) {
+            s.append("## Referenced Globals\n\n");
+            s.append("| Name | Address | Type | Init? |\n|---|---|---|---|\n");
+            for (GlobalRef g : config.globals) {
+                s.append("| `").append(g.name).append("` | `")
+                 .append(g.address).append("` | ").append(g.dataTypeName)
+                 .append(" | ").append(g.initialize ? "Yes (" + g.initValue + ")" : "No")
+                 .append(" |\n");
+            }
+            s.append("\n");
+        }
+
+        s.append("## Troubleshooting\n\n");
+        s.append("| Problem | Solution |\n|---|---|\n");
+        s.append("| `cmake not found` | `sudo apt install cmake ninja-build` |\n");
+        s.append("| `ensurepip not found` | `sudo apt install python3-venv` |\n");
+        s.append("| `cargo not found` in WSL | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\| sh` |\n");
+        s.append("| Build very slow | Don't build on `/mnt/c/` — copy to `~/` in WSL |\n");
+        s.append("| Docker build fails | Ensure Docker Desktop is running with Linux containers |\n");
+        s.append("| No new coverage | Review `src/harness.rs` — input may not reach target code |\n");
+
+        return s.toString();
+    }
+
+    // ===================================================================
+    // Analysis helpers
+    // ===================================================================
+
+    private TargetArch detectArch() {
+        if (currentProgram == null) return TargetArch.UNKNOWN;
+        Language lang = currentProgram.getLanguage();
+        String proc = lang.getProcessor().toString().toLowerCase(Locale.ROOT);
+        int ptr = currentProgram.getDefaultPointerSize();
+        if (proc.contains("aarch64")) return TargetArch.AARCH64;
+        if (proc.contains("arm")) return ptr >= 8 ? TargetArch.AARCH64 : TargetArch.ARM;
+        if (proc.contains("x86")) return ptr >= 8 ? TargetArch.X86_64 : TargetArch.X86;
+        if (proc.contains("mips")) return lang.isBigEndian() ? TargetArch.MIPS : TargetArch.MIPSEL;
+        if (proc.contains("ppc")) return TargetArch.PPC;
+        return ptr >= 8 ? TargetArch.X86_64 : TargetArch.X86;
+    }
+
+    private List<MemRegion> extractMemoryMap() {
+        List<MemRegion> regions = new ArrayList<>();
+        if (currentProgram == null) return regions;
+        for (MemoryBlock block : currentProgram.getMemory().getBlocks()) {
+            if (!block.isInitialized() && !block.isMapped()) continue;
+            regions.add(new MemRegion(block.getName(),
+                    block.getStart().getOffset(), block.getEnd().getOffset(),
+                    block.isRead(), block.isWrite(), block.isExecute()));
+        }
+        return regions;
+    }
+
+    private List<String> extractInterestingStrings(int limit) {
+        List<String> strings = new ArrayList<>();
+        if (currentProgram == null) return strings;
+        DataIterator iter = currentProgram.getListing().getDefinedData(true);
+        int count = 0;
+        while (iter.hasNext() && count < limit) {
+            Data data = iter.next();
+            if (data.hasStringValue()) {
+                try {
+                    Object val = data.getValue();
+                    if (val instanceof String sv && sv.length() >= 3 && sv.length() <= 128) {
+                        strings.add(sv);
+                        count++;
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+        return strings;
+    }
+
+    private long findFunctionExitAddress(Function func) {
+        if (func == null) return 0;
+        try {
+            AddressSetView body = func.getBody();
+            Address max = body.getMaxAddress();
+            if (max != null) {
+                Instruction instr = currentProgram.getListing().getInstructionAt(max);
+                if (instr != null) return instr.getAddress().getOffset();
+                return max.getOffset();
+            }
+        } catch (Exception ignored) {}
+        return 0;
+    }
+
+    private String decompileFunction(Function func) {
+        if (func == null) return null;
+        try {
+            DecompInterface decomp = new DecompInterface();
+            decomp.openProgram(currentProgram);
+            DecompileResults results = decomp.decompileFunction(func, 30, TaskMonitor.DUMMY);
+            String code = results.decompileCompleted()
+                    ? results.getDecompiledFunction().getC() : null;
+            decomp.dispose();
+            return code;
+        } catch (Exception e) {
+            Msg.warn(this, "Decompilation failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private Symbol findSymbol(String name) {
+        if (currentProgram == null) return null;
+        SymbolIterator iter = currentProgram.getSymbolTable().getSymbols(name);
+        return iter.hasNext() ? iter.next() : null;
+    }
+
+    private String sanitizeName(String name) {
+        return name.replaceAll("[^a-zA-Z0-9_]", "_").replaceAll("_+", "_")
+                   .toLowerCase(Locale.ROOT);
+    }
+
+    private void writeFile(Path path, String content) throws IOException {
+        try (PrintWriter pw = new PrintWriter(new FileWriter(path.toFile()))) {
+            pw.print(content);
+        }
+    }
+
+    @Override
+    protected void dispose() {
+        if (generateAction != null) tool.removeAction(generateAction);
+        if (generateFromFuncAction != null) tool.removeAction(generateFromFuncAction);
+        super.dispose();
+    }
+}
