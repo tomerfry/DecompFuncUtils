@@ -574,10 +574,14 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         JPanel generalTab = createGeneralTab(config);
         tabs.addTab("General", generalTab);
 
-        // --- Tab 2: Input Mapping (NEW — most important tab) ---
-        if (config.targetFunction != null && !config.paramConfigs.isEmpty()) {
+        // --- Tab 2: Input Mapping (always shown when targeting a function) ---
+        if (config.targetFunction != null) {
             JPanel inputTab = createInputMappingTab(config);
-            tabs.addTab("★ Input Mapping (" + config.paramConfigs.size() + " params)", inputTab);
+            int paramCount = config.paramConfigs.size();
+            String tabTitle = paramCount > 0
+                ? "★ Input Mapping (" + paramCount + " params)"
+                : "★ Input Mapping (no params detected — add manually)";
+            tabs.addTab(tabTitle, inputTab);
             tabs.setSelectedIndex(1); // Focus on input mapping by default
         }
 
@@ -1077,7 +1081,7 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("libafl_bolts = { version = \"0.15\", features = [\"std\"] }\n");
         s.append("libafl_qemu = { version = \"0.15\", features = [\"usermode\"] }\n");
         s.append("libafl_qemu_sys = { version = \"0.15\" }\n");
-        s.append("libafl_targets = { version = \"0.15\", features = [\"std\"] }\n");
+        s.append("libafl_targets = { version = \"0.15\", features = [\"std\", \"pointer_maps\"] }\n");
         s.append("log = \"0.4\"\n");
         s.append("env_logger = \"0.11\"\n");
         s.append("goblin = \"0.10\"\n\n");
@@ -1116,15 +1120,17 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("    inputs::BytesInput,\n");
         s.append("    monitors::SimpleMonitor,\n");
         s.append("    mutators::{havoc_mutations, scheduled::HavocScheduledMutator, Tokens},\n");
-        s.append("    observers::{CanTrack, HitcountsMapObserver, TimeObserver, StdMapObserver},\n");
+        s.append("    observers::{CanTrack, HitcountsMapObserver, TimeObserver, VariableMapObserver},\n");
         s.append("    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},\n");
         s.append("    stages::StdMutationalStage,\n");
         s.append("    state::{HasCorpus, StdState},\n");
         s.append("    HasMetadata,\n");
         s.append("};\n");
         s.append("use libafl_bolts::{current_nanos, ownedref::OwnedMutSlice, rands::StdRand, tuples::tuple_list};\n");
+        s.append("use libafl_targets;\n");
         s.append("use libafl_qemu::{\n");
         s.append("    emu::Emulator, executor::QemuExecutor,\n");
+        s.append("    modules::edges::StdEdgeCoverageModule,\n");
         s.append("    GuestAddr, GuestReg, MmapPerms, Qemu, Regs,\n");
         s.append("};\n\n");
         s.append("mod harness;\n");
@@ -1145,9 +1151,7 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
              .append(Long.toHexString(config.mainAddress)).append(";\n");
         }
         s.append("const MAX_INPUT_SIZE: usize = ").append(config.maxInputSize).append(";\n");
-        s.append("const MAP_SIZE: usize = 65536;\n");
-        s.append("/// Fixed PIE load base — we pass -B to QEMU to force this address.\n");
-        s.append("const PIE_BASE: GuestAddr = 0x4000000000;\n\n");
+        s.append("\n");
 
         s.append("/// Resolve a Ghidra address to a runtime QEMU address.\n");
         s.append("/// For PIE binaries, Ghidra uses an image base (e.g. 0x100000) that differs\n");
@@ -1161,9 +1165,9 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("    resolved\n");
         s.append("}\n\n");
 
-        s.append("/// Determine the PIE load base by running to the ELF entry point.\n");
-        s.append("/// After Emulator::build(), QEMU has loaded the binary. We set a breakpoint\n");
-        s.append("/// at the entry point, run, and read PC to confirm.\n");
+        s.append("/// Determine the PIE load base from QEMU's internal state.\n");
+        s.append("/// After Emulator::build(), QEMU has loaded the binary into guest memory.\n");
+        s.append("/// We use multiple strategies to discover where it was loaded.\n");
         s.append("/// Returns (load_base, is_pie).\n");
         s.append("fn find_load_base(qemu: &Qemu) -> (GuestAddr, bool) {\n");
         s.append("    let args: Vec<String> = std::env::args().collect();\n");
@@ -1178,28 +1182,96 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("    let is_pie = elf.header.e_type == goblin::elf::header::ET_DYN;\n");
         s.append("    log::info!(\"ELF entry={:#x}, PIE={}\", elf_entry, is_pie);\n");
         s.append("    \n");
-        s.append("    // We force the load base via QEMU's -B flag in the args.\n");
-        s.append("    // For PIE: base = PIE_BASE (0x4000000000). For non-PIE: base = 0.\n");
-        s.append("    let load_base: GuestAddr = if is_pie { PIE_BASE } else { 0 };\n");
-        s.append("    let entry_addr = load_base + elf_entry;\n");
-        s.append("    log::info!(\"Expected entry at {:#x} (base={:#x})\", entry_addr, load_base);\n");
-        s.append("    \n");
-        s.append("    // Set breakpoint at entry and run to it\n");
-        s.append("    qemu.set_breakpoint(entry_addr);\n");
-        s.append("    unsafe { let _ = qemu.run(); }\n");
-        s.append("    \n");
-        s.append("    // Verify we stopped at the right place\n");
-        s.append("    let pc: u64 = qemu.read_reg(Regs::Pc).expect(\"Failed to read PC at entry\");\n");
-        s.append("    log::info!(\"PC at entry = {:#x} (expected {:#x})\", pc, entry_addr);\n");
-        s.append("    if pc != entry_addr {\n");
-        s.append("        log::warn!(\"PC mismatch! Binary may have loaded at unexpected address.\");\n");
-        s.append("        log::warn!(\"Actual load_base = {:#x}\", pc - elf_entry);\n");
-        s.append("    }\n");
-        s.append("    // Use actual PC to compute real base in case -B was ignored\n");
-        s.append("    let actual_base = pc - elf_entry;\n");
-        s.append("    qemu.remove_breakpoint(entry_addr);\n");
-        s.append("    \n");
-        s.append("    (actual_base, is_pie)\n");
+        s.append("    if !is_pie {\n");
+        s.append("        log::info!(\"Non-PIE binary, load_base = 0\");\n");
+        s.append("        return (0, false);\n");
+        s.append("    }\n\n");
+
+        s.append("    let first_load_vaddr: u64 = elf.program_headers.iter()\n");
+        s.append("        .find(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)\n");
+        s.append("        .map(|ph| ph.p_vaddr)\n");
+        s.append("        .unwrap_or(0);\n");
+        s.append("    let mut load_base: Option<GuestAddr> = None;\n\n");
+
+        // Strategy 1: Parse /proc/self/maps — match ANY mapping of the binary
+        s.append("    // Strategy 1: Parse /proc/self/maps.\n");
+        s.append("    // In QEMU usermode, the guest binary is mmap'd into the host process.\n");
+        s.append("    // Note: QEMU TCG doesn't mark guest code as r-xp (executable) — it loads\n");
+        s.append("    // segments as r--p/rw-p since TCG translates at runtime. So we match ANY\n");
+        s.append("    // mapping that contains the binary path.\n");
+        s.append("    // The load base = mapping_start - file_offset (from the maps line).\n");
+        s.append("    let binary_name = std::path::Path::new(binary_path)\n");
+        s.append("        .file_name().unwrap().to_str().unwrap();\n");
+        s.append("    log::info!(\"Searching /proc/self/maps for '{}'\", binary_name);\n");
+        s.append("    if let Ok(maps) = std::fs::read_to_string(\"/proc/self/maps\") {\n");
+        s.append("        for line in maps.lines() {\n");
+        s.append("            // Match any mapping that contains the binary name\n");
+        s.append("            if line.contains(binary_name) {\n");
+        s.append("                // Parse: addr_start-addr_end perms file_offset dev inode pathname\n");
+        s.append("                let parts: Vec<&str> = line.split_whitespace().collect();\n");
+        s.append("                if parts.len() >= 3 {\n");
+        s.append("                    let addr_str = parts[0].split('-').next().unwrap_or(\"\");\n");
+        s.append("                    let offset_str = parts[2];\n");
+        s.append("                    if let (Ok(map_addr), Ok(file_off)) = (\n");
+        s.append("                        u64::from_str_radix(addr_str, 16),\n");
+        s.append("                        u64::from_str_radix(offset_str, 16),\n");
+        s.append("                    ) {\n");
+        s.append("                        // load_base = mapping_addr - file_offset\n");
+        s.append("                        let base = map_addr - file_off;\n");
+        s.append("                        log::info!(\"Found binary mapping: {}\", line.trim());\n");
+        s.append("                        log::info!(\"  map_addr={:#x}, file_offset={:#x}, base={:#x}\",\n");
+        s.append("                            map_addr, file_off, base);\n");
+        s.append("                        load_base = Some(base);\n");
+        s.append("                        break;\n");
+        s.append("                    }\n");
+        s.append("                }\n");
+        s.append("            }\n");
+        s.append("        }\n");
+        s.append("        if load_base.is_none() {\n");
+        s.append("            log::warn!(\"Binary not found in /proc/self/maps. Dumping all mappings:\");\n");
+        s.append("            for line in maps.lines() {\n");
+        s.append("                log::warn!(\"  {}\", line);\n");
+        s.append("            }\n");
+        s.append("        }\n");
+        s.append("    } else {\n");
+        s.append("        log::warn!(\"/proc/self/maps not readable\");\n");
+        s.append("    }\n\n");
+
+        // Strategy 2: Multi-probe breakpoints at main (not _start, since QEMU may have passed _start)
+        s.append("    // Strategy 2: Probe by setting breakpoints at main() with candidate bases.\n");
+        s.append("    // Note: By the time Emulator::build() returns, QEMU may have already\n");
+        s.append("    // executed past _start. So we probe main() instead.\n");
+        s.append("    if load_base.is_none() {\n");
+
+        // Use mainAddress if available, otherwise fall back to entry
+        long probeAddr = config.mainAddress != 0 ? config.mainAddress : config.entryAddress;
+        long ghidraBase = config.imageBase;
+        long probeOffset = probeAddr - ghidraBase;
+
+        s.append("        let probe_offset: u64 = 0x")
+         .append(Long.toHexString(probeOffset)).append("; // file offset of probe target\n");
+        s.append("        log::info!(\"Probing with offset {:#x} from candidate bases...\", probe_offset);\n");
+        s.append("        let candidates: Vec<GuestAddr> = vec![\n");
+        s.append("            0x555555554000, 0x4000000000, 0x10000, 0x400000,\n");
+        s.append("            0x8000000, 0x100000, 0x0,\n");
+        s.append("        ];\n");
+        s.append("        for &cand in &candidates {\n");
+        s.append("            let addr = cand + probe_offset;\n");
+        s.append("            log::info!(\"  Setting BP at {:#x} (base={:#x})\", addr, cand);\n");
+        s.append("            qemu.set_breakpoint(addr);\n");
+        s.append("        }\n");
+        s.append("        unsafe { let _ = qemu.run(); }\n");
+        s.append("        let pc: u64 = qemu.read_reg(Regs::Pc).expect(\"read PC\");\n");
+        s.append("        log::info!(\"Stopped at PC={:#x}\", pc);\n");
+        s.append("        for &cand in &candidates {\n");
+        s.append("            qemu.remove_breakpoint(cand + probe_offset);\n");
+        s.append("        }\n");
+        s.append("        load_base = Some(pc - probe_offset);\n");
+        s.append("    }\n\n");
+
+        s.append("    let base = load_base.unwrap();\n");
+        s.append("    log::info!(\"Resolved load base = {:#x}\", base);\n");
+        s.append("    (base, is_pie)\n");
         s.append("}\n\n");
 
         s.append("fn main() {\n");
@@ -1207,9 +1279,6 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("    let args: Vec<String> = env::args().collect();\n");
         s.append("    let qemu_args: Vec<String> = if let Some(pos) = args.iter().position(|a| a == \"--\") {\n");
         s.append("        let mut qa = vec![\"qemu\".to_string()];\n");
-        s.append("        // Force PIE load base with -B so we know the exact address\n");
-        s.append("        qa.push(\"-B\".to_string());\n");
-        s.append("        qa.push(format!(\"{:#x}\", PIE_BASE));\n");
         s.append("        qa.extend_from_slice(&args[pos + 1..]);\n");
         s.append("        qa\n");
         s.append("    } else {\n");
@@ -1217,13 +1286,36 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("        process::exit(1);\n");
         s.append("    };\n\n");
 
-        s.append("    let emu = Emulator::builder().qemu_parameters(qemu_args).build()\n");
+        // Create the edges observer FIRST (before emulator, because the module needs it)
+        s.append("    // Coverage observer — connected to StdEdgeCoverageModule\n");
+        s.append("    let mut edges_observer = unsafe {\n");
+        s.append("        HitcountsMapObserver::new(VariableMapObserver::from_mut_slice(\n");
+        s.append("            \"edges\",\n");
+        s.append("            OwnedMutSlice::from_raw_parts_mut(\n");
+        s.append("                libafl_targets::edges_map_mut_ptr(),\n");
+        s.append("                libafl_targets::EDGES_MAP_DEFAULT_SIZE,\n");
+        s.append("            ),\n");
+        s.append("            std::ptr::addr_of_mut!(libafl_targets::MAX_EDGES_FOUND),\n");
+        s.append("        ))\n");
+        s.append("        .track_indices()\n");
+        s.append("    };\n\n");
+
+        s.append("    let emu = Emulator::builder()\n");
+        s.append("        .qemu_parameters(qemu_args)\n");
+        s.append("        .modules(tuple_list!(\n");
+        s.append("            StdEdgeCoverageModule::builder()\n");
+        s.append("                .map_observer(edges_observer.as_mut())\n");
+        s.append("                .build()\n");
+        s.append("                .expect(\"Failed to build edge coverage module\")\n");
+        s.append("        ))\n");
+        s.append("        .build()\n");
         s.append("        .expect(\"Failed to initialize QEMU\");\n");
         s.append("    let qemu = emu.qemu();\n\n");
 
-        s.append("    // === Phase 1: Run to _start to determine PIE load base ===\n");
+        s.append("    // === Phase 1: Determine PIE load base ===\n");
         s.append("    let (load_base, _is_pie) = find_load_base(&qemu);\n");
-        s.append("    // At this point, QEMU is stopped at _start.\n\n");
+        s.append("    // Note: After find_load_base, QEMU state may be at _start or still\n");
+        s.append("    // at initial state depending on which strategy succeeded.\n\n");
 
         // Phase 2: Run to main() for libc initialization (if main is known)
         if (config.mainAddress != 0) {
@@ -1271,23 +1363,25 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         // Set up exit breakpoint
         // We allocate a "ret-sled" page: a page of NOP/INT3 that the target returns to
         s.append("    // Allocate a return-sled page for the exit breakpoint\n");
-        s.append("    let ret_sled = qemu.map_private(0, 4096, MmapPerms::ReadWrite)\n");
+        s.append("    let ret_sled = qemu.map_private(0, 4096, MmapPerms::ReadWriteExecute)\n");
         s.append("        .expect(\"Failed to mmap ret-sled\");\n");
-        s.append("    // Fill with INT3 (0xCC) so any return hits a breakpoint\n");
-        s.append("    let sled_data = vec![0xCCu8; 4096];\n");
-        s.append("    unsafe { let _ = qemu.write_mem(ret_sled, &sled_data); }\n");
+        s.append("    // Fill with NOP (0x90) — the breakpoint fires before executing.\n");
+        s.append("    // Using NOP instead of INT3 avoids a crash if the BP mechanism\n");
+        s.append("    // doesn't fire before instruction execution.\n");
+        s.append("    let sled_data = vec![0x90u8; 4096];\n");
+        s.append("    let _ = qemu.write_mem(ret_sled, &sled_data);\n");
         s.append("    log::info!(\"Return sled at {:#x}\", ret_sled);\n\n");
 
         // Push ret_sled as return address and set PC
         switch (config.arch) {
             case X86_64:
                 s.append("    // Write ret_sled as return address on stack, set PC\n");
-                s.append("    unsafe { let _ = qemu.write_mem(sp, &ret_sled.to_le_bytes()); }\n");
+                s.append("    let _ = qemu.write_mem(sp, &ret_sled.to_le_bytes());\n");
                 s.append("    let _ = qemu.write_reg(Regs::Rsp, sp);\n");
                 s.append("    let _ = qemu.write_reg(Regs::Rip, target_entry);\n");
                 break;
             case X86:
-                s.append("    unsafe { let _ = qemu.write_mem(sp, &(ret_sled as u32).to_le_bytes()); }\n");
+                s.append("    let _ = qemu.write_mem(sp, &(ret_sled as u32).to_le_bytes());\n");
                 s.append("    let _ = qemu.write_reg(Regs::Esp, sp);\n");
                 s.append("    let _ = qemu.write_reg(Regs::Eip, target_entry);\n");
                 break;
@@ -1317,14 +1411,7 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("    // Save the initial state (PC, SP) for restoring each fuzzing iteration\n");
         s.append("    harness::save_state(&qemu);\n\n");
 
-        // Standard fuzzer setup
-        s.append("    let mut edges_shmem = vec![0u8; MAP_SIZE];\n");
-        s.append("    let edges_map = unsafe {\n");
-        s.append("        OwnedMutSlice::from_raw_parts_mut(edges_shmem.as_mut_ptr(), edges_shmem.len())\n");
-        s.append("    };\n");
-        s.append("    let edges_observer = HitcountsMapObserver::new(\n");
-        s.append("        StdMapObserver::from_mut_slice(\"edges\", edges_map)\n");
-        s.append("    ).track_indices();\n");
+        // Feedback & objective (observer was created above, before emulator)
         s.append("    let time_observer = TimeObserver::new(\"time\");\n");
         s.append("    let mut feedback = MaxMapFeedback::new(&edges_observer);\n");
         s.append("    let mut objective = CrashFeedback::new();\n\n");
@@ -1536,7 +1623,7 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("\n");
 
         s.append("    // Write fuzz data to the input buffer\n");
-        s.append("    unsafe { let _ = qemu.write_mem(INPUT_ADDR, &bytes[..len]); }\n\n");
+        s.append("    let _ = qemu.write_mem(unsafe { INPUT_ADDR }, &bytes[..len]);\n\n");
 
         // Set arguments per iteration based on paramConfigs
         s.append("    // Set arguments per input mapping\n");
