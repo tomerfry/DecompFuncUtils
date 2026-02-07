@@ -209,6 +209,62 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         }
     }
 
+    // --- Input mapping: how fuzz data reaches the target function ---
+
+    enum InputRole {
+        FUZZ_PTR("Fuzz buffer pointer",
+            "This parameter receives a pointer to the fuzz input data"),
+        FUZZ_LEN("Fuzz buffer length",
+            "This parameter receives the length of the fuzz input"),
+        FUZZ_VALUE("Fuzz scalar value",
+            "This parameter is directly fuzzed (raw bytes cast to its type)"),
+        FIXED("Fixed / constant value",
+            "This parameter gets a fixed value every iteration"),
+        IGNORE("Ignore / leave default",
+            "This parameter is left at its default (zero or whatever is in registers)");
+
+        final String label;
+        final String tooltip;
+        InputRole(String label, String tooltip) {
+            this.label = label; this.tooltip = tooltip;
+        }
+        @Override public String toString() { return label; }
+    }
+
+    static class FuncParamConfig {
+        String name;          // parameter name from Ghidra
+        String dataType;      // type string, e.g. "char *", "int", "size_t"
+        int index;            // 0-based parameter index
+        boolean isPointer;    // is it a pointer type?
+        InputRole role = InputRole.IGNORE;
+        String fixedValue = "0";  // used when role == FIXED (hex literal)
+        int fuzzValueSize = 4;    // byte width for FUZZ_VALUE
+
+        FuncParamConfig(String name, String dataType, int index, boolean isPointer) {
+            this.name = name;
+            this.dataType = dataType;
+            this.index = index;
+            this.isPointer = isPointer;
+        }
+    }
+
+    static class GlobalInputConfig {
+        String name;
+        long address;
+        long size;
+        String dataType;
+        boolean writeFuzzData = false;  // write fuzz input to this global each iteration
+        boolean initialize = false;      // initialize to a fixed value at setup
+        String initValue = "0";
+
+        GlobalInputConfig(String name, long address, long size, String dataType) {
+            this.name = name;
+            this.address = address;
+            this.size = size;
+            this.dataType = dataType;
+        }
+    }
+
     static class FuzzerConfig {
         String projectName;
         String targetBinaryPath;
@@ -216,6 +272,9 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         Function targetFunction;
         long entryAddress;
         long exitAddress;
+        long mainAddress;    // Address of main() for initialization
+        long imageBase;
+        long elfEntryPoint;
         boolean useSnapshots = true;
         boolean useCmpLog = true;
         boolean generateDictionary = true;
@@ -225,6 +284,10 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         List<String> seedStrings = new ArrayList<>();
         List<ExternFuncInfo> externalFunctions = new ArrayList<>();
         List<GlobalRef> globals = new ArrayList<>();
+
+        // Input mapping — how fuzz data reaches the target
+        List<FuncParamConfig> paramConfigs = new ArrayList<>();
+        List<GlobalInputConfig> globalInputs = new ArrayList<>();
     }
 
     // ===================================================================
@@ -282,10 +345,89 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         config.seedStrings = extractInterestingStrings(50);
         config.targetBinaryPath = currentProgram.getExecutablePath();
 
+        // Get Ghidra's image base (e.g. 0x100000 for PIE, 0x400000 for non-PIE x86_64)
+        config.imageBase = currentProgram.getImageBase().getOffset();
+
+        // Get the raw ELF entry point from the binary header.
+        // For PIE binaries this is a small offset like 0x1060.
+        // We compute it as: elfEntry = ghidraEntry - ghidraBase
+        // where ghidraEntry is what Ghidra shows for _start.
+        Address ghidraEntry = null;
+        Symbol startSym = findSymbol("_start");
+        if (startSym != null) {
+            ghidraEntry = startSym.getAddress();
+        } else {
+            // Fallback: use the minimum address or program's declared entry
+            ghidraEntry = currentProgram.getMinAddress();
+        }
+        // The raw ELF entry = ghidra entry - ghidra image base
+        config.elfEntryPoint = ghidraEntry.getOffset() - config.imageBase;
+
+        // Find main() address for initialization phase
+        Symbol mainSym = findSymbol("main");
+        if (mainSym != null) {
+            config.mainAddress = mainSym.getAddress().getOffset();
+        } else {
+            config.mainAddress = 0; // will skip main initialization phase
+        }
+
         if (targetFunc != null) {
             config.entryAddress = targetFunc.getEntryPoint().getOffset();
             config.exitAddress = findFunctionExitAddress(targetFunc);
             config.decompiledCode = decompileFunction(targetFunc);
+
+            // Extract function parameters for input mapping
+            Parameter[] params = targetFunc.getParameters();
+            for (int i = 0; i < params.length; i++) {
+                Parameter p = params[i];
+                DataType dt = p.getDataType();
+                String typeName = dt.getDisplayName();
+                boolean isPtr = typeName.contains("*") || typeName.contains("[]")
+                    || dt instanceof ghidra.program.model.data.Pointer;
+                FuncParamConfig pc = new FuncParamConfig(
+                    p.getName(), typeName, i, isPtr);
+
+                // Smart defaults: try to guess roles from names and types
+                String nameLower = p.getName().toLowerCase();
+                if (isPtr && (nameLower.contains("buf") || nameLower.contains("data")
+                        || nameLower.contains("input") || nameLower.contains("src")
+                        || nameLower.contains("str") || nameLower.contains("msg")
+                        || nameLower.contains("payload") || nameLower.contains("pkt")
+                        || nameLower.contains("ptr") || nameLower.contains("mem"))) {
+                    pc.role = InputRole.FUZZ_PTR;
+                } else if (!isPtr && (nameLower.contains("len") || nameLower.contains("size")
+                        || nameLower.contains("count") || nameLower.contains("nbytes")
+                        || nameLower.contains("sz") || nameLower.contains("length"))) {
+                    pc.role = InputRole.FUZZ_LEN;
+                } else if (isPtr && i == 0 && params.length >= 2) {
+                    // First pointer arg with a second arg → likely (buf, len)
+                    pc.role = InputRole.FUZZ_PTR;
+                } else if (!isPtr && i == 1 && params.length >= 2
+                        && config.paramConfigs.size() > 0
+                        && config.paramConfigs.get(0).role == InputRole.FUZZ_PTR) {
+                    // Second non-pointer arg after a FUZZ_PTR → likely length
+                    pc.role = InputRole.FUZZ_LEN;
+                }
+                config.paramConfigs.add(pc);
+            }
+
+            // If no params were marked as FUZZ_PTR, mark the first pointer as FUZZ_PTR
+            // and the first integer after it as FUZZ_LEN
+            boolean hasFuzzPtr = config.paramConfigs.stream()
+                .anyMatch(p -> p.role == InputRole.FUZZ_PTR);
+            if (!hasFuzzPtr) {
+                for (FuncParamConfig pc : config.paramConfigs) {
+                    if (pc.isPointer) { pc.role = InputRole.FUZZ_PTR; break; }
+                }
+                // Now find a length candidate after the ptr
+                boolean afterPtr = false;
+                for (FuncParamConfig pc : config.paramConfigs) {
+                    if (pc.role == InputRole.FUZZ_PTR) { afterPtr = true; continue; }
+                    if (afterPtr && !pc.isPointer && pc.role == InputRole.IGNORE) {
+                        pc.role = InputRole.FUZZ_LEN; break;
+                    }
+                }
+            }
         } else {
             Address entry = currentProgram.getMinAddress();
             Symbol sym = findSymbol("main");
@@ -426,22 +568,29 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
 
     private boolean showConfigWizard(FuzzerConfig config) {
         JTabbedPane tabs = new JTabbedPane();
-        tabs.setPreferredSize(new Dimension(750, 500));
+        tabs.setPreferredSize(new Dimension(800, 550));
 
         // --- Tab 1: General ---
         JPanel generalTab = createGeneralTab(config);
         tabs.addTab("General", generalTab);
 
-        // --- Tab 2: External Functions ---
+        // --- Tab 2: Input Mapping (NEW — most important tab) ---
+        if (config.targetFunction != null && !config.paramConfigs.isEmpty()) {
+            JPanel inputTab = createInputMappingTab(config);
+            tabs.addTab("★ Input Mapping (" + config.paramConfigs.size() + " params)", inputTab);
+            tabs.setSelectedIndex(1); // Focus on input mapping by default
+        }
+
+        // --- Tab 3: External Functions ---
         JPanel externsTab = createExternsTab(config);
         tabs.addTab("External Functions (" + config.externalFunctions.size() + ")",
                 externsTab);
 
-        // --- Tab 3: Global State ---
+        // --- Tab 4: Global State ---
         JPanel globalsTab = createGlobalsTab(config);
         tabs.addTab("Globals (" + config.globals.size() + ")", globalsTab);
 
-        // --- Tab 4: Platform ---
+        // --- Tab 5: Platform ---
         JPanel platformTab = createPlatformTab(config);
         tabs.addTab("Platform / Build", platformTab);
 
@@ -563,6 +712,128 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         gbc.gridx = 1; gbc.weightx = 1.0;
         panel.add(info, gbc);
         return info;
+    }
+
+    // --- Input Mapping tab ---
+
+    private JPanel createInputMappingTab(FuzzerConfig config) {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(new EmptyBorder(8, 8, 8, 8));
+
+        // Top: function signature display
+        JPanel sigPanel = new JPanel(new BorderLayout());
+        sigPanel.setBorder(BorderFactory.createTitledBorder("Target Function"));
+        String sig = buildFuncSignature(config);
+        JTextArea sigArea = new JTextArea(sig);
+        sigArea.setEditable(false);
+        sigArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        sigArea.setRows(3);
+        sigArea.setBackground(new Color(245, 245, 245));
+        sigPanel.add(new JScrollPane(sigArea), BorderLayout.CENTER);
+        panel.add(sigPanel, BorderLayout.NORTH);
+
+        // Center: parameter table
+        JPanel centerPanel = new JPanel(new BorderLayout(4, 4));
+        centerPanel.setBorder(BorderFactory.createTitledBorder(
+            "Parameter → Input Mapping (configure how fuzz data reaches each parameter)"));
+
+        String[] colNames = {"#", "Name", "Type", "Role", "Fixed Value"};
+        Object[][] tableData = new Object[config.paramConfigs.size()][5];
+        for (int i = 0; i < config.paramConfigs.size(); i++) {
+            FuncParamConfig p = config.paramConfigs.get(i);
+            tableData[i] = new Object[]{
+                p.index, p.name, p.dataType, p.role, p.fixedValue
+            };
+        }
+
+        javax.swing.table.DefaultTableModel model = new javax.swing.table.DefaultTableModel(
+                tableData, colNames) {
+            @Override public boolean isCellEditable(int row, int col) {
+                return col == 3 || col == 4; // only role and fixed value
+            }
+            @Override public Class<?> getColumnClass(int col) {
+                if (col == 3) return InputRole.class;
+                return String.class;
+            }
+        };
+        JTable table = new JTable(model);
+        table.setRowHeight(26);
+        table.getColumnModel().getColumn(0).setPreferredWidth(30);
+        table.getColumnModel().getColumn(1).setPreferredWidth(120);
+        table.getColumnModel().getColumn(2).setPreferredWidth(120);
+        table.getColumnModel().getColumn(3).setPreferredWidth(180);
+        table.getColumnModel().getColumn(4).setPreferredWidth(120);
+
+        // Role column: combo box editor
+        JComboBox<InputRole> roleCombo = new JComboBox<>(InputRole.values());
+        table.getColumnModel().getColumn(3).setCellEditor(
+                new DefaultCellEditor(roleCombo));
+
+        centerPanel.add(new JScrollPane(table), BorderLayout.CENTER);
+
+        // Help text
+        JTextArea helpText = new JTextArea(
+            "Roles:\n" +
+            "  • Fuzz buffer pointer — receives pointer to the mmap'd fuzz input buffer\n" +
+            "  • Fuzz buffer length — receives the current fuzz input length\n" +
+            "  • Fuzz scalar value — parameter itself is fuzzed (e.g. int flags)\n" +
+            "  • Fixed / constant — always set to the value in 'Fixed Value' column (hex)\n" +
+            "  • Ignore — left at default (zero)\n\n" +
+            "Typical pattern: func(char* buf, size_t len) → buf=Fuzz ptr, len=Fuzz len"
+        );
+        helpText.setEditable(false);
+        helpText.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
+        helpText.setRows(6);
+        helpText.setBackground(panel.getBackground());
+        centerPanel.add(helpText, BorderLayout.SOUTH);
+
+        panel.add(centerPanel, BorderLayout.CENTER);
+
+        // Wire values back on close
+        panel.addHierarchyListener(e -> {
+            if ((e.getChangeFlags() & java.awt.event.HierarchyEvent.SHOWING_CHANGED) != 0
+                    && !panel.isShowing()) {
+                // Stop any active editing
+                if (table.isEditing()) table.getCellEditor().stopCellEditing();
+                for (int i = 0; i < config.paramConfigs.size(); i++) {
+                    Object roleVal = model.getValueAt(i, 3);
+                    if (roleVal instanceof InputRole) {
+                        config.paramConfigs.get(i).role = (InputRole) roleVal;
+                    }
+                    Object fixVal = model.getValueAt(i, 4);
+                    if (fixVal != null) {
+                        config.paramConfigs.get(i).fixedValue = fixVal.toString();
+                    }
+                }
+            }
+        });
+
+        return panel;
+    }
+
+    private String buildFuncSignature(FuzzerConfig config) {
+        if (config.targetFunction == null) return "(no function selected)";
+        StringBuilder sb = new StringBuilder();
+        // Show decompiled prototype
+        String retType = config.targetFunction.getReturnType().getDisplayName();
+        sb.append(retType).append(" ").append(config.targetFunction.getName()).append("(");
+        for (int i = 0; i < config.paramConfigs.size(); i++) {
+            if (i > 0) sb.append(", ");
+            FuncParamConfig p = config.paramConfigs.get(i);
+            sb.append(p.dataType).append(" ").append(p.name);
+        }
+        sb.append(")");
+        sb.append("\n@ 0x").append(Long.toHexString(config.entryAddress));
+        if (config.decompiledCode != null) {
+            // Show first few lines of decompiled code
+            String[] lines = config.decompiledCode.split("\n");
+            sb.append("\n\n");
+            for (int i = 0; i < Math.min(lines.length, 5); i++) {
+                sb.append(lines[i]).append("\n");
+            }
+            if (lines.length > 5) sb.append("  ...");
+        }
+        return sb.toString();
     }
 
     // --- External Functions tab ---
@@ -808,7 +1079,8 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("libafl_qemu_sys = { version = \"0.15\" }\n");
         s.append("libafl_targets = { version = \"0.15\", features = [\"std\"] }\n");
         s.append("log = \"0.4\"\n");
-        s.append("env_logger = \"0.11\"\n\n");
+        s.append("env_logger = \"0.11\"\n");
+        s.append("goblin = \"0.10\"\n\n");
         s.append("[profile.release]\n");
         s.append("opt-level = 3\n");
         s.append("lto = \"thin\"\n");
@@ -824,6 +1096,7 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
     private String genMainRs(FuzzerConfig config) {
         StringBuilder s = new StringBuilder();
         s.append("//! LibAFL QEMU fuzzer — auto-generated from Ghidra.\n");
+        s.append("#![allow(dead_code, unused_variables)]\n");
         s.append("//! Target: ").append(config.targetBinaryPath).append("\n");
         if (config.targetFunction != null) {
             s.append("//! Function: ").append(config.targetFunction.getName())
@@ -832,82 +1105,226 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("//! Arch: ").append(config.arch.qemuName).append("\n\n");
 
         s.append("use std::{env, path::PathBuf, process, time::Duration};\n\n");
+        s.append("use std::num::NonZeroUsize;\n");
         s.append("use libafl::{\n");
-        s.append("    corpus::{InMemoryCorpus, OnDiskCorpus},\n");
+        s.append("    corpus::{Corpus, InMemoryCorpus, OnDiskCorpus},\n");
         s.append("    events::SimpleEventManager,\n");
         s.append("    executors::ExitKind,\n");
-        s.append("    feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},\n");
+        s.append("    feedbacks::{CrashFeedback, MaxMapFeedback},\n");
         s.append("    fuzzer::{Fuzzer, StdFuzzer},\n");
         s.append("    generators::RandBytesGenerator,\n");
+        s.append("    inputs::BytesInput,\n");
         s.append("    monitors::SimpleMonitor,\n");
-        s.append("    mutators::{havoc_mutations, scheduled::StdScheduledMutator, Tokens},\n");
+        s.append("    mutators::{havoc_mutations, scheduled::HavocScheduledMutator, Tokens},\n");
         s.append("    observers::{CanTrack, HitcountsMapObserver, TimeObserver, StdMapObserver},\n");
         s.append("    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},\n");
         s.append("    stages::StdMutationalStage,\n");
-        s.append("    state::StdState,\n");
+        s.append("    state::{HasCorpus, StdState},\n");
         s.append("    HasMetadata,\n");
         s.append("};\n");
-        s.append("use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};\n");
+        s.append("use libafl_bolts::{current_nanos, ownedref::OwnedMutSlice, rands::StdRand, tuples::tuple_list};\n");
         s.append("use libafl_qemu::{\n");
-        s.append("    elf::EasyElf, emu::Emulator, executor::QemuExecutor,\n");
-        s.append("    GuestAddr, GuestReg, MmapPerms, Qemu, QemuExitReason, Regs,\n");
+        s.append("    emu::Emulator, executor::QemuExecutor,\n");
+        s.append("    GuestAddr, GuestReg, MmapPerms, Qemu, Regs,\n");
         s.append("};\n\n");
         s.append("mod harness;\n");
         s.append("mod externals;\n");
         s.append("mod globals;\n\n");
 
-        s.append("const TARGET_ENTRY: GuestAddr = 0x")
+        s.append("/// Ghidra addresses (with Ghidra's image base)\n");
+        s.append("const GHIDRA_ENTRY: GuestAddr = 0x")
          .append(Long.toHexString(config.entryAddress)).append(";\n");
+        s.append("const GHIDRA_BASE: GuestAddr = 0x")
+         .append(Long.toHexString(config.imageBase)).append(";\n");
         if (config.exitAddress != 0) {
-            s.append("const TARGET_EXIT: GuestAddr = 0x")
+            s.append("const GHIDRA_EXIT: GuestAddr = 0x")
              .append(Long.toHexString(config.exitAddress)).append(";\n");
         }
+        if (config.mainAddress != 0) {
+            s.append("const GHIDRA_MAIN: GuestAddr = 0x")
+             .append(Long.toHexString(config.mainAddress)).append(";\n");
+        }
         s.append("const MAX_INPUT_SIZE: usize = ").append(config.maxInputSize).append(";\n");
-        s.append("const MAP_SIZE: usize = 65536;\n\n");
+        s.append("const MAP_SIZE: usize = 65536;\n");
+        s.append("/// Fixed PIE load base — we pass -B to QEMU to force this address.\n");
+        s.append("const PIE_BASE: GuestAddr = 0x4000000000;\n\n");
+
+        s.append("/// Resolve a Ghidra address to a runtime QEMU address.\n");
+        s.append("/// For PIE binaries, Ghidra uses an image base (e.g. 0x100000) that differs\n");
+        s.append("/// from QEMU's actual load address. This function computes the file offset\n");
+        s.append("/// and adds it to the actual QEMU load base.\n");
+        s.append("fn resolve_addr(load_base: GuestAddr, ghidra_addr: GuestAddr) -> GuestAddr {\n");
+        s.append("    let file_offset = ghidra_addr - GHIDRA_BASE;\n");
+        s.append("    let resolved = load_base + file_offset;\n");
+        s.append("    log::info!(\"Resolved {:#x} (Ghidra) -> {:#x} (QEMU) [base={:#x}, offset={:#x}]\",\n");
+        s.append("        ghidra_addr, resolved, load_base, file_offset);\n");
+        s.append("    resolved\n");
+        s.append("}\n\n");
+
+        s.append("/// Determine the PIE load base by running to the ELF entry point.\n");
+        s.append("/// After Emulator::build(), QEMU has loaded the binary. We set a breakpoint\n");
+        s.append("/// at the entry point, run, and read PC to confirm.\n");
+        s.append("/// Returns (load_base, is_pie).\n");
+        s.append("fn find_load_base(qemu: &Qemu) -> (GuestAddr, bool) {\n");
+        s.append("    let args: Vec<String> = std::env::args().collect();\n");
+        s.append("    let binary_path = args.iter().rev()\n");
+        s.append("        .find(|a| !a.starts_with('-') && *a != \"--\")\n");
+        s.append("        .expect(\"Could not find binary path in args\");\n");
+        s.append("    \n");
+        s.append("    log::info!(\"Parsing ELF: {}\", binary_path);\n");
+        s.append("    let binary_data = std::fs::read(binary_path).expect(\"Failed to read binary\");\n");
+        s.append("    let elf = goblin::elf::Elf::parse(&binary_data).expect(\"Failed to parse ELF\");\n");
+        s.append("    let elf_entry = elf.entry;\n");
+        s.append("    let is_pie = elf.header.e_type == goblin::elf::header::ET_DYN;\n");
+        s.append("    log::info!(\"ELF entry={:#x}, PIE={}\", elf_entry, is_pie);\n");
+        s.append("    \n");
+        s.append("    // We force the load base via QEMU's -B flag in the args.\n");
+        s.append("    // For PIE: base = PIE_BASE (0x4000000000). For non-PIE: base = 0.\n");
+        s.append("    let load_base: GuestAddr = if is_pie { PIE_BASE } else { 0 };\n");
+        s.append("    let entry_addr = load_base + elf_entry;\n");
+        s.append("    log::info!(\"Expected entry at {:#x} (base={:#x})\", entry_addr, load_base);\n");
+        s.append("    \n");
+        s.append("    // Set breakpoint at entry and run to it\n");
+        s.append("    qemu.set_breakpoint(entry_addr);\n");
+        s.append("    unsafe { let _ = qemu.run(); }\n");
+        s.append("    \n");
+        s.append("    // Verify we stopped at the right place\n");
+        s.append("    let pc: u64 = qemu.read_reg(Regs::Pc).expect(\"Failed to read PC at entry\");\n");
+        s.append("    log::info!(\"PC at entry = {:#x} (expected {:#x})\", pc, entry_addr);\n");
+        s.append("    if pc != entry_addr {\n");
+        s.append("        log::warn!(\"PC mismatch! Binary may have loaded at unexpected address.\");\n");
+        s.append("        log::warn!(\"Actual load_base = {:#x}\", pc - elf_entry);\n");
+        s.append("    }\n");
+        s.append("    // Use actual PC to compute real base in case -B was ignored\n");
+        s.append("    let actual_base = pc - elf_entry;\n");
+        s.append("    qemu.remove_breakpoint(entry_addr);\n");
+        s.append("    \n");
+        s.append("    (actual_base, is_pie)\n");
+        s.append("}\n\n");
 
         s.append("fn main() {\n");
         s.append("    env_logger::init();\n\n");
         s.append("    let args: Vec<String> = env::args().collect();\n");
         s.append("    let qemu_args: Vec<String> = if let Some(pos) = args.iter().position(|a| a == \"--\") {\n");
-        s.append("        args[pos + 1..].to_vec()\n");
+        s.append("        let mut qa = vec![\"qemu\".to_string()];\n");
+        s.append("        // Force PIE load base with -B so we know the exact address\n");
+        s.append("        qa.push(\"-B\".to_string());\n");
+        s.append("        qa.push(format!(\"{:#x}\", PIE_BASE));\n");
+        s.append("        qa.extend_from_slice(&args[pos + 1..]);\n");
+        s.append("        qa\n");
         s.append("    } else {\n");
         s.append("        eprintln!(\"Usage: {} -- <target_binary> [args]\", args[0]);\n");
         s.append("        process::exit(1);\n");
         s.append("    };\n\n");
 
-        s.append("    let emu = Emulator::builder().qemu_cli(qemu_args).build()\n");
+        s.append("    let emu = Emulator::builder().qemu_parameters(qemu_args).build()\n");
         s.append("        .expect(\"Failed to initialize QEMU\");\n");
         s.append("    let qemu = emu.qemu();\n\n");
 
-        s.append("    // Set breakpoint at target entry and run to it\n");
-        s.append("    qemu.set_breakpoint(TARGET_ENTRY);\n");
-        s.append("    unsafe { qemu.run() };\n");
-        s.append("    log::info!(\"Reached target entry @ {:#x}\", TARGET_ENTRY);\n");
-        s.append("    qemu.remove_breakpoint(TARGET_ENTRY);\n\n");
+        s.append("    // === Phase 1: Run to _start to determine PIE load base ===\n");
+        s.append("    let (load_base, _is_pie) = find_load_base(&qemu);\n");
+        s.append("    // At this point, QEMU is stopped at _start.\n\n");
+
+        // Phase 2: Run to main() for libc initialization (if main is known)
+        if (config.mainAddress != 0) {
+            s.append("    // === Phase 2: Run to main() so libc/ld fully initializes ===\n");
+            s.append("    let main_addr = resolve_addr(load_base, GHIDRA_MAIN);\n");
+            s.append("    log::info!(\"Running to main() at {:#x}\", main_addr);\n");
+            s.append("    qemu.set_breakpoint(main_addr);\n");
+            s.append("    unsafe { let _ = qemu.run(); }\n");
+            s.append("    let pc: u64 = qemu.read_reg(Regs::Pc).unwrap_or(0);\n");
+            s.append("    log::info!(\"Stopped at PC={:#x} (expected main={:#x})\", pc, main_addr);\n");
+            s.append("    qemu.remove_breakpoint(main_addr);\n\n");
+        } else {
+            s.append("    // No main() symbol found, staying at _start.\n");
+            s.append("    // Note: libc may not be fully initialized.\n\n");
+        }
+
+        s.append("    // === Phase 3: Set up fuzzing harness at target function ===\n");
+        s.append("    let target_entry = resolve_addr(load_base, GHIDRA_ENTRY);\n");
+        s.append("    log::info!(\"Target function at {:#x}\", target_entry);\n\n");
+
+        s.append("    // Map input buffer in guest memory\n");
+        s.append("    let input_addr = qemu.map_private(0, MAX_INPUT_SIZE, MmapPerms::ReadWrite)\n");
+        s.append("        .expect(\"Failed to mmap input buffer\");\n\n");
+
+        s.append("    // Set PC directly to the target function (don't rely on program calling it)\n");
+        s.append("    log::info!(\"Jumping PC to target function {:#x}\", target_entry);\n");
+
+        switch (config.arch) {
+            case X86_64:
+                // For x86_64: set RIP to target, push a fake return address for the exit BP
+                s.append("    // Push a return address on the stack for the exit breakpoint\n");
+                s.append("    let sp: u64 = qemu.read_reg(Regs::Rsp).unwrap();\n");
+                s.append("    let sp = sp - 8; // make room for return address\n");
+                break;
+            case X86:
+                s.append("    let sp: u64 = qemu.read_reg(Regs::Esp).unwrap();\n");
+                s.append("    let sp = sp - 4;\n");
+                break;
+            default:
+                break;
+        }
+
+        s.append("    \n");
+
+        // Set up exit breakpoint
+        // We allocate a "ret-sled" page: a page of NOP/INT3 that the target returns to
+        s.append("    // Allocate a return-sled page for the exit breakpoint\n");
+        s.append("    let ret_sled = qemu.map_private(0, 4096, MmapPerms::ReadWrite)\n");
+        s.append("        .expect(\"Failed to mmap ret-sled\");\n");
+        s.append("    // Fill with INT3 (0xCC) so any return hits a breakpoint\n");
+        s.append("    let sled_data = vec![0xCCu8; 4096];\n");
+        s.append("    unsafe { let _ = qemu.write_mem(ret_sled, &sled_data); }\n");
+        s.append("    log::info!(\"Return sled at {:#x}\", ret_sled);\n\n");
+
+        // Push ret_sled as return address and set PC
+        switch (config.arch) {
+            case X86_64:
+                s.append("    // Write ret_sled as return address on stack, set PC\n");
+                s.append("    unsafe { let _ = qemu.write_mem(sp, &ret_sled.to_le_bytes()); }\n");
+                s.append("    let _ = qemu.write_reg(Regs::Rsp, sp);\n");
+                s.append("    let _ = qemu.write_reg(Regs::Rip, target_entry);\n");
+                break;
+            case X86:
+                s.append("    unsafe { let _ = qemu.write_mem(sp, &(ret_sled as u32).to_le_bytes()); }\n");
+                s.append("    let _ = qemu.write_reg(Regs::Esp, sp);\n");
+                s.append("    let _ = qemu.write_reg(Regs::Eip, target_entry);\n");
+                break;
+            case ARM: case AARCH64:
+                s.append("    // Set LR to ret_sled, PC to target\n");
+                s.append("    let _ = qemu.write_reg(Regs::Lr, ret_sled);\n");
+                s.append("    let _ = qemu.write_reg(Regs::Pc, target_entry);\n");
+                break;
+            case MIPS: case MIPSEL:
+                s.append("    let _ = qemu.write_reg(Regs::Ra, ret_sled);\n");
+                s.append("    let _ = qemu.write_reg(Regs::Pc, target_entry);\n");
+                break;
+            default:
+                s.append("    // TODO: set PC and return address for your architecture\n");
+        }
+        s.append("    \n");
+
+        s.append("    // Set breakpoint at the return sled (this is our \"exit\" for the harness)\n");
+        s.append("    qemu.set_breakpoint(ret_sled);\n\n");
 
         s.append("    // Install external function hooks/stubs\n");
         s.append("    externals::install_hooks(&qemu);\n\n");
 
-        if (config.exitAddress != 0) {
-            s.append("    let exit_bp = TARGET_EXIT;\n");
-        } else {
-            s.append("    let exit_bp = harness::find_exit_address(&qemu, TARGET_ENTRY);\n");
-        }
-        s.append("    qemu.set_breakpoint(exit_bp);\n\n");
-
-        s.append("    // Map input buffer in guest\n");
-        s.append("    let input_addr = qemu.map_private(0, MAX_INPUT_SIZE, MmapPerms::ReadWrite)\n");
-        s.append("        .expect(\"Failed to mmap input buffer\");\n\n");
-
         s.append("    // Setup target state (registers, args, globals)\n");
         s.append("    harness::setup_target_state(&qemu, input_addr, MAX_INPUT_SIZE);\n");
-        s.append("    globals::initialize_globals(&qemu);\n\n");
+        s.append("    globals::initialize_globals(&qemu);\n");
+        s.append("    // Save the initial state (PC, SP) for restoring each fuzzing iteration\n");
+        s.append("    harness::save_state(&qemu);\n\n");
 
         // Standard fuzzer setup
         s.append("    let mut edges_shmem = vec![0u8; MAP_SIZE];\n");
-        s.append("    let edges_observer = unsafe {\n");
-        s.append("        HitcountsMapObserver::new(StdMapObserver::from_mut_slice(\"edges\", &mut edges_shmem))\n");
+        s.append("    let edges_map = unsafe {\n");
+        s.append("        OwnedMutSlice::from_raw_parts_mut(edges_shmem.as_mut_ptr(), edges_shmem.len())\n");
         s.append("    };\n");
+        s.append("    let edges_observer = HitcountsMapObserver::new(\n");
+        s.append("        StdMapObserver::from_mut_slice(\"edges\", edges_map)\n");
+        s.append("    ).track_indices();\n");
         s.append("    let time_observer = TimeObserver::new(\"time\");\n");
         s.append("    let mut feedback = MaxMapFeedback::new(&edges_observer);\n");
         s.append("    let mut objective = CrashFeedback::new();\n\n");
@@ -938,8 +1355,12 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("    let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());\n");
         s.append("    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);\n\n");
 
+        s.append("    let qemu_ref = qemu.clone();\n");
+        s.append("    let mut harness_fn = move |_emu_ref: &mut _, _state: &mut _, input: &BytesInput| -> ExitKind {\n");
+        s.append("        harness::run_target(&qemu_ref, input)\n");
+        s.append("    };\n");
         s.append("    let mut executor = QemuExecutor::new(\n");
-        s.append("        emu, &mut harness::harness_fn,\n");
+        s.append("        emu, &mut harness_fn,\n");
         s.append("        tuple_list!(edges_observer, time_observer),\n");
         s.append("        &mut fuzzer, &mut state, &mut mgr,\n");
         s.append("        Duration::from_secs(5),\n");
@@ -950,12 +1371,12 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("        let _ = state.load_initial_inputs(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir]);\n");
         s.append("    }\n");
         s.append("    if state.corpus().count() == 0 {\n");
-        s.append("        let mut gen = RandBytesGenerator::new(MAX_INPUT_SIZE);\n");
+        s.append("        let mut gen = RandBytesGenerator::new(NonZeroUsize::new(MAX_INPUT_SIZE).unwrap());\n");
         s.append("        state.generate_initial_inputs(&mut fuzzer, &mut executor, &mut gen, &mut mgr, 256)\n");
         s.append("            .expect(\"Failed to generate seeds\");\n");
         s.append("    }\n\n");
 
-        s.append("    let mutator = StdScheduledMutator::new(havoc_mutations());\n");
+        s.append("    let mutator = HavocScheduledMutator::new(havoc_mutations());\n");
         s.append("    let mut stages = tuple_list!(StdMutationalStage::new(mutator));\n\n");
 
         s.append("    println!(\"[*] Starting fuzzing...\");\n");
@@ -979,7 +1400,39 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("use libafl_bolts::AsSlice;\n\n");
 
         s.append("static mut INPUT_ADDR: GuestAddr = 0;\n");
-        s.append("static mut INPUT_MAX_SIZE: usize = 0;\n\n");
+        s.append("static mut INPUT_MAX_SIZE: usize = 0;\n");
+        s.append("static mut SAVED_PC: GuestAddr = 0;\n");
+        s.append("static mut SAVED_SP: GuestAddr = 0;\n\n");
+
+        s.append("/// Save the initial harness state (PC, SP) so we can restore each iteration.\n");
+        s.append("pub fn save_state(qemu: &Qemu) {\n");
+        switch (config.arch) {
+            case X86_64:
+                s.append("    unsafe {\n");
+                s.append("        SAVED_PC = qemu.read_reg(Regs::Rip).unwrap();\n");
+                s.append("        SAVED_SP = qemu.read_reg(Regs::Rsp).unwrap();\n");
+                s.append("    }\n");
+                break;
+            case X86:
+                s.append("    unsafe {\n");
+                s.append("        SAVED_PC = qemu.read_reg(Regs::Eip).unwrap();\n");
+                s.append("        SAVED_SP = qemu.read_reg(Regs::Esp).unwrap();\n");
+                s.append("    }\n");
+                break;
+            case ARM: case AARCH64:
+                s.append("    unsafe {\n");
+                s.append("        SAVED_PC = qemu.read_reg(Regs::Pc).unwrap();\n");
+                s.append("        SAVED_SP = qemu.read_reg(Regs::Sp).unwrap();\n");
+                s.append("    }\n");
+                break;
+            default:
+                s.append("    unsafe {\n");
+                s.append("        SAVED_PC = qemu.read_reg(Regs::Pc).unwrap();\n");
+                s.append("        SAVED_SP = 0; // TODO\n");
+                s.append("    }\n");
+        }
+        s.append("    log::info!(\"Saved state: PC={:#x}, SP={:#x}\", unsafe { SAVED_PC }, unsafe { SAVED_SP });\n");
+        s.append("}\n\n");
 
         // Decompiled code as reference
         if (config.decompiledCode != null && !config.decompiledCode.isEmpty()) {
@@ -999,35 +1452,35 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         }
         s.append("\n");
 
-        // setup_target_state
+        // setup_target_state — initial setup of function arguments
         s.append("pub fn setup_target_state(qemu: &Qemu, input_addr: GuestAddr, max_size: usize) {\n");
         s.append("    unsafe { INPUT_ADDR = input_addr; INPUT_MAX_SIZE = max_size; }\n\n");
-        s.append("    // Set function arguments → (input_ptr, input_len)\n");
-        s.append("    // Adjust for actual function signature.\n");
-        switch (config.arch) {
-            case ARM: case AARCH64:
-                s.append("    let _ = qemu.write_reg(Regs::R0, input_addr);\n");
-                s.append("    let _ = qemu.write_reg(Regs::R1, max_size as GuestReg);\n");
-                break;
-            case X86:
-                s.append("    let sp: GuestAddr = qemu.read_reg(Regs::Esp).unwrap();\n");
-                s.append("    let _ = qemu.write_mem(sp + 4, &input_addr.to_le_bytes());\n");
-                s.append("    let _ = qemu.write_mem(sp + 8, &(max_size as u32).to_le_bytes());\n");
-                break;
-            case X86_64:
-                s.append("    let _ = qemu.write_reg(Regs::Rdi, input_addr);\n");
-                s.append("    let _ = qemu.write_reg(Regs::Rsi, max_size as GuestReg);\n");
-                break;
-            case MIPS: case MIPSEL:
-                s.append("    let _ = qemu.write_reg(Regs::A0, input_addr);\n");
-                s.append("    let _ = qemu.write_reg(Regs::A1, max_size as GuestReg);\n");
-                break;
-            default:
-                s.append("    // TODO: set registers for your calling convention\n");
+        s.append("    // Set function arguments per input mapping from Ghidra config.\n");
+        for (FuncParamConfig p : config.paramConfigs) {
+            String comment = String.format("    // param[%d] %s %s → %s\n",
+                p.index, p.dataType, p.name, p.role.label);
+            s.append(comment);
+            switch (p.role) {
+                case FUZZ_PTR:
+                    genSetArg(s, config.arch, p.index, "input_addr");
+                    break;
+                case FUZZ_LEN:
+                    genSetArg(s, config.arch, p.index, "max_size as GuestReg");
+                    break;
+                case FUZZ_VALUE:
+                    genSetArg(s, config.arch, p.index, "0 as GuestReg"); // initial 0, overwritten per-iteration
+                    break;
+                case FIXED:
+                    genSetArg(s, config.arch, p.index, p.fixedValue + " as GuestReg");
+                    break;
+                case IGNORE:
+                    // leave default
+                    break;
+            }
         }
         s.append("}\n\n");
 
-        // find_exit_address
+        // find_exit_address (kept for compatibility but unused with ret-sled approach)
         s.append("pub fn find_exit_address(qemu: &Qemu, _entry: GuestAddr) -> GuestAddr {\n");
         switch (config.arch) {
             case ARM: case AARCH64:
@@ -1054,30 +1507,85 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         }
         s.append("}\n\n");
 
-        // harness_fn — simplified signature using impl trait
-        s.append("/// Per-iteration harness function.\n");
-        s.append("pub fn harness_fn(emu: &mut impl libafl_qemu::IsEmuExitHandler, input: &BytesInput) -> ExitKind {\n");
-        s.append("    let qemu = emu.qemu();\n");
+        // run_target — called from the closure in main.rs
+        s.append("/// Per-iteration target execution. Called from the harness closure.\n");
+        s.append("pub fn run_target(qemu: &Qemu, input: &BytesInput) -> ExitKind {\n");
         s.append("    let target = input.target_bytes();\n");
         s.append("    let bytes = target.as_slice();\n");
         s.append("    let len = bytes.len().min(unsafe { INPUT_MAX_SIZE });\n");
         s.append("    if len == 0 { return ExitKind::Ok; }\n\n");
-        s.append("    unsafe { let _ = qemu.write_mem(INPUT_ADDR, &bytes[..len]); }\n\n");
-        s.append("    // Update length argument\n");
+
+        // Restore PC and SP to the saved state (start of target function)
+        s.append("    // Restore PC/SP to target function entry\n");
         switch (config.arch) {
-            case ARM: case AARCH64:
-                s.append("    let _ = qemu.write_reg(Regs::R1, len as GuestReg);\n"); break;
             case X86_64:
-                s.append("    let _ = qemu.write_reg(Regs::Rsi, len as GuestReg);\n"); break;
+                s.append("    let _ = qemu.write_reg(Regs::Rip, unsafe { SAVED_PC });\n");
+                s.append("    let _ = qemu.write_reg(Regs::Rsp, unsafe { SAVED_SP });\n");
+                break;
             case X86:
-                s.append("    let sp: GuestAddr = qemu.read_reg(Regs::Esp).unwrap();\n");
-                s.append("    let _ = qemu.write_mem(sp + 8, &(len as u32).to_le_bytes());\n"); break;
-            case MIPS: case MIPSEL:
-                s.append("    let _ = qemu.write_reg(Regs::A1, len as GuestReg);\n"); break;
-            default: s.append("    // TODO: update length arg\n");
+                s.append("    let _ = qemu.write_reg(Regs::Eip, unsafe { SAVED_PC });\n");
+                s.append("    let _ = qemu.write_reg(Regs::Esp, unsafe { SAVED_SP });\n");
+                break;
+            case ARM: case AARCH64:
+                s.append("    let _ = qemu.write_reg(Regs::Pc, unsafe { SAVED_PC });\n");
+                s.append("    let _ = qemu.write_reg(Regs::Sp, unsafe { SAVED_SP });\n");
+                break;
+            default:
+                s.append("    let _ = qemu.write_reg(Regs::Pc, unsafe { SAVED_PC });\n");
         }
+        s.append("\n");
+
+        s.append("    // Write fuzz data to the input buffer\n");
+        s.append("    unsafe { let _ = qemu.write_mem(INPUT_ADDR, &bytes[..len]); }\n\n");
+
+        // Set arguments per iteration based on paramConfigs
+        s.append("    // Set arguments per input mapping\n");
+
+        // Track offset into fuzz input for FUZZ_VALUE params
+        boolean hasFuzzValue = config.paramConfigs.stream()
+            .anyMatch(p -> p.role == InputRole.FUZZ_VALUE);
+        if (hasFuzzValue) {
+            s.append("    let mut fuzz_offset = 0usize;\n");
+        }
+
+        for (FuncParamConfig p : config.paramConfigs) {
+            switch (p.role) {
+                case FUZZ_PTR:
+                    s.append("    // ").append(p.name).append(" → fuzz buffer ptr\n");
+                    genSetArg(s, config.arch, p.index, "unsafe { INPUT_ADDR }");
+                    break;
+                case FUZZ_LEN:
+                    s.append("    // ").append(p.name).append(" → fuzz length\n");
+                    genSetArg(s, config.arch, p.index, "len as GuestReg");
+                    break;
+                case FUZZ_VALUE:
+                    s.append("    // ").append(p.name).append(" → fuzzed scalar (")
+                     .append(p.fuzzValueSize).append(" bytes from input)\n");
+                    s.append("    {\n");
+                    s.append("        let vsize = ").append(p.fuzzValueSize).append(";\n");
+                    s.append("        let mut vbuf = [0u8; 8];\n");
+                    s.append("        let end = (fuzz_offset + vsize).min(len);\n");
+                    s.append("        if fuzz_offset < len {\n");
+                    s.append("            vbuf[..end-fuzz_offset].copy_from_slice(&bytes[fuzz_offset..end]);\n");
+                    s.append("        }\n");
+                    s.append("        let val = u64::from_le_bytes(vbuf);\n");
+                    genSetArg(s, config.arch, p.index, "val as GuestReg");
+                    s.append("        fuzz_offset += vsize;\n");
+                    s.append("    }\n");
+                    break;
+                case FIXED:
+                    s.append("    // ").append(p.name).append(" → fixed: ")
+                     .append(p.fixedValue).append("\n");
+                    genSetArg(s, config.arch, p.index, p.fixedValue + " as GuestReg");
+                    break;
+                case IGNORE:
+                    // nothing
+                    break;
+            }
+        }
+
         s.append("\n    // Initialize globals before each iteration\n");
-        s.append("    crate::globals::initialize_globals(&qemu);\n\n");
+        s.append("    crate::globals::initialize_globals(qemu);\n\n");
         s.append("    unsafe {\n");
         s.append("        match qemu.run() {\n");
         s.append("            Ok(QemuExitReason::Breakpoint(_)) => ExitKind::Ok,\n");
@@ -1086,6 +1594,86 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("            _ => ExitKind::Ok,\n");
         s.append("        }\n    }\n}\n");
         return s.toString();
+    }
+
+    // ===================================================================
+    // Helper: generate code to set a function argument by index
+    // ===================================================================
+
+    /**
+     * Generates Rust code to write a value to function argument [argIndex]
+     * using the appropriate calling convention for the target architecture.
+     */
+    private void genSetArg(StringBuilder s, TargetArch arch, int argIndex, String valueExpr) {
+        switch (arch) {
+            case X86_64: {
+                // System V AMD64: RDI, RSI, RDX, RCX, R8, R9, then stack
+                String[] regs = {"Rdi", "Rsi", "Rdx", "Rcx", "R8", "R9"};
+                if (argIndex < regs.length) {
+                    s.append("    let _ = qemu.write_reg(Regs::").append(regs[argIndex])
+                     .append(", ").append(valueExpr).append(");\n");
+                } else {
+                    int stackOff = (argIndex - 6) * 8 + 8; // +8 for return address
+                    s.append("    { let sp: u64 = qemu.read_reg(Regs::Rsp).unwrap();\n");
+                    s.append("      let _ = qemu.write_mem(sp + ").append(stackOff)
+                     .append(", &(").append(valueExpr).append(" as u64).to_le_bytes()); }\n");
+                }
+                break;
+            }
+            case X86: {
+                // cdecl: all args on stack  [esp+4], [esp+8], ...
+                int stackOff = (argIndex + 1) * 4; // +4 for return address
+                s.append("    { let sp: u64 = qemu.read_reg(Regs::Esp).unwrap();\n");
+                s.append("      let _ = qemu.write_mem(sp + ").append(stackOff)
+                 .append(", &(").append(valueExpr).append(" as u32).to_le_bytes()); }\n");
+                break;
+            }
+            case ARM: {
+                // ARM EABI: R0-R3, then stack
+                String[] regs = {"R0", "R1", "R2", "R3"};
+                if (argIndex < regs.length) {
+                    s.append("    let _ = qemu.write_reg(Regs::").append(regs[argIndex])
+                     .append(", ").append(valueExpr).append(");\n");
+                } else {
+                    int stackOff = (argIndex - 4) * 4;
+                    s.append("    { let sp: u64 = qemu.read_reg(Regs::Sp).unwrap();\n");
+                    s.append("      let _ = qemu.write_mem(sp + ").append(stackOff)
+                     .append(", &(").append(valueExpr).append(" as u32).to_le_bytes()); }\n");
+                }
+                break;
+            }
+            case AARCH64: {
+                // AAPCS64: X0-X7, then stack
+                String[] regs = {"R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7"};
+                if (argIndex < regs.length) {
+                    s.append("    let _ = qemu.write_reg(Regs::").append(regs[argIndex])
+                     .append(", ").append(valueExpr).append(");\n");
+                } else {
+                    int stackOff = (argIndex - 8) * 8;
+                    s.append("    { let sp: u64 = qemu.read_reg(Regs::Sp).unwrap();\n");
+                    s.append("      let _ = qemu.write_mem(sp + ").append(stackOff)
+                     .append(", &(").append(valueExpr).append(" as u64).to_le_bytes()); }\n");
+                }
+                break;
+            }
+            case MIPS: case MIPSEL: {
+                // MIPS O32: $a0-$a3, then stack
+                String[] regs = {"A0", "A1", "A2", "A3"};
+                if (argIndex < regs.length) {
+                    s.append("    let _ = qemu.write_reg(Regs::").append(regs[argIndex])
+                     .append(", ").append(valueExpr).append(");\n");
+                } else {
+                    int stackOff = argIndex * 4; // MIPS always reserves stack space for a0-a3
+                    s.append("    { let sp: u64 = qemu.read_reg(Regs::Sp).unwrap();\n");
+                    s.append("      let _ = qemu.write_mem(sp + ").append(stackOff)
+                     .append(", &(").append(valueExpr).append(" as u32).to_le_bytes()); }\n");
+                }
+                break;
+            }
+            default:
+                s.append("    // TODO: set arg[").append(argIndex).append("] = ")
+                 .append(valueExpr).append("\n");
+        }
     }
 
     // ===================================================================
@@ -1227,21 +1815,33 @@ public class LibAFLFuzzerGeneratorPlugin extends ProgramPlugin {
         s.append("# ").append(config.projectName).append(" — LibAFL QEMU Fuzzer\n");
         s.append("# Multi-stage build: compiles QEMU + fuzzer, produces slim runtime image.\n\n");
 
-        s.append("FROM rust:1.82-bookworm AS builder\n\n");
+        s.append("FROM debian:bookworm AS builder\n\n");
 
-        s.append("# All build dependencies (cmake, ninja, python3-venv, QEMU libs)\n");
+        s.append("# Install system build dependencies\n");
         s.append("RUN apt-get update && apt-get install -y --no-install-recommends \\\n");
-        s.append("    build-essential cmake ninja-build pkg-config \\\n");
+        s.append("    build-essential cmake ninja-build pkg-config curl ca-certificates git \\\n");
         s.append("    python3 python3-venv python3-pip python3-setuptools \\\n");
         s.append("    libglib2.0-dev libpixman-1-dev libslirp-dev \\\n");
+        s.append("    lsb-release wget software-properties-common gnupg \\\n");
         s.append("    && rm -rf /var/lib/apt/lists/*\n\n");
+
+        s.append("# Install LLVM 20 (required by libafl_qemu — must match rustc's LLVM version)\n");
+        s.append("RUN wget -qO- https://apt.llvm.org/llvm.sh | bash -s -- 20 \\\n");
+        s.append("    && apt-get install -y --no-install-recommends llvm-20-dev libclang-20-dev \\\n");
+        s.append("    && ln -sf /usr/bin/llvm-config-20 /usr/bin/llvm-config \\\n");
+        s.append("    && rm -rf /var/lib/apt/lists/*\n\n");
+
+        s.append("# Install Rust via rustup (gets latest stable, currently 1.87+)\n");
+        s.append("RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n");
+        s.append("ENV PATH=\"/root/.cargo/bin:${PATH}\"\n\n");
 
         s.append("WORKDIR /fuzzer\n");
         s.append("COPY Cargo.toml .\n");
         s.append("COPY src/ src/\n\n");
 
-        s.append("# Build (compiles QEMU from source — takes ~15 min first time)\n");
-        s.append("RUN cargo build --release 2>&1 | tail -20\n\n");
+        s.append("# Build — show full output so errors are visible\n");
+        s.append("RUN cargo build --release && \\\n");
+        s.append("    ls -la /fuzzer/target/release/ | head -20\n\n");
 
         s.append("# --- Runtime stage ---\n");
         s.append("FROM debian:bookworm-slim\n\n");
