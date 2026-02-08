@@ -212,11 +212,13 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
     }
 
     /**
-     * Inject the fold-margin panel into the DecompilerPanel's WEST side.
+     * Inject the fold-margin panel so it scrolls in sync with the FieldPanel.
      *
-     * The DecompilerPanel uses BorderLayout. The WEST slot may contain
-     * an existing margin box (JPanel with BoxLayout) or may be empty.
-     * We always add our panel as the leftmost component.
+     * Strategy (in order of preference):
+     * 1. If the FieldPanel lives inside a JScrollPane, set the margin as
+     *    the scroll pane's row header view.  Swing will then scroll the
+     *    margin automatically — no manual yOffset painting needed.
+     * 2. Fallback: add to DecompilerPanel WEST and rely on manual yOffset.
      */
     private void injectMarginComponent(DecompilerPanel panel, FoldMarginPanel margin) {
         try {
@@ -225,19 +227,44 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                 margin.attachToFieldPanel(fp);
             }
 
+            // --- Strategy 1: JScrollPane row header ---
+            javax.swing.JScrollPane scrollPane = findScrollPaneFor(fp);
+            if (scrollPane != null) {
+                // If there's already a row header, wrap both together
+                Component existingHeader = null;
+                if (scrollPane.getRowHeader() != null) {
+                    existingHeader = scrollPane.getRowHeader().getView();
+                }
+                if (existingHeader != null) {
+                    JPanel wrapper = new JPanel();
+                    wrapper.setLayout(new BoxLayout(wrapper, BoxLayout.X_AXIS));
+                    wrapper.setOpaque(false);
+                    wrapper.add(margin);
+                    wrapper.add(existingHeader);
+                    scrollPane.setRowHeaderView(wrapper);
+                } else {
+                    scrollPane.setRowHeaderView(margin);
+                }
+                scrollPane.revalidate();
+                scrollPane.repaint();
+                margin.setInsideScrollPane(true);
+                Msg.info(this, "Fold margin installed as JScrollPane row header");
+                return;
+            }
+
+            // --- Strategy 2: BorderLayout WEST fallback ---
+            Msg.info(this, "No JScrollPane found — falling back to WEST injection");
             java.awt.LayoutManager lm = panel.getLayout();
 
             if (lm instanceof BorderLayout bl) {
                 Component west = bl.getLayoutComponent(BorderLayout.WEST);
 
                 if (west instanceof JComponent box) {
-                    // Existing west container — prepend our margin
                     box.add(margin, 0);
                     box.revalidate();
                     box.repaint();
                     Msg.info(this, "Fold margin added to existing WEST box");
                 } else {
-                    // No existing west container — create wrapper
                     JPanel wrapper = new JPanel();
                     wrapper.setLayout(new BoxLayout(wrapper, BoxLayout.X_AXIS));
                     wrapper.setOpaque(false);
@@ -252,7 +279,6 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                     Msg.info(this, "Fold margin injected as new WEST wrapper");
                 }
             } else {
-                // Fallback: just add to the panel and hope for the best
                 panel.add(margin, BorderLayout.WEST);
                 panel.revalidate();
                 panel.repaint();
@@ -261,6 +287,23 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         } catch (Exception ex) {
             Msg.error(this, "Failed to inject fold margin component", ex);
         }
+    }
+
+    /**
+     * Walk up from a component to find the enclosing JScrollPane.
+     */
+    private javax.swing.JScrollPane findScrollPaneFor(Component c) {
+        if (c == null) return null;
+        Component parent = c.getParent();
+        while (parent != null) {
+            if (parent instanceof javax.swing.JScrollPane sp) return sp;
+            if (parent instanceof JViewport) {
+                Component vpParent = parent.getParent();
+                if (vpParent instanceof javax.swing.JScrollPane sp) return sp;
+            }
+            parent = parent.getParent();
+        }
+        return null;
     }
 
     // =======================================================================
@@ -485,6 +528,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
 
         private final DecompilerPanel decompPanel;
         private FieldPanel fieldPanel;
+        private boolean insideScrollPane = false;
 
         private List<FoldRegion> regions = Collections.emptyList();
         private Map<Integer, FoldRegion> regionByStartLine = Collections.emptyMap();
@@ -510,6 +554,10 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             setOpaque(true);
             addMouseListener(this);
             setToolTipText("");
+        }
+
+        void setInsideScrollPane(boolean inside) {
+            this.insideScrollPane = inside;
         }
 
         void attachToFieldPanel(FieldPanel fp) {
@@ -548,7 +596,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             };
             originalModel.addLayoutModelListener(originalModelListener);
 
-            // Track scroll for margin repaint
+            // Track scroll for margin repaint (only needed for WEST fallback)
             Container parent = fp.getParent();
             if (parent instanceof JViewport vp) {
                 vp.addChangeListener(e -> repaint());
@@ -726,17 +774,7 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
         // Fold / unfold
         // -------------------------------------------------------------------
 
-        /**
-         * Toggle fold at a visible line index.
-         *
-         * The line parameter may be 0-based or 1-based depending on the source:
-         * - DecompilerActionContext.getLineNumber() is typically 1-based
-         * - Gutter click getVisibleLineAtY() is 0-based
-         *
-         * We try both the raw value and value-1 to find a matching region.
-         */
         void toggleFoldAtVisibleLine(int lineParam) {
-            // Try 0-based first, then 1-based adjusted
             FoldRegion found = tryFindRegionAtVisible(lineParam);
             if (found == null) {
                 found = tryFindRegionAtVisible(lineParam - 1);
@@ -754,19 +792,13 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             }
         }
 
-        /**
-         * Try to find a fold region at the given visible line index.
-         * Returns null if no region found or index is out of bounds.
-         */
         private FoldRegion tryFindRegionAtVisible(int visibleLine) {
             if (visibleLine < 0 || visibleLine >= visibleToOriginal.length) return null;
             int origLine = visibleToOriginal[visibleLine];
 
-            // Exact match on startLine
             FoldRegion exact = regionByStartLine.get(origLine);
             if (exact != null) return exact;
 
-            // Innermost enclosing region (skip depth-0 function body)
             FoldRegion best = null;
             for (FoldRegion r : allRegionsFlat) {
                 if (r.depth == 0) continue;
@@ -795,15 +827,9 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             }
         }
 
-        /**
-         * Collect hidden lines. When collapsed, we hide startLine+1 to endLine-1,
-         * keeping BOTH the opening '{' line AND the closing '}' line visible.
-         * This matches standard IDE folding behavior.
-         */
         private void collectHiddenLines(List<FoldRegion> list, Set<Integer> hidden) {
             for (FoldRegion r : list) {
                 if (r.collapsed) {
-                    // Hide everything between '{' and '}', exclusive on both ends
                     for (int l = r.startLine + 1; l < r.endLine; l++) {
                         hidden.add(l);
                     }
@@ -841,10 +867,15 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                 LayoutModel activeModel = modelSwapped ? filteringModel : originalModel;
                 if (activeModel == null) return;
 
+                // When inside a JScrollPane row header, Swing translates
+                // the Graphics context for us — yOffset is always 0.
+                // When in the WEST fallback, we must manually compensate.
                 int yOffset = 0;
-                Container parent = fieldPanel.getParent();
-                if (parent instanceof JViewport vp) {
-                    yOffset = vp.getViewPosition().y;
+                if (!insideScrollPane) {
+                    Container parent = fieldPanel.getParent();
+                    if (parent instanceof JViewport vp) {
+                        yOffset = vp.getViewPosition().y;
+                    }
                 }
 
                 BigInteger numIndexes = activeModel.getNumIndexes();
@@ -868,7 +899,6 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
                         if (r != null) {
                             paintFoldIcon(g2, screenY, rowHeight, r.collapsed);
                         } else {
-                            // Check if this is the '}' line of a collapsed region
                             boolean isClosingBrace = false;
                             for (FoldRegion fr : allRegionsFlat) {
                                 if (fr.collapsed && fr.endLine == origLine) {
@@ -891,23 +921,50 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             }
         }
 
+        /**
+         * Compute the full height of the margin to match the FieldPanel's
+         * total content height.  When used as a row header, the JScrollPane
+         * needs the preferred height to match the viewport content so that
+         * the row header scrolls 1:1.
+         */
+        @Override
+        public Dimension getPreferredSize() {
+            if (insideScrollPane && fieldPanel != null) {
+                // Match the FieldPanel's full virtual height
+                int totalHeight = computeTotalContentHeight();
+                return new Dimension(MARGIN_WIDTH, totalHeight);
+            }
+            return super.getPreferredSize();
+        }
+
+        private int computeTotalContentHeight() {
+            LayoutModel activeModel = modelSwapped ? filteringModel : originalModel;
+            if (activeModel == null) return 0;
+            int total = 0;
+            BigInteger numIndexes = activeModel.getNumIndexes();
+            BigInteger idx = BigInteger.ZERO;
+            while (idx.compareTo(numIndexes) < 0) {
+                Layout layout = activeModel.getLayout(idx);
+                if (layout != null) total += layout.getHeight();
+                idx = idx.add(BigInteger.ONE);
+            }
+            return total;
+        }
+
         private void paintFoldIcon(Graphics2D g, int y, int rowHeight, boolean collapsed) {
             int cx = MARGIN_WIDTH / 2;
             int cy = y + rowHeight / 2;
             int half = ICON_SIZE / 2;
 
-            // Box outline
             g.setColor(new Color(140, 140, 140));
             g.drawRect(cx - half, cy - half, ICON_SIZE, ICON_SIZE);
-            // Box fill
             g.setColor(new Color(240, 240, 240));
             g.fillRect(cx - half + 1, cy - half + 1, ICON_SIZE - 1, ICON_SIZE - 1);
-            // +/- sign
             g.setColor(new Color(80, 80, 80));
             g.setStroke(new BasicStroke(1.2f));
-            g.drawLine(cx - half + 2, cy, cx + half - 2, cy); // horizontal bar (always)
+            g.drawLine(cx - half + 2, cy, cx + half - 2, cy);
             if (collapsed) {
-                g.drawLine(cx, cy - half + 2, cx, cy + half - 2); // vertical bar → '+'
+                g.drawLine(cx, cy - half + 2, cx, cy + half - 2);
             }
         }
 
@@ -972,13 +1029,16 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
             LayoutModel activeModel = modelSwapped ? filteringModel : originalModel;
             if (activeModel == null) return 0;
 
-            int yOffset = 0;
-            Container parent = fieldPanel.getParent();
-            if (parent instanceof JViewport vp) {
-                yOffset = vp.getViewPosition().y;
+            // When inside a scroll pane row header, mouseY is already
+            // in the scrolled coordinate space — no offset needed.
+            int targetY = mouseY;
+            if (!insideScrollPane) {
+                Container parent = fieldPanel.getParent();
+                if (parent instanceof JViewport vp) {
+                    targetY = mouseY + vp.getViewPosition().y;
+                }
             }
 
-            int targetY = mouseY + yOffset;
             int y = 0;
             int lineIndex = 0;
             BigInteger numIndexes = activeModel.getNumIndexes();
