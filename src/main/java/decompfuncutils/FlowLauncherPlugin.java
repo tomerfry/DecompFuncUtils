@@ -24,6 +24,7 @@ package decompfuncutils;
 import docking.ActionContext;
 import docking.DockingWindowManager;
 import docking.action.DockingAction;
+import docking.action.DockingActionIf;
 import docking.action.KeyBindingData;
 
 import ghidra.app.plugin.PluginCategoryNames;
@@ -49,6 +50,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -287,9 +289,6 @@ public class FlowLauncherPlugin extends ProgramPlugin {
     }
 
     private void indexComments(Program program, List<LauncherItem> items) {
-        // Use string-based comment type names to avoid deprecated constants.
-        // We'll access comments via Listing.getComment(Address, int) with raw int values.
-        // Comment type int values: EOL=0, PRE=1, POST=2, PLATE=3 (stable across versions)
         int[] commentTypes = { 0, 1, 2, 3 };
         String[] commentLabels = { "EOL", "Pre", "Post", "Plate" };
 
@@ -303,7 +302,6 @@ public class FlowLauncherPlugin extends ProgramPlugin {
             for (int i = 0; i < commentTypes.length; i++) {
                 String comment = null;
                 try {
-                    // Use reflection to call getComment to avoid deprecation
                     comment = listing.getComment(commentTypes[i], cu.getAddress());
                 } catch (Exception ignored) {}
 
@@ -324,9 +322,9 @@ public class FlowLauncherPlugin extends ProgramPlugin {
 
     private void indexActions(List<LauncherItem> items) {
         try {
-            Set<DockingAction> allActions = (Set<DockingAction>)(Set<?>)
-                    tool.getAllActions();
-            for (DockingAction action : allActions) {
+            // FIX: Use DockingActionIf which is what tool.getAllActions() actually returns
+            Set<DockingActionIf> allActions = tool.getAllActions();
+            for (DockingActionIf action : allActions) {
                 if (!action.isEnabled()) continue;
                 String name = action.getName();
                 String owner = action.getOwner();
@@ -469,22 +467,43 @@ public class FlowLauncherPlugin extends ProgramPlugin {
         String name = parts[0];
         String owner = parts.length > 1 ? parts[1] : null;
 
-        try {
-            Set<DockingAction> allActions = (Set<DockingAction>)(Set<?>)
-                    tool.getAllActions();
-            for (DockingAction action : allActions) {
-                if (action.getName().equals(name)
-                        && (owner == null || action.getOwner().equals(owner))) {
-                    ActionContext ctx = new docking.DefaultActionContext();
-                    if (action.isEnabledForContext(ctx)) {
-                        action.actionPerformed(ctx);
-                        return;
+        // Defer execution so the dialog has fully closed and focus has returned to Ghidra
+        SwingUtilities.invokeLater(() -> {
+            try {
+                Set<DockingActionIf> allActions = tool.getAllActions();
+                for (DockingActionIf action : allActions) {
+                    if (action.getName().equals(name)
+                            && (owner == null || action.getOwner().equals(owner))) {
+                        // Try to get a meaningful context from the active provider
+                        ActionContext ctx = null;
+                        try {
+                            DockingWindowManager dwm = DockingWindowManager.getActiveInstance();
+                            if (dwm != null) {
+                                docking.ComponentProvider provider = dwm.getActiveComponentProvider();
+                                if (provider != null) {
+                                    ctx = provider.getActionContext(null);
+                                }
+                            }
+                        } catch (Exception ignored) {}
+
+                        // Fall back to a ProgramActionContext so program-aware actions work
+                        if (ctx == null && currentProgram != null) {
+                            ctx = new ghidra.app.context.ProgramActionContext(null, currentProgram);
+                        }
+                        if (ctx == null) {
+                            ctx = new docking.DefaultActionContext();
+                        }
+
+                        if (action.isEnabledForContext(ctx)) {
+                            action.actionPerformed(ctx);
+                            return;
+                        }
                     }
                 }
+            } catch (Exception e) {
+                Msg.warn(this, "Failed to execute action: " + name);
             }
-        } catch (Exception e) {
-            Msg.warn(this, "Failed to execute action: " + name);
-        }
+        });
     }
 
     // ===================================================================
@@ -554,6 +573,12 @@ public class FlowLauncherPlugin extends ProgramPlugin {
                     BorderFactory.createEmptyBorder(8, 10, 8, 10)));
             searchField.putClientProperty("JTextField.placeholderText",
                     "Search functions, symbols, strings, actions...");
+
+            // FIX: Remove Tab from focus traversal keys so KeyListener receives it
+            searchField.setFocusTraversalKeys(KeyboardFocusManager.FORWARD_TRAVERSAL_KEYS,
+                    Collections.emptySet());
+            searchField.setFocusTraversalKeys(KeyboardFocusManager.BACKWARD_TRAVERSAL_KEYS,
+                    Collections.emptySet());
 
             // Filter label row
             JPanel topPanel = new JPanel(new BorderLayout(0, 4));
@@ -868,12 +893,16 @@ public class FlowLauncherPlugin extends ProgramPlugin {
             ensureSelectionVisible();
         }
 
+        // FIX: Use resultsPanel.scrollRectToVisible with the child's bounds,
+        // not jc.scrollRectToVisible(jc.getBounds()) which uses wrong coordinate space
         private void ensureSelectionVisible() {
             if (selectedIndex >= 0 && selectedIndex < resultsPanel.getComponentCount()) {
                 Component comp = resultsPanel.getComponent(selectedIndex);
                 if (comp instanceof JComponent jc) {
-                    SwingUtilities.invokeLater(() ->
-                            jc.scrollRectToVisible(jc.getBounds()));
+                    SwingUtilities.invokeLater(() -> {
+                        Rectangle bounds = jc.getBounds();
+                        resultsPanel.scrollRectToVisible(bounds);
+                    });
                 }
             }
         }
