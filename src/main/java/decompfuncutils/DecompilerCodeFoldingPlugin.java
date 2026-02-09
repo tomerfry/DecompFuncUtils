@@ -834,10 +834,25 @@ public class DecompilerCodeFoldingPlugin extends ProgramPlugin {
 
         private String stripStringLiteralsAndComments(String line) {
             StringBuilder sb = new StringBuilder(line.length());
-            boolean inStr = false, inChar = false;
+            boolean inStr = false, inChar = false, inBlock = false;
             char prev = 0;
             for (int i = 0; i < line.length(); i++) {
                 char c = line.charAt(i);
+                // End block comment
+                if (inBlock) {
+                    if (c == '/' && prev == '*') { inBlock = false; prev = 0; }
+                    else prev = c;
+                    continue;
+                }
+                // Start block comment /* ... */
+                if (!inStr && !inChar && c == '*' && prev == '/') {
+                    inBlock = true;
+                    // Remove the '/' we already appended
+                    if (sb.length() > 0) sb.setLength(sb.length() - 1);
+                    prev = c;
+                    continue;
+                }
+                // Single-line comment //
                 if (!inStr && !inChar && c == '/' && i + 1 < line.length()
                         && line.charAt(i + 1) == '/') break;
                 if (!inChar && c == '"' && prev != '\\') { inStr = !inStr; prev = c; continue; }
