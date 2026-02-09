@@ -34,6 +34,9 @@ public class TaintQueryMatcher {
     private final TaintMatrixConverter converter;
     private final GpuTaintEngine engine;
     
+    // Alias tracking for current function being analyzed
+    private AliasTracker aliasTracker;
+    
     // Results
     private List<QueryMatch> matches = new ArrayList<>();
     
@@ -78,6 +81,10 @@ public class TaintQueryMatcher {
         
         // Build taint matrix for constraint evaluation
         TaintMatrixConverter.CsrData taintData = converter.convert(highFunc);
+        
+        // Build alias tracker for this function
+        aliasTracker = new AliasTracker(highFunc);
+        logPanel.logInfo("  " + aliasTracker.getStats());
         
         // Create taint context
         TaintContextImpl taintCtx = new TaintContextImpl(taintData, highFunc, engine);
@@ -217,6 +224,9 @@ public class TaintQueryMatcher {
         // Build taint matrix for constraint evaluation
         TaintMatrixConverter.CsrData taintData = converter.convert(highFunc);
         
+        // Build alias tracker for this function
+        aliasTracker = new AliasTracker(highFunc);
+        
         // Create taint context
         TaintContextImpl taintCtx = new TaintContextImpl(taintData, highFunc, engine);
         
@@ -319,9 +329,16 @@ public class TaintQueryMatcher {
         if (argPattern.startsWith("$")) {
             Object existing = bindings.get(argPattern);
             if (existing != null) {
-                // Already bound - verify it matches
-                if (existing instanceof Varnode) {
-                    return varnodeMatchesExact(actualArg, (Varnode) existing, highFunc);
+                // Already bound - verify it matches (exact or alias)
+                if (existing instanceof Varnode existingVn) {
+                    if (varnodeMatchesExact(actualArg, existingVn, highFunc)) {
+                        return true;
+                    }
+                    // Also check aliases - free(ptr) followed by free(alias) 
+                    // where alias == ptr should still match
+                    if (aliasTracker != null && aliasTracker.areAliases(actualArg, existingVn)) {
+                        return true;
+                    }
                 }
                 return false;
             }
@@ -760,23 +777,36 @@ public class TaintQueryMatcher {
     /**
      * Check if a statement assigns to the given variable
      */
+    /**
+     * Check if a statement assigns to the given variable (or any of its aliases)
+     * 
+     * FIXED: Previously only checked COPY/STORE/CALL/CALLIND opcodes, missing
+     * LOAD (ptr reassignment from memory), MULTIEQUAL (PHI nodes in loops),
+     * and other operations that produce a new value for the variable.
+     * Now checks ANY operation whose output matches the target varnode.
+     */
     private boolean isAssignmentTo(ClangStatement stmt, Object targetVar, HighFunction highFunc) {
         if (!(targetVar instanceof Varnode targetVn)) return false;
         
-        // Look for COPY/STORE operations that write to targetVn
         Address stmtAddr = stmt.getMinAddress();
         if (stmtAddr == null) return false;
+        
+        // Get alias set - check assignment to the target OR any of its aliases
+        Set<Varnode> aliasSet = (aliasTracker != null) 
+            ? aliasTracker.getAliases(targetVn) 
+            : Collections.singleton(targetVn);
         
         Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
         while (ops.hasNext()) {
             PcodeOpAST op = ops.next();
-            int opcode = op.getOpcode();
+            Varnode output = op.getOutput();
             
-            if (opcode == PcodeOp.COPY || opcode == PcodeOp.STORE || 
-                opcode == PcodeOp.CALL || opcode == PcodeOp.CALLIND) {
-                Varnode output = op.getOutput();
-                if (output != null && varnodeMatches(output, targetVn)) {
-                    return true;
+            // Check ANY operation that produces output matching our target or aliases
+            if (output != null) {
+                for (Varnode alias : aliasSet) {
+                    if (varnodeMatches(output, alias)) {
+                        return true;
+                    }
                 }
             }
         }
@@ -840,9 +870,10 @@ public class TaintQueryMatcher {
     /**
      * Match a dereference pattern
      * 
-     * This checks if the statement dereferences the EXACT pointer that was bound.
-     * For UAF detection, we need to ensure that the pointer being dereferenced
-     * is the same as what was freed, not just a related pointer.
+     * This checks if the statement dereferences the EXACT pointer that was bound,
+     * OR any alias of that pointer (to catch UAF through aliased variables).
+     * 
+     * For UAF detection: free(ptr); ... *alias; where alias == ptr
      */
     private boolean matchDereference(TaintQuery.Dereference deref, ClangStatement stmt,
                                      HighFunction highFunc, Map<String, Object> bindings) {
@@ -852,10 +883,15 @@ public class TaintQueryMatcher {
         
         if (!(boundVar instanceof Varnode targetVn)) return false;
         
+        // Get alias set for the bound pointer
+        Set<Varnode> aliasSet = (aliasTracker != null)
+            ? aliasTracker.getAliases(targetVn)
+            : Collections.singleton(targetVn);
+        
         Address stmtAddr = stmt.getMinAddress();
         if (stmtAddr == null) return false;
         
-        // Check P-Code for LOAD or STORE operations that use the exact pointer
+        // Check P-Code for LOAD or STORE operations that use the pointer or any alias
         Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
         while (ops.hasNext()) {
             PcodeOpAST op = ops.next();
@@ -864,16 +900,24 @@ public class TaintQueryMatcher {
             // LOAD: reading through a pointer (*ptr on right side)
             if (opcode == PcodeOp.LOAD) {
                 Varnode ptr = op.getInput(1);
-                if (ptr != null && varnodeMatchesExact(ptr, targetVn, highFunc)) {
-                    return true;
+                if (ptr != null) {
+                    for (Varnode alias : aliasSet) {
+                        if (varnodeMatchesExact(ptr, alias, highFunc)) {
+                            return true;
+                        }
+                    }
                 }
             }
             
             // STORE: writing through a pointer (*ptr on left side, or ptr->field = x)
             if (opcode == PcodeOp.STORE) {
                 Varnode ptr = op.getInput(1);
-                if (ptr != null && varnodeMatchesExact(ptr, targetVn, highFunc)) {
-                    return true;
+                if (ptr != null) {
+                    for (Varnode alias : aliasSet) {
+                        if (varnodeMatchesExact(ptr, alias, highFunc)) {
+                            return true;
+                        }
+                    }
                 }
             }
         }
