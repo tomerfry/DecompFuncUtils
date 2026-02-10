@@ -133,6 +133,42 @@ public class TaintQueryParser {
             "PATTERN tainted_param_to_sink {\n" +
             "    $sink($arg, ...);\n" +
             "} WHERE is_param($arg) AND tainted($arg)");
+        
+        // === New patterns using distance constraints and guard checks ===
+        
+        // Find npos check: find() result used in arithmetic without npos validation
+        // Uses distance constraint to keep matches tight, and not:($a == 0xffffffff)
+        // to filter out paths that DO have a guard check (those are safe)
+        BUILTIN_PATTERNS.put("find_no_npos_check",
+            "PATTERN find_no_npos_check {\n" +
+            "    $a = std::__cxx11::string::find();\n" +
+            "    ...{0,5} not:$a=_ not:($a == 0xffffffff);\n" +
+            "    FUN_000216e4(_, _, $a + _);\n" +
+            "}");
+        
+        // Broader variant: find() to any substr without npos check
+        BUILTIN_PATTERNS.put("find_to_substr_unchecked",
+            "PATTERN find_to_substr_unchecked {\n" +
+            "    $a = std::__cxx11::string::find();\n" +
+            "    ...{0,8} not:$a=_ not:($a == 0xffffffff);\n" +
+            "    FUN_000215c4(_, _, $a + _);\n" +
+            "}");
+        
+        // Use-after-free with tight distance bound (more precise)
+        BUILTIN_PATTERNS.put("use_after_free_tight",
+            "PATTERN use_after_free_tight {\n" +
+            "    free($ptr);\n" +
+            "    ...{0,20} not:$ptr=_;\n" +
+            "    *$ptr;\n" +
+            "}");
+        
+        // Null pointer dereference without null check guard
+        BUILTIN_PATTERNS.put("null_deref_unchecked",
+            "PATTERN null_deref_unchecked {\n" +
+            "    $ptr = malloc($size);\n" +
+            "    ...{0,10} not:($ptr == 0x0);\n" +
+            "    *$ptr;\n" +
+            "}");
     }
     
     /**
@@ -340,15 +376,69 @@ public class TaintQueryParser {
         stmt = stmt.trim();
         
         // Wildcard multi with negative patterns (... not:$ptr=_)
+        // Also supports distance constraint: ...{0,5} not:$ptr=_
+        // Also supports guard/branch barrier: ...{0,5} guard:($a == 0xffffffff)
+        //   and: ... not:($a == 0xffffffff)
         if (stmt.startsWith("...")) {
             TaintQuery.WildcardMulti wm = new TaintQuery.WildcardMulti();
             
-            // Parse any not: clauses
             String remaining = stmt.substring(3).trim();
-            while (remaining.toLowerCase().startsWith("not:")) {
-                remaining = remaining.substring(4).trim();
+            
+            // Parse optional distance constraint: {min,max} or {max}
+            Pattern distPattern = Pattern.compile("^\\{\\s*(\\d+)\\s*(?:,\\s*(\\d*))?\\s*\\}(.*)$");
+            Matcher distMatcher = distPattern.matcher(remaining);
+            if (distMatcher.matches()) {
+                String first = distMatcher.group(1);
+                String second = distMatcher.group(2);
+                
+                if (second != null) {
+                    // {min,max} or {min,} (unbounded max)
+                    wm.minDistance = Integer.parseInt(first);
+                    if (!second.isEmpty()) {
+                        wm.maxDistance = Integer.parseInt(second);
+                    }
+                    // else maxDistance stays -1 (unbounded)
+                } else {
+                    // {max} - shorthand for {0,max}
+                    wm.minDistance = 0;
+                    wm.maxDistance = Integer.parseInt(first);
+                }
+                remaining = distMatcher.group(3).trim();
+            }
+            
+            // Parse not: and guard: clauses
+            while (remaining.toLowerCase().startsWith("not:") || 
+                   remaining.toLowerCase().startsWith("guard:")) {
+                
+                boolean isGuard = remaining.toLowerCase().startsWith("guard:");
+                remaining = remaining.substring(isGuard ? 6 : 4).trim();
                 
                 TaintQuery.NegativePattern neg = new TaintQuery.NegativePattern();
+                
+                // Check for conditional comparison pattern: ($var == 0xconst) or ($var == const)
+                Pattern condPattern = Pattern.compile(
+                    "^\\(\\s*(\\$\\w+)\\s*(?:==|!=|cmp)\\s*(?:0x([0-9a-fA-F]+)|(\\d+)|_)\\s*\\)(.*)$");
+                Matcher condMatcher = condPattern.matcher(remaining);
+                if (condMatcher.matches()) {
+                    neg.guardVarName = condMatcher.group(1);
+                    neg.isGuardCheck = isGuard;
+                    
+                    String hexVal = condMatcher.group(2);
+                    String decVal = condMatcher.group(3);
+                    if (hexVal != null) {
+                        neg.guardConstant = Long.parseUnsignedLong(hexVal, 16);
+                    } else if (decVal != null) {
+                        neg.guardConstant = Long.parseLong(decVal);
+                    }
+                    // else guardConstant stays null (matches any comparison)
+                    
+                    wm.negatives.add(neg);
+                    remaining = condMatcher.group(4).trim();
+                    if (remaining.startsWith(";")) {
+                        remaining = remaining.substring(1).trim();
+                    }
+                    continue;
+                }
                 
                 // Check for $var=_ pattern (no assignment to var)
                 Pattern assignPattern = Pattern.compile("^(\\$\\w+)\\s*=\\s*_(.*)$");

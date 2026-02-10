@@ -79,6 +79,13 @@ public class TaintQueryMatcher {
         Function func = highFunc.getFunction();
         logPanel.logInfo("Searching in " + func.getName() + "...");
         
+        // Log pattern structure once
+        List<TaintQuery.PatternElement> elements = query.getPatternElements();
+        logPanel.logInfo("Pattern has " + elements.size() + " elements:");
+        for (int i = 0; i < elements.size(); i++) {
+            logPanel.logInfo("  [" + i + "] " + elements.get(i).getClass().getSimpleName() + ": " + elements.get(i));
+        }
+        
         // Build taint matrix for constraint evaluation
         TaintMatrixConverter.CsrData taintData = converter.convert(highFunc);
         
@@ -656,11 +663,6 @@ public class TaintQueryMatcher {
         
         List<TaintQuery.PatternElement> elements = query.getPatternElements();
 
-        logPanel.logInfo("Pattern has " + elements.size() + " elements:");
-        for (int i = 0; i < elements.size(); i++) {
-            logPanel.logInfo("  [" + i + "] " + elements.get(i).getClass().getSimpleName() + ": " + elements.get(i));
-        }
-
         if (elementIdx >= elements.size()) {
             // All elements matched!
             if (query.getConstraint().evaluate(bindings, taintCtx)) {
@@ -687,7 +689,18 @@ public class TaintQueryMatcher {
             // Search through remaining statements for next element
             List<ClangStatement> remainingStmts = getStatementsAfter(startStmt, highFunc);
             
-            for (int i = 0; i < remainingStmts.size(); i++) {
+            // Apply maxDistance limit to search range
+            int searchLimit = remainingStmts.size();
+            if (wm.maxDistance >= 0) {
+                searchLimit = Math.min(searchLimit, wm.maxDistance + 1);
+            }
+            
+            for (int i = 0; i < searchLimit; i++) {
+                // Check minDistance constraint
+                if (!wm.isDistanceSatisfied(i)) {
+                    continue;
+                }
+                
                 ClangStatement candidateStmt = remainingStmts.get(i);
                 Map<String, Object> newBindings = new HashMap<>(bindings);
                 
@@ -738,7 +751,17 @@ public class TaintQueryMatcher {
 
 
     /**
-     * Check that negative patterns are NOT present in the given statements
+     * Check that negative patterns are NOT present in the given statements,
+     * and guard patterns ARE present.
+     * 
+     * Supports three types of patterns:
+     * 1. not:$var=_          - Variable must NOT be reassigned in the gap
+     * 2. not:func($var)      - Function must NOT be called in the gap
+     * 3. guard:($var == 0xN) - Gap MUST contain a conditional branch comparing $var to N
+     *                          (i.e., a sanitizer check). If absent, the match is valid
+     *                          (meaning no guard was found = potential vulnerability)
+     * 4. not:($var == 0xN)   - Gap must NOT contain a conditional branch comparing $var to N
+     *                          (forbids the check pattern)
      */
     private boolean checkNegativePatterns(List<TaintQuery.NegativePattern> negatives,
                                           List<ClangStatement> statements,
@@ -747,6 +770,35 @@ public class TaintQueryMatcher {
         if (negatives.isEmpty()) return true;
         
         for (TaintQuery.NegativePattern neg : negatives) {
+            
+            // Handle conditional branch barrier: guard:($var == const) or not:($var == const)
+            if (neg.guardVarName != null) {
+                boolean branchFound = checkConditionalBranchInGap(
+                    neg.guardVarName, neg.guardConstant, statements, bindings, highFunc);
+                
+                if (neg.isGuardCheck) {
+                    // guard: semantics - the check MUST be present
+                    // If no branch found, the guard is absent = this is a vulnerability
+                    // Return false to REJECT this match (we want matches WITHOUT guards)
+                    // Wait - "guard:" means "require a guard". If guard is absent, 
+                    // the gap does NOT satisfy the pattern, so we reject.
+                    // If you want to find MISSING guards, use: not:($var == const) 
+                    // which rejects gaps that DO have the check.
+                    if (!branchFound) {
+                        return false;  // Guard required but not found
+                    }
+                } else {
+                    // not: semantics - the check must NOT be present
+                    // If a branch IS found comparing $var to the constant,
+                    // this means the code has a sanitizer = NOT a vulnerability
+                    // Return false to reject this match candidate
+                    if (branchFound) {
+                        return false;  // Found a guard check, so this path is sanitized
+                    }
+                }
+                continue;
+            }
+            
             for (ClangStatement stmt : statements) {
                 String stmtText = extractCodeText(stmt);
                 
@@ -771,7 +823,161 @@ public class TaintQueryMatcher {
             }
         }
         
-        return true;  // No negative patterns found - OK
+        return true;  // All checks passed
+    }
+    
+    /**
+     * Check if any statement in the gap contains a conditional branch (CBRANCH)
+     * that compares the bound variable against a specific constant value.
+     * 
+     * This detects patterns like:
+     *   if (find_result == 0xffffffff) { ... }    // npos check
+     *   if (find_result == -1) { ... }             // npos check
+     *   if (result != NULL) { ... }                // null check
+     * 
+     * The detection works by scanning P-Code operations in the gap for:
+     *   CBRANCH that depends on INT_EQUAL/INT_NOTEQUAL/INT_SLESS/etc.
+     *   where one operand resolves to the bound variable and the other
+     *   is the specified constant.
+     * 
+     * @param guardVarName  Pattern variable name (e.g., "$a")
+     * @param guardConstant Constant to check for (e.g., 0xFFFFFFFF for npos), null for any
+     * @param statements    Statements in the gap between pattern elements
+     * @param bindings      Current variable bindings
+     * @param highFunc      The high-level function being analyzed
+     * @return true if a matching conditional branch was found
+     */
+    private boolean checkConditionalBranchInGap(String guardVarName, Long guardConstant,
+                                                 List<ClangStatement> statements,
+                                                 Map<String, Object> bindings,
+                                                 HighFunction highFunc) {
+        Object boundVar = bindings.get(guardVarName);
+        if (boundVar == null || !(boundVar instanceof Varnode targetVn)) {
+            return false;
+        }
+        
+        // Get alias set for the variable
+        Set<Varnode> aliasSet = (aliasTracker != null)
+            ? aliasTracker.getAliases(targetVn)
+            : Collections.singleton(targetVn);
+        
+        for (ClangStatement stmt : statements) {
+            Address stmtAddr = stmt.getMinAddress();
+            if (stmtAddr == null) continue;
+            
+            Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
+            while (ops.hasNext()) {
+                PcodeOpAST op = ops.next();
+                int opcode = op.getOpcode();
+                
+                // Look for comparison operations that feed into conditional branches
+                // INT_EQUAL, INT_NOTEQUAL, INT_SLESS, INT_SLESSEQUAL, INT_LESS, INT_LESSEQUAL
+                if (isComparisonOpcode(opcode)) {
+                    Varnode input0 = op.getInput(0);
+                    Varnode input1 = op.getInput(1);
+                    
+                    if (input0 == null || input1 == null) continue;
+                    
+                    // Check if one operand is our target variable and the other is the constant
+                    boolean varOnLeft = isVarnodeInSet(input0, aliasSet, highFunc);
+                    boolean varOnRight = isVarnodeInSet(input1, aliasSet, highFunc);
+                    
+                    if (varOnLeft || varOnRight) {
+                        // Found a comparison involving our variable
+                        Varnode constOperand = varOnLeft ? input1 : input0;
+                        
+                        if (guardConstant == null) {
+                            // Any comparison against any value counts
+                            return true;
+                        }
+                        
+                        // Check if the other operand is the expected constant
+                        if (constOperand.isConstant()) {
+                            long constVal = constOperand.getOffset();
+                            // Handle sign extension: 0xffffffff == -1 for 32-bit
+                            if (constVal == guardConstant || 
+                                (constVal & 0xFFFFFFFFL) == (guardConstant & 0xFFFFFFFFL)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                
+                // Also check CBRANCH directly - its input might be a boolean from
+                // a comparison that we can trace back
+                if (opcode == PcodeOp.CBRANCH) {
+                    Varnode condition = op.getInput(1);
+                    if (condition != null) {
+                        PcodeOp condDef = condition.getDef();
+                        if (condDef != null && isComparisonOpcode(condDef.getOpcode())) {
+                            Varnode cmpIn0 = condDef.getInput(0);
+                            Varnode cmpIn1 = condDef.getInput(1);
+                            
+                            if (cmpIn0 == null || cmpIn1 == null) continue;
+                            
+                            boolean cmpVarLeft = isVarnodeInSet(cmpIn0, aliasSet, highFunc);
+                            boolean cmpVarRight = isVarnodeInSet(cmpIn1, aliasSet, highFunc);
+                            
+                            if (cmpVarLeft || cmpVarRight) {
+                                Varnode cmpConst = cmpVarLeft ? cmpIn1 : cmpIn0;
+                                
+                                if (guardConstant == null) {
+                                    return true;
+                                }
+                                
+                                if (cmpConst.isConstant()) {
+                                    long val = cmpConst.getOffset();
+                                    if (val == guardConstant || 
+                                        (val & 0xFFFFFFFFL) == (guardConstant & 0xFFFFFFFFL)) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Check if a P-Code opcode is a comparison operation
+     */
+    private boolean isComparisonOpcode(int opcode) {
+        return opcode == PcodeOp.INT_EQUAL ||
+               opcode == PcodeOp.INT_NOTEQUAL ||
+               opcode == PcodeOp.INT_SLESS ||
+               opcode == PcodeOp.INT_SLESSEQUAL ||
+               opcode == PcodeOp.INT_LESS ||
+               opcode == PcodeOp.INT_LESSEQUAL;
+    }
+    
+    /**
+     * Check if a varnode matches any varnode in the given alias set.
+     * Uses both direct matching and high-variable resolution.
+     */
+    private boolean isVarnodeInSet(Varnode vn, Set<Varnode> aliasSet, HighFunction highFunc) {
+        for (Varnode alias : aliasSet) {
+            if (varnodeMatchesExact(vn, alias, highFunc)) {
+                return true;
+            }
+        }
+        // Also check by tracing through COPY chains - the comparison might
+        // use a copy of the original variable
+        PcodeOp def = vn.getDef();
+        if (def != null && (def.getOpcode() == PcodeOp.COPY || def.getOpcode() == PcodeOp.CAST)) {
+            Varnode copySource = def.getInput(0);
+            if (copySource != null) {
+                for (Varnode alias : aliasSet) {
+                    if (varnodeMatchesExact(copySource, alias, highFunc)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
     
     /**
@@ -1060,23 +1266,48 @@ public class TaintQueryMatcher {
             return true;
         }
         
+        // Qualified name matching: if pattern contains "::", allow matching
+        // the called name against the full qualified pattern or vice versa
+        // e.g., pattern "std::__cxx11::string::find" matches called "find" 
+        //   if calledName is the unqualified tail
+        // or calledName "std::__cxx11::basic_string<>::find" matches pattern
+        //   "std::__cxx11::string::find" by containing the key parts
+        if (patternName.contains("::")) {
+            // Extract the final component of the qualified name
+            String patternTail = patternName.substring(patternName.lastIndexOf("::") + 2);
+            // Check if called name ends with the same tail and contains key namespace parts
+            if (calledName.equals(patternTail)) {
+                return true;
+            }
+            // Check if the called name contains the pattern (for demangled names)
+            if (calledName.contains(patternName)) {
+                return true;
+            }
+            // Check if pattern contains the called name (calledName might be shorter)
+            if (patternName.contains(calledName) && calledName.length() > 3) {
+                return true;
+            }
+        }
+        // Also handle the reverse: calledName is qualified, pattern is simple
+        if (calledName.contains("::") && !patternName.contains("::")) {
+            String calledTail = calledName.substring(calledName.lastIndexOf("::") + 2);
+            if (calledTail.equals(patternName)) {
+                return true;
+            }
+        }
+        
         // Common wrapper patterns (strict)
-        // __wrap_malloc -> matches malloc
         if (calledName.equals("__wrap_" + patternName)) {
             return true;
         }
-        
-        // malloc_s -> matches malloc (safe variants)
         if (calledName.equals(patternName + "_s")) {
             return true;
         }
-        
-        // __malloc -> matches malloc (internal variants)
         if (calledName.equals("__" + patternName)) {
             return true;
         }
         
-        // No match - reject things like av_mallocz for malloc
+        // No match
         return false;
     }
 
@@ -1174,9 +1405,9 @@ public class TaintQueryMatcher {
             return false;
         }
         
-        // Check for function call on RHS like "$ptr = malloc($size)"
+        // Check for function call on RHS like "$ptr = malloc($size)" or "$a = std::string::find()"
         java.util.regex.Pattern callPattern = java.util.regex.Pattern.compile(
-            "^(\\$?\\w+)\\s*\\((.*)\\)$");
+            "^(\\$?[\\w:]+)\\s*\\((.*)\\)$");
         java.util.regex.Matcher callMatcher = callPattern.matcher(rhs);
         
         if (callMatcher.matches()) {
@@ -1340,13 +1571,23 @@ public class TaintQueryMatcher {
     }
     
     /**
-     * Add a match to results
+     * Add a match to results (with deduplication by address)
      */
     private void addMatch(TaintQuery query, ClangNode node, HighFunction highFunc,
                          Map<String, Object> bindings) {
+        Address addr = node.getMinAddress();
+        
+        // Deduplicate: skip if we already have a match at this address in this function
+        for (QueryMatch existing : matches) {
+            if (existing.address != null && existing.address.equals(addr) &&
+                existing.function.equals(highFunc.getFunction())) {
+                return;
+            }
+        }
+        
         QueryMatch match = new QueryMatch();
         match.function = highFunc.getFunction();
-        match.address = node.getMinAddress();
+        match.address = addr;
         match.matchedCode = extractCodeText(node);
         match.bindings = new HashMap<>(bindings);
         match.matchedTokens = collectTokens(node);

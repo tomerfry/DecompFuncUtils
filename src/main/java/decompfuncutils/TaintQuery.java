@@ -174,17 +174,39 @@ public class TaintQuery {
         // Matches zero or more statements "..."
         public List<NegativePattern> negatives = new ArrayList<>();  // not: patterns
         
+        // Distance constraint: ...{min,max} limits how many statements the gap can span
+        // -1 means unbounded (default behavior)
+        public int minDistance = 0;   // minimum number of statements in the gap
+        public int maxDistance = -1;  // maximum number of statements (-1 = unlimited)
+        
         @Override
         public boolean matches(TokenContext ctx, Map<String, Object> bindings) {
             return true;
         }
         
+        /**
+         * Check if a given gap size satisfies the distance constraint
+         */
+        public boolean isDistanceSatisfied(int gapSize) {
+            if (gapSize < minDistance) return false;
+            if (maxDistance >= 0 && gapSize > maxDistance) return false;
+            return true;
+        }
+        
         @Override
         public String toString() {
-            if (negatives.isEmpty()) return "...";
             StringBuilder sb = new StringBuilder("...");
+            if (maxDistance >= 0 || minDistance > 0) {
+                sb.append("{").append(minDistance).append(",");
+                sb.append(maxDistance >= 0 ? maxDistance : "").append("}");
+            }
             for (NegativePattern neg : negatives) {
-                sb.append(" not:").append(neg);
+                if (neg.guardVarName != null) {
+                    // Guard/conditional patterns already include their prefix in toString()
+                    sb.append(" ").append(neg);
+                } else {
+                    sb.append(" not:").append(neg);
+                }
             }
             return sb.toString();
         }
@@ -194,8 +216,25 @@ public class TaintQuery {
         public String varName;      // Variable that must NOT be assigned
         public String pattern;      // Full pattern that must NOT appear
         
+        // Conditional branch barrier: not:($var == 0xffffffff) or not:($var cmp const)
+        // If set, the gap must NOT contain a conditional branch that compares
+        // the bound variable against the given constant - meaning such a check
+        // IS required (double negation: "not having a check" = "check is absent" = bug)
+        // When used as: ...{0,5} guard:($a == 0xffffffff), it means the gap must 
+        // CONTAIN a branch comparing $a to the constant (sanitizer/guard check)
+        public String guardVarName;     // Variable being compared (e.g., "$a")
+        public Long guardConstant;      // Constant being compared against (e.g., 0xffffffff for npos)
+        public boolean isGuardCheck;    // true = require guard (gap must contain check)
+                                        // false = forbid guard (default not: behavior)
+        
         @Override
         public String toString() {
+            if (guardVarName != null) {
+                String prefix = isGuardCheck ? "guard:" : "not:";
+                String constStr = guardConstant != null ? 
+                    "0x" + Long.toHexString(guardConstant) : "_";
+                return prefix + "(" + guardVarName + " == " + constStr + ")";
+            }
             if (varName != null) return varName + "=_";
             return pattern;
         }
