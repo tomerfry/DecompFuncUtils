@@ -557,7 +557,8 @@ public class TaintQueryParser {
         // Parse RHS - could be function call, variable, or expression
         if (rhs.contains("(")) {
             // Function call on RHS - extract function name and mark as RHS
-            Pattern callPattern = Pattern.compile("^(\\$?\\w+)\\s*\\((.*)\\)\\s*$");
+            // Allow dots in names for operator.new, operator.delete, etc.
+            Pattern callPattern = Pattern.compile("^(\\$?[\\w.]+)\\s*\\((.*)\\)\\s*$");
             Matcher callMatcher = callPattern.matcher(rhs);
             if (callMatcher.matches()) {
                 assign.rhs = rhs;  // Keep the full call

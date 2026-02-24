@@ -296,6 +296,24 @@ public class TaintQueryMatcher {
      */
     private boolean matchArgument(String argPattern, Varnode actualArg, 
                                 HighFunction highFunc, Map<String, Object> bindings) {
+        return matchArgument(argPattern, actualArg, highFunc, bindings, null);
+    }
+    
+    /**
+     * Match a function call argument against a pattern.
+     * 
+     * Handles:
+     * - Simple variables: "$x" matches any argument
+     * - Binary expressions: "$a * $b" requires INT_MULT operation
+     * - Constants: literal values must match
+     * 
+     * @param stmtText Optional decompiled C text of the statement, used to cross-check
+     *                 that binary operations actually appear in the decompiled output
+     *                 (not just as low-level pcode artifacts like pointer arithmetic).
+     */
+    private boolean matchArgument(String argPattern, Varnode actualArg, 
+                                HighFunction highFunc, Map<String, Object> bindings,
+                                String stmtText) {
         argPattern = argPattern.trim();
         
         // Check for binary operation patterns: $a * $b, $a + $b, etc.
@@ -317,6 +335,23 @@ public class TaintQueryMatcher {
             int expectedOpcode = getOpcodeForOperator(operator);
             if (defOp.getOpcode() != expectedOpcode) {
                 return false;  // Wrong operation type
+            }
+            
+            // Cross-check: verify the operator actually appears in the decompiled C text.
+            // This filters out pcode-level artifacts (pointer arithmetic, stack adjustments)
+            // that the decompiler has already folded into a single variable.
+            // e.g., prevents matching "operator.new(uVar1)" where uVar1's pcode definition
+            // happens to involve INT_ADD from address calculation.
+            if (stmtText != null) {
+                // Map operator to what appears in C output
+                String cOperator = operator;
+                // For *, check it's arithmetic multiplication not pointer dereference
+                // by looking for the pattern "var * var" or "var *number"
+                if (!stmtText.contains(" " + cOperator + " ") && 
+                    !stmtText.contains("(" + cOperator) && 
+                    !stmtText.contains(cOperator + ")")) {
+                    return false;  // Operation not visible in decompiled output
+                }
             }
             
             // Bind the operands
@@ -624,7 +659,10 @@ public class TaintQueryMatcher {
         
         // For assignment patterns
         if (elements.size() == 1 && elements.get(0) instanceof TaintQuery.Assignment assign) {
-            if (ctx.isAssignment() && matchAssignment(assign, stmt, highFunc, bindings)) {
+            // Use matchAssignmentWithExpression to handle function calls on RHS
+            // (e.g., $a = operator.new($b), $ptr = malloc($size))
+            // Falls back to simple matchAssignment internally if no call/binop pattern
+            if (ctx.isAssignment() && matchAssignmentWithExpression(assign, stmt, highFunc, bindings)) {
                 if (query.getConstraint().evaluate(bindings, taintCtx)) {
                     addMatch(query, stmt, highFunc, bindings);
                 }
@@ -1405,16 +1443,46 @@ public class TaintQueryMatcher {
             return false;
         }
         
-        // Check for function call on RHS like "$ptr = malloc($size)" or "$a = std::string::find()"
+        // Check for function call on RHS like "$ptr = malloc($size)" or "$a = operator.new($size)"
         java.util.regex.Pattern callPattern = java.util.regex.Pattern.compile(
-            "^(\\$?[\\w:]+)\\s*\\((.*)\\)$");
+            "^(\\$?[\\w.:]+)\\s*\\((.*)\\)$");
         java.util.regex.Matcher callMatcher = callPattern.matcher(rhs);
         
         if (callMatcher.matches()) {
             String funcName = callMatcher.group(1);
             String argsStr = callMatcher.group(2);
             
-            // Find CALL operation and verify function name
+            // First try: Find CALL via the function name token in the statement
+            // (more reliable than statement address, since the CALL pcode op is mapped
+            // to the function name token's address, not the assignment target's address)
+            ClangFuncNameToken funcToken = findFuncNameToken(stmt);
+            if (funcToken != null) {
+                PcodeOp callOp = findCallPcodeOp(funcToken, highFunc);
+                if (callOp != null) {
+                    String calledName = funcToken.getText();
+                    if (matchFunctionName(calledName, funcName, bindings)) {
+                        Varnode output = callOp.getOutput();
+                        // Bind LHS
+                        if (assign.lhs.startsWith("$") && output != null) {
+                            bindings.put(assign.lhs, output);
+                        }
+                        
+                        // Bind arguments using matchArgument (handles expression patterns like $b * $c)
+                        String stmtText = extractCodeText(stmt);
+                        List<String> args = parseArgumentList(argsStr);
+                        Varnode[] inputs = callOp.getInputs();
+                        for (int i = 0; i < args.size() && i + 1 < inputs.length; i++) {
+                            String argPattern = args.get(i);
+                            if (!matchArgument(argPattern, inputs[i + 1], highFunc, bindings, stmtText)) {
+                                return false;  // Argument doesn't match pattern
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
+            
+            // Fallback: Find CALL operation at statement address
             Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
             while (ops.hasNext()) {
                 PcodeOpAST op = ops.next();
@@ -1430,16 +1498,21 @@ public class TaintQueryMatcher {
                             bindings.put(assign.lhs, output);
                         }
                         
-                        // Bind arguments
+                        // Bind arguments using matchArgument (handles expression patterns like $b * $c)
+                        String stmtText = extractCodeText(stmt);
                         List<String> args = parseArgumentList(argsStr);
                         Varnode[] inputs = op.getInputs();
+                        boolean argsMatched = true;
                         for (int i = 0; i < args.size() && i + 1 < inputs.length; i++) {
                             String argPattern = args.get(i);
-                            if (argPattern.startsWith("$")) {
-                                bindings.put(argPattern, inputs[i + 1]);
+                            if (!matchArgument(argPattern, inputs[i + 1], highFunc, bindings, stmtText)) {
+                                argsMatched = false;
+                                break;
                             }
                         }
-                        return true;
+                        if (argsMatched) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -1515,8 +1588,11 @@ public class TaintQueryMatcher {
      */
     private boolean matchAssignment(TaintQuery.Assignment assign, ClangStatement stmt,
                                    HighFunction highFunc, Map<String, Object> bindings) {
-        // Look for assignment in P-Code
-        Iterator<PcodeOpAST> ops = highFunc.getPcodeOps();
+        // Scope to P-Code ops at this statement's address (not the whole function)
+        Address stmtAddr = stmt.getMinAddress();
+        if (stmtAddr == null) return false;
+        
+        Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
         while (ops.hasNext()) {
             PcodeOpAST op = ops.next();
             if (op.getOpcode() == PcodeOp.COPY || op.getOpcode() == PcodeOp.CAST) {
