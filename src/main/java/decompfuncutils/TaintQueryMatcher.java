@@ -605,15 +605,10 @@ public class TaintQueryMatcher {
     private void searchInTokens(TaintQuery query, ClangNode node, HighFunction highFunc,
                                 TaintContextImpl taintCtx, List<ClangToken> context) {
         
-        // Check statement-level patterns (handles both single and multi-element patterns)
+        // Check statement-level patterns (handles single and multi-element patterns,
+        // including single function calls, assignments, and complex sequences)
         if (node instanceof ClangStatement stmt) {
             checkStatementMatch(query, stmt, highFunc, taintCtx);
-        }
-        
-        // For single-element function call patterns only, also check at token level
-        // This prevents multi-element patterns from matching individual function calls
-        if (node instanceof ClangFuncNameToken funcToken && isSingleFunctionCallPattern(query)) {
-            checkFunctionCallMatch(query, funcToken, highFunc, taintCtx);
         }
         
         // Recurse into children

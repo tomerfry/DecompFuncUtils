@@ -453,8 +453,8 @@ public class TaintQueryParser {
                     continue;
                 }
                 
-                // Check for function call pattern not:free($ptr)
-                Pattern funcPattern = Pattern.compile("^(\\w+\\s*\\([^)]*\\))(.*)$");
+                // Check for function call pattern not:free($ptr) or not:operator.delete($ptr)
+                Pattern funcPattern = Pattern.compile("^([\\w.]+\\s*\\([^)]*\\))(.*)$");
                 Matcher funcMatcher = funcPattern.matcher(remaining);
                 if (funcMatcher.matches()) {
                     neg.pattern = funcMatcher.group(1);
@@ -515,7 +515,8 @@ public class TaintQueryParser {
         }
         
         // Function call (funcname($arg1, $arg2, ...))
-        Pattern callPattern = Pattern.compile("^(\\$?\\w+)\\s*\\((.*)\\)\\s*$");
+        // Allow dots in names for operator.new, operator.delete, etc.
+        Pattern callPattern = Pattern.compile("^(\\$?[\\w.]+)\\s*\\((.*)\\)\\s*$");
         Matcher callMatcher = callPattern.matcher(stmt);
         if (callMatcher.matches()) {
             TaintQuery.FunctionCall call = new TaintQuery.FunctionCall();
