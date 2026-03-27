@@ -56,7 +56,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import ghidra.program.model.address.AddressIterator;
 
 //@formatter:off
 @PluginInfo(
@@ -182,8 +182,9 @@ public class FlowLauncherPlugin extends ProgramPlugin {
 
         Program program = currentProgram;
         if (program != null) {
-            indexFunctions(program, items);
-            indexSymbols(program, items);
+            Set<Address> functionAddrs = new HashSet<>();
+            indexFunctions(program, items, functionAddrs);
+            indexSymbols(program, items, functionAddrs);
             indexStrings(program, items);
             indexBookmarks(program, items);
             indexComments(program, items);
@@ -195,7 +196,8 @@ public class FlowLauncherPlugin extends ProgramPlugin {
         return items;
     }
 
-    private void indexFunctions(Program program, List<LauncherItem> items) {
+    private void indexFunctions(Program program, List<LauncherItem> items,
+                                Set<Address> functionAddrs) {
         FunctionIterator iter = program.getFunctionManager().getFunctions(true);
         int count = 0;
         int limit = 50000; // safety limit
@@ -210,24 +212,20 @@ public class FlowLauncherPlugin extends ProgramPlugin {
                 detail = sig;
             }
 
+            Address entry = func.getEntryPoint();
+            functionAddrs.add(entry);
             items.add(new LauncherItem(name, detail, ItemCategory.FUNCTION,
-                    func.getEntryPoint(), null));
+                    entry, null));
             count++;
         }
     }
 
-    private void indexSymbols(Program program, List<LauncherItem> items) {
+    private void indexSymbols(Program program, List<LauncherItem> items,
+                              Set<Address> functionAddrs) {
         SymbolTable symTable = program.getSymbolTable();
         SymbolIterator iter = symTable.getAllSymbols(true);
         int count = 0;
         int limit = 50000;
-
-        // Track function entry points so we don't duplicate
-        Set<Address> functionAddrs = ConcurrentHashMap.newKeySet();
-        FunctionIterator fiter = program.getFunctionManager().getFunctions(true);
-        while (fiter.hasNext()) {
-            functionAddrs.add(fiter.next().getEntryPoint());
-        }
 
         while (iter.hasNext() && count < limit) {
             Symbol sym = iter.next();
@@ -293,16 +291,17 @@ public class FlowLauncherPlugin extends ProgramPlugin {
         String[] commentLabels = { "EOL", "Pre", "Post", "Plate" };
 
         Listing listing = program.getListing();
-        CodeUnitIterator iter = listing.getCodeUnits(true);
         int count = 0;
         int limit = 20000;
 
-        while (iter.hasNext() && count < limit) {
-            CodeUnit cu = iter.next();
-            for (int i = 0; i < commentTypes.length; i++) {
+        for (int i = 0; i < commentTypes.length && count < limit; i++) {
+            AddressIterator addrIter = listing.getCommentAddressIterator(
+                    commentTypes[i], program.getMemory(), true);
+            while (addrIter.hasNext() && count < limit) {
+                Address addr = addrIter.next();
                 String comment = null;
                 try {
-                    comment = listing.getComment(commentTypes[i], cu.getAddress());
+                    comment = listing.getComment(commentTypes[i], addr);
                 } catch (Exception ignored) {}
 
                 if (comment != null && !comment.isEmpty()) {
@@ -310,10 +309,10 @@ public class FlowLauncherPlugin extends ProgramPlugin {
                     if (display.length() > 100) {
                         display = display.substring(0, 97) + "...";
                     }
-                    String detail = cu.getAddress().toString()
+                    String detail = addr.toString()
                             + " [" + commentLabels[i] + " comment]";
                     items.add(new LauncherItem(display, detail, ItemCategory.COMMENT,
-                            cu.getAddress(), null));
+                            addr, null));
                     count++;
                 }
             }
@@ -523,6 +522,7 @@ public class FlowLauncherPlugin extends ProgramPlugin {
 
         private List<LauncherItem> allItems = Collections.emptyList();
         private List<LauncherItem> filteredItems = new ArrayList<>();
+        private List<JPanel> resultRows = new ArrayList<>();
         private int selectedIndex = 0;
 
         /** Currently active category filter, null = all */
@@ -793,6 +793,7 @@ public class FlowLauncherPlugin extends ProgramPlugin {
 
         private void rebuildResultsUI() {
             resultsPanel.removeAll();
+            resultRows.clear();
 
             if (filteredItems.isEmpty()) {
                 JLabel empty = new JLabel("  No results found");
@@ -804,7 +805,9 @@ public class FlowLauncherPlugin extends ProgramPlugin {
             } else {
                 int showCount = Math.min(filteredItems.size(), 100);
                 for (int i = 0; i < showCount; i++) {
-                    resultsPanel.add(createResultRow(filteredItems.get(i), i));
+                    JPanel row = createResultRow(filteredItems.get(i), i);
+                    resultRows.add(row);
+                    resultsPanel.add(row);
                 }
             }
 
@@ -872,8 +875,11 @@ public class FlowLauncherPlugin extends ProgramPlugin {
                 }
                 @Override
                 public void mouseEntered(MouseEvent e) {
+                    int oldIndex = selectedIndex;
                     selectedIndex = idx;
-                    rebuildResultsUI();
+                    if (oldIndex != selectedIndex) {
+                        updateSelectionVisuals(oldIndex, selectedIndex);
+                    }
                 }
             });
             row.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -887,22 +893,43 @@ public class FlowLauncherPlugin extends ProgramPlugin {
 
         private void moveSelection(int delta) {
             if (filteredItems.isEmpty()) return;
+            int oldIndex = selectedIndex;
             selectedIndex = Math.max(0, Math.min(filteredItems.size() - 1,
                     selectedIndex + delta));
-            rebuildResultsUI();
+            if (oldIndex != selectedIndex) {
+                updateSelectionVisuals(oldIndex, selectedIndex);
+            }
+        }
+
+        private void updateSelectionVisuals(int oldIndex, int newIndex) {
+            if (oldIndex >= 0 && oldIndex < resultRows.size()) {
+                applyRowStyle(resultRows.get(oldIndex), false);
+            }
+            if (newIndex >= 0 && newIndex < resultRows.size()) {
+                applyRowStyle(resultRows.get(newIndex), true);
+            }
             ensureSelectionVisible();
         }
 
-        // FIX: Use resultsPanel.scrollRectToVisible with the child's bounds,
-        // not jc.scrollRectToVisible(jc.getBounds()) which uses wrong coordinate space
+        private void applyRowStyle(JPanel row, boolean selected) {
+            row.setBackground(selected ? new Color(50, 50, 80) : new Color(30, 30, 30));
+            Component centerComp = ((BorderLayout) row.getLayout())
+                    .getLayoutComponent(BorderLayout.CENTER);
+            if (centerComp instanceof JPanel textPanel && textPanel.getComponentCount() > 0) {
+                Component nameComp = textPanel.getComponent(0);
+                if (nameComp instanceof JLabel nameLabel) {
+                    nameLabel.setForeground(selected ? Color.WHITE : new Color(210, 210, 210));
+                }
+            }
+            row.repaint();
+        }
+
         private void ensureSelectionVisible() {
             if (selectedIndex >= 0 && selectedIndex < resultsPanel.getComponentCount()) {
                 Component comp = resultsPanel.getComponent(selectedIndex);
                 if (comp instanceof JComponent jc) {
-                    SwingUtilities.invokeLater(() -> {
-                        Rectangle bounds = jc.getBounds();
-                        resultsPanel.scrollRectToVisible(bounds);
-                    });
+                    Rectangle bounds = jc.getBounds();
+                    resultsPanel.scrollRectToVisible(bounds);
                 }
             }
         }
