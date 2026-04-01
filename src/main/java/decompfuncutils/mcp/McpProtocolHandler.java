@@ -19,7 +19,13 @@ import java.util.function.Supplier;
  */
 public class McpProtocolHandler {
 
-    // Uses Ghidra's Msg for logging
+    private static final Set<String> TOOLS_WITHOUT_PROGRAM = Set.of(
+        "ghidra_get_program_info",
+        "ghidra_list_open_programs",
+        "ghidra_open_program",
+        "ghidra_switch_program"
+    );
+
     private static final String PROTOCOL_VERSION = "2024-11-05";
     private static final String SERVER_NAME = "ghidra-mcp";
     private static final String SERVER_VERSION = "1.0.0";
@@ -162,7 +168,7 @@ public class McpProtocolHandler {
         Program program = programSupplier.get();
         PluginTool pluginTool = toolSupplier.get();
 
-        if (program == null && !toolName.equals("ghidra_get_program_info")) {
+        if (program == null && !TOOLS_WITHOUT_PROGRAM.contains(toolName)) {
             throw new McpError(-32603, "No program is currently open in Ghidra");
         }
 

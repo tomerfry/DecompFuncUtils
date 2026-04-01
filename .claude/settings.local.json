@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew build:*)",
+      "Bash(ls C:/Users/tomer.g/Documents/Project1/DecompFuncUtils/gradle*)",
+      "Bash(ls C:/Users/tomer.g/Documents/Project1/DecompFuncUtils/gradlew*)",
+      "Bash(gradle build:*)",
+      "Read(//c/Users/tomer.g/Ghidra/**)",
+      "Bash(javap -p -classpath \"Ghidra/Features/Base/lib/Base.jar\" \"ghidra.app.util.opinion.LoadResults\")"
+    ]
+  },
+  "disabledMcpjsonServers": [
+    "ghidra"
+  ]
+}

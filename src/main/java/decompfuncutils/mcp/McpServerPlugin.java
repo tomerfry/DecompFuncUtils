@@ -139,6 +139,11 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         toolRegistry.register(new CreateFunctionTool());
         toolRegistry.register(new CreateBookmarkTool());
 
+        // Program Management
+        toolRegistry.register(new ListOpenProgramsTool());
+        toolRegistry.register(new OpenProgramTool());
+        toolRegistry.register(new SwitchProgramTool());
+
         // P2 — Advanced Analysis
         toolRegistry.register(new TaintForwardTool());
         toolRegistry.register(new TaintBackwardTool());
