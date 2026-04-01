@@ -9,13 +9,14 @@ import ghidra.program.model.listing.Program;
 import ghidra.framework.options.ToolOptions;
 import ghidra.framework.options.OptionsChangeListener;
 import ghidra.framework.options.Options;
+import ghidra.util.Msg;
 import docking.ActionContext;
 import docking.action.DockingAction;
 import docking.action.MenuData;
 
+import javax.swing.JOptionPane;
+import javax.swing.SwingUtilities;
 import java.io.IOException;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 //@formatter:off
 @PluginInfo(
@@ -28,8 +29,6 @@ import java.util.logging.Logger;
 )
 //@formatter:on
 public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListener {
-
-    private static final Logger LOG = Logger.getLogger(McpServerPlugin.class.getName());
 
     private static final String OPTION_PORT = "MCP Server Port";
     private static final String OPTION_AUTH_TOKEN = "MCP Auth Token";
@@ -159,16 +158,33 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
 
     public void startServer() {
         if (transport != null && transport.isRunning()) {
-            LOG.info("MCP server is already running on port " + transport.getPort());
+            Msg.showInfo(this, null, "MCP Server",
+                "MCP server is already running on port " + transport.getPort());
             return;
         }
 
         transport = new McpHttpTransport(port, authToken, protocolHandler);
         try {
             transport.start();
-            LOG.info("MCP server started on port " + port + " with " + toolRegistry.size() + " tools");
-        } catch (IOException e) {
-            LOG.log(Level.SEVERE, "Failed to start MCP server", e);
+            Msg.info(this, "MCP server started on http://127.0.0.1:" + port +
+                " with " + toolRegistry.size() + " tools");
+            SwingUtilities.invokeLater(() ->
+                JOptionPane.showMessageDialog(null,
+                    "MCP server started on http://127.0.0.1:" + port +
+                    "\n" + toolRegistry.size() + " tools registered." +
+                    "\n\nConnect Claude Code with:" +
+                    "\n  URL: http://localhost:" + port + "/sse",
+                    "MCP Server Started",
+                    JOptionPane.INFORMATION_MESSAGE));
+        } catch (Exception e) {
+            Msg.error(this, "Failed to start MCP server on port " + port, e);
+            SwingUtilities.invokeLater(() ->
+                JOptionPane.showMessageDialog(null,
+                    "Failed to start MCP server on port " + port +
+                    "\n\nError: " + e.getMessage() +
+                    "\n\nCheck if the port is already in use.",
+                    "MCP Server Error",
+                    JOptionPane.ERROR_MESSAGE));
             transport = null;
         }
     }
@@ -177,7 +193,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         if (transport != null) {
             transport.stop();
             transport = null;
-            LOG.info("MCP server stopped");
+            Msg.info(this, "MCP server stopped");
         }
     }
 
@@ -192,7 +208,6 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
     @Override
     protected void programDeactivated(Program program) {
         super.programDeactivated(program);
-        // Keep server running — it will return errors if no program is open
     }
 
     @Override
@@ -214,10 +229,9 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
                 autoStart = (boolean) newValue;
                 break;
         }
-        // If server is running and port/token changed, need to restart
         if ((OPTION_PORT.equals(optionName) || OPTION_AUTH_TOKEN.equals(optionName))
                 && transport != null && transport.isRunning()) {
-            LOG.info("MCP server config changed, restarting...");
+            Msg.info(this, "MCP server config changed, restarting...");
             stopServer();
             startServer();
         }

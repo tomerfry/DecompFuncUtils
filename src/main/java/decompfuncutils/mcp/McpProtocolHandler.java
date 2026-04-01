@@ -4,13 +4,13 @@ import com.google.gson.*;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
 
+import ghidra.util.Msg;
+
 import javax.swing.SwingUtilities;
 import java.lang.reflect.InvocationTargetException;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
  * Handles MCP JSON-RPC 2.0 protocol messages.
@@ -19,7 +19,7 @@ import java.util.logging.Logger;
  */
 public class McpProtocolHandler {
 
-    private static final Logger LOG = Logger.getLogger(McpProtocolHandler.class.getName());
+    // Uses Ghidra's Msg for logging
     private static final String PROTOCOL_VERSION = "2024-11-05";
     private static final String SERVER_NAME = "ghidra-mcp";
     private static final String SERVER_VERSION = "1.0.0";
@@ -69,7 +69,7 @@ public class McpProtocolHandler {
         } catch (McpError e) {
             return errorResponse(idElement, e.code, e.getMessage());
         } catch (Exception e) {
-            LOG.log(Level.WARNING, "Error handling " + method, e);
+            Msg.warn(this, "Error handling " + method + ": " + e.getMessage());
             return errorResponse(idElement, -32603, "Internal error: " + e.getMessage());
         }
     }
@@ -77,13 +77,13 @@ public class McpProtocolHandler {
     private void handleNotification(String method, JsonObject params) {
         switch (method) {
             case "notifications/initialized":
-                LOG.info("MCP client initialized");
+                Msg.info(this, "MCP client initialized");
                 break;
             case "notifications/cancelled":
-                LOG.info("MCP client cancelled request");
+                Msg.info(this, "MCP client cancelled request");
                 break;
             default:
-                LOG.fine("Unknown notification: " + method);
+                Msg.debug(this, "Unknown notification: " + method);
         }
     }
 

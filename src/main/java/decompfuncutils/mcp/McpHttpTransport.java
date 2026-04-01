@@ -4,14 +4,14 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
+import ghidra.util.Msg;
+
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.*;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
  * HTTP+SSE transport for MCP protocol.
@@ -22,7 +22,7 @@ import java.util.logging.Logger;
  */
 public class McpHttpTransport {
 
-    private static final Logger LOG = Logger.getLogger(McpHttpTransport.class.getName());
+    // Uses Ghidra's Msg for logging
 
     private final int port;
     private final String authToken; // null = no auth
@@ -49,7 +49,7 @@ public class McpHttpTransport {
         server.createContext("/message", new MessageHandler());
 
         server.start();
-        LOG.info("MCP server started on http://127.0.0.1:" + port);
+        Msg.info(this,"MCP server started on http://127.0.0.1:" + port);
 
         // Start keepalive: send comment every 30s to keep SSE connections alive
         keepaliveExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -74,7 +74,7 @@ public class McpHttpTransport {
         if (server != null) {
             server.stop(1);
             server = null;
-            LOG.info("MCP server stopped");
+            Msg.info(this,"MCP server stopped");
         }
     }
 
@@ -111,7 +111,7 @@ public class McpHttpTransport {
             try {
                 conn.sendComment("keepalive");
             } catch (IOException e) {
-                LOG.fine("SSE connection " + entry.getKey() + " lost during keepalive");
+                Msg.debug(this,"SSE connection " + entry.getKey() + " lost during keepalive");
                 conn.close();
                 sseConnections.remove(entry.getKey());
             }
@@ -126,7 +126,7 @@ public class McpHttpTransport {
             try {
                 entry.getValue().sendEvent(event, data);
             } catch (IOException e) {
-                LOG.fine("SSE connection " + entry.getKey() + " lost during broadcast");
+                Msg.debug(this,"SSE connection " + entry.getKey() + " lost during broadcast");
                 entry.getValue().close();
                 sseConnections.remove(entry.getKey());
             }
@@ -160,10 +160,14 @@ public class McpHttpTransport {
             SseConnection conn = new SseConnection(os, exchange);
             sseConnections.put(sessionId, conn);
 
-            LOG.info("SSE client connected: " + sessionId);
+            Msg.info(this,"SSE client connected: " + sessionId);
 
-            // Send the endpoint event telling the client where to POST messages
-            String messageUrl = "http://127.0.0.1:" + port + "/message?sessionId=" + sessionId;
+            // Send the endpoint event — derive host from the request's Host header
+            String host = exchange.getRequestHeaders().getFirst("Host");
+            if (host == null || host.isEmpty()) {
+                host = "localhost:" + port;
+            }
+            String messageUrl = "http://" + host + "/message?sessionId=" + sessionId;
             conn.sendEvent("endpoint", messageUrl);
 
             // Keep the connection open — it will be held by the HTTP server thread.
@@ -212,7 +216,7 @@ public class McpHttpTransport {
                 }
             }
 
-            LOG.fine("Received message from session " + sessionId + ": " + requestBody);
+            Msg.debug(this,"Received message from session " + sessionId + ": " + requestBody);
 
             // Process the JSON-RPC request
             String response = protocolHandler.handleRequest(requestBody);
@@ -230,7 +234,7 @@ public class McpHttpTransport {
                     try {
                         conn.sendEvent("message", response);
                     } catch (IOException e) {
-                        LOG.warning("Failed to send SSE response to session " + sessionId);
+                        Msg.warn(this,"Failed to send SSE response to session " + sessionId);
                         conn.close();
                         sseConnections.remove(sessionId);
                     }
