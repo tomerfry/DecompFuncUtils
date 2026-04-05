@@ -61,7 +61,6 @@ public class OpenProgramTool implements McpTool {
             throw new IllegalArgumentException("'filePath' is required");
         }
 
-        // Normalize path separators for cross-platform compatibility
         filePath = filePath.replace('/', File.separatorChar).replace('\\', File.separatorChar);
 
         File file = new File(filePath);
@@ -83,16 +82,8 @@ public class OpenProgramTool implements McpTool {
             if (absPath.equals(p.getExecutablePath()) ||
                     p.getName().equals(file.getName()) ||
                     (programName != null && p.getName().equals(programName))) {
-                // Already open — just switch to it
                 pm.setCurrentProgram(p);
-                Map<String, Object> result = new LinkedHashMap<>();
-                result.put("status", "already_open");
-                result.put("name", p.getName());
-                result.put("executablePath", p.getExecutablePath());
-                result.put("processor", p.getLanguage().getProcessor().toString());
-                result.put("analyzed", GhidraProgramUtilities.isAnalyzed(p));
-                result.put("functionCount", p.getFunctionManager().getFunctionCount());
-                return result;
+                return buildResult("already_open", p);
             }
         }
 
@@ -103,33 +94,41 @@ public class OpenProgramTool implements McpTool {
         DomainFile existing = rootFolder.getFile(targetName);
 
         if (existing != null) {
-            // Already in project — open it
-            Program opened = pm.openProgram(existing);
-            if (opened == null) {
-                throw new RuntimeException("Failed to open existing program from project: " + targetName);
+            // Load the program ourselves via DomainFile.getDomainObject, then hand to ProgramManager.
+            // This avoids DomainFileProxy issues with pm.openProgram(DomainFile).
+            Program loaded = (Program) existing.getDomainObject(this, false, false, TaskMonitor.DUMMY);
+            if (loaded == null) {
+                throw new RuntimeException("Failed to load existing program from project: " + targetName);
             }
-            pm.setCurrentProgram(opened);
+            pm.openProgram(loaded);
+            pm.setCurrentProgram(loaded);
+            loaded.release(this);
 
-            // Trigger analysis if not yet analyzed
-            if (analyze && !GhidraProgramUtilities.isAnalyzed(opened)) {
-                triggerAutoAnalysis(opened);
+            if (analyze && !GhidraProgramUtilities.isAnalyzed(loaded)) {
+                triggerAutoAnalysis(loaded);
             }
 
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("status", "opened_from_project");
-            result.put("name", opened.getName());
-            result.put("executablePath", opened.getExecutablePath());
-            result.put("processor", opened.getLanguage().getProcessor().toString());
-            result.put("analyzed", GhidraProgramUtilities.isAnalyzed(opened));
-            result.put("functionCount", opened.getFunctionManager().getFunctionCount());
-            return result;
+            return buildResult("opened_from_project", loaded);
         }
 
         // Import the binary
         Msg.info(this, "Importing binary: " + absPath);
         MessageLog log = new MessageLog();
-        LoadResults<Program> loadResults = AutoImporter.importByUsingBestGuess(file, project,
-            rootFolder.getPathname(), this, log, TaskMonitor.DUMMY);
+        LoadResults<Program> loadResults;
+        try {
+            loadResults = AutoImporter.importByUsingBestGuess(file, project,
+                rootFolder.getPathname(), this, log, TaskMonitor.DUMMY);
+        } catch (Exception e) {
+            String logMsg = log.toString();
+            throw new RuntimeException("Import failed for: " + filePath + " — " + e.getMessage() +
+                (logMsg.isEmpty() ? "" : "\nImport log: " + logMsg), e);
+        }
+
+        if (loadResults == null) {
+            String logMsg = log.toString();
+            throw new RuntimeException("Import returned no results for: " + filePath +
+                (logMsg.isEmpty() ? "" : "\nImport log: " + logMsg));
+        }
 
         Program imported = loadResults.getPrimaryDomainObject();
         if (imported == null) {
@@ -139,40 +138,39 @@ public class OpenProgramTool implements McpTool {
                 (logMsg.isEmpty() ? "" : "\nImport log: " + logMsg));
         }
 
-        // Release non-primary loaded objects
         loadResults.releaseNonPrimary(this);
 
         // Rename if a custom name was provided
         if (programName != null && !programName.isEmpty() && !imported.getName().equals(programName)) {
-            imported.getDomainFile().setName(programName);
+            try {
+                imported.getDomainFile().setName(programName);
+            } catch (Exception e) {
+                Msg.warn(this, "Could not rename to " + programName + ": " + e.getMessage());
+            }
         }
 
-        // Save and release the domain object so ProgramManager can open it properly
-        DomainFile domainFile = imported.getDomainFile();
-        imported.save("Initial import", TaskMonitor.DUMMY);
+        // Use pm.openProgram(Program) to hand the imported program directly to ProgramManager.
+        // This bypasses the DomainFileProxy entirely — ProgramManager acquires its own reference.
+        pm.openProgram(imported);
+        pm.setCurrentProgram(imported);
+
+        // Release our consumer lock — ProgramManager now owns the program
         imported.release(this);
 
-        // Open via ProgramManager (this triggers UI integration)
-        Program opened = pm.openProgram(domainFile);
-        if (opened == null) {
-            throw new RuntimeException("Imported but failed to open program in tool");
-        }
-        pm.setCurrentProgram(opened);
-
-        // Explicitly trigger auto-analysis so functions and data are discovered
+        // Trigger auto-analysis
         if (analyze) {
-            triggerAutoAnalysis(opened);
+            triggerAutoAnalysis(imported);
         }
 
-        Msg.info(this, "Successfully imported and opened: " + opened.getName());
+        Msg.info(this, "Successfully imported and opened: " + imported.getName());
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "imported");
-        result.put("name", opened.getName());
-        result.put("executablePath", opened.getExecutablePath());
-        result.put("processor", opened.getLanguage().getProcessor().toString());
-        result.put("pointerSize", opened.getDefaultPointerSize());
-        result.put("analyzing", true);
+        result.put("name", imported.getName());
+        result.put("executablePath", imported.getExecutablePath());
+        result.put("processor", imported.getLanguage().getProcessor().toString());
+        result.put("pointerSize", imported.getDefaultPointerSize());
+        result.put("analyzing", analyze);
         result.put("hint", "Auto-analysis has been started. Use ghidra_get_program_info to check " +
             "functionCount and confirm analysis progress before decompiling.");
         String logMsg = log.toString();
@@ -182,10 +180,17 @@ public class OpenProgramTool implements McpTool {
         return result;
     }
 
-    /**
-     * Trigger Ghidra's auto-analysis on the program.
-     * Analysis runs asynchronously in the background.
-     */
+    private Map<String, Object> buildResult(String status, Program p) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", status);
+        result.put("name", p.getName());
+        result.put("executablePath", p.getExecutablePath());
+        result.put("processor", p.getLanguage().getProcessor().toString());
+        result.put("analyzed", GhidraProgramUtilities.isAnalyzed(p));
+        result.put("functionCount", p.getFunctionManager().getFunctionCount());
+        return result;
+    }
+
     private void triggerAutoAnalysis(Program program) {
         try {
             AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);

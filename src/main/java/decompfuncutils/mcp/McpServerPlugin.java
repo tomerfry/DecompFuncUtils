@@ -54,6 +54,12 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         setupOptions();
         setupActions();
         setupToolRegistry();
+
+        // Auto-start the server immediately so MCP clients can import binaries
+        // even before a program is manually opened in the CodeBrowser.
+        if (autoStart) {
+            startServer();
+        }
     }
 
     private void setupOptions() {
@@ -168,30 +174,33 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
             return;
         }
 
-        transport = new McpHttpTransport(port, authToken, protocolHandler);
-        try {
-            transport.start();
-            Msg.info(this, "MCP server started on http://127.0.0.1:" + port +
-                " with " + toolRegistry.size() + " tools");
-            SwingUtilities.invokeLater(() ->
-                JOptionPane.showMessageDialog(null,
-                    "MCP server started on http://127.0.0.1:" + port +
-                    "\n" + toolRegistry.size() + " tools registered." +
-                    "\n\nConnect Claude Code with:" +
-                    "\n  URL: http://localhost:" + port + "/sse",
-                    "MCP Server Started",
-                    JOptionPane.INFORMATION_MESSAGE));
-        } catch (Exception e) {
-            Msg.error(this, "Failed to start MCP server on port " + port, e);
-            SwingUtilities.invokeLater(() ->
-                JOptionPane.showMessageDialog(null,
-                    "Failed to start MCP server on port " + port +
-                    "\n\nError: " + e.getMessage() +
-                    "\n\nCheck if the port is already in use.",
-                    "MCP Server Error",
-                    JOptionPane.ERROR_MESSAGE));
-            transport = null;
+        // Try configured port first, then scan up to 50 ports for a free one.
+        // This allows multiple CodeBrowser instances to coexist.
+        int actualPort = port;
+        Exception lastError = null;
+        for (int attempt = 0; attempt < 50; attempt++) {
+            transport = new McpHttpTransport(actualPort, authToken, protocolHandler);
+            try {
+                transport.start();
+                Msg.info(this, "MCP server started on http://127.0.0.1:" + actualPort +
+                    " with " + toolRegistry.size() + " tools");
+                if (actualPort != port) {
+                    Msg.info(this, "Configured port " + port + " was busy, using " + actualPort);
+                }
+                return;
+            } catch (Exception e) {
+                lastError = e;
+                transport = null;
+                actualPort++;
+            }
         }
+
+        Msg.error(this, "Failed to start MCP server on ports " + port + "-" + (actualPort - 1), lastError);
+        SwingUtilities.invokeLater(() ->
+            JOptionPane.showMessageDialog(null,
+                "Failed to start MCP server.\nAll ports " + port + "-" + (port + 49) + " are in use.",
+                "MCP Server Error",
+                JOptionPane.ERROR_MESSAGE));
     }
 
     public void stopServer() {
