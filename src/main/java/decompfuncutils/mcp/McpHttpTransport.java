@@ -65,9 +65,10 @@ public class McpHttpTransport {
             keepaliveExecutor.shutdownNow();
             keepaliveExecutor = null;
         }
-        // Close all SSE connections
-        for (SseConnection conn : sseConnections.values()) {
-            conn.close();
+        // Close all SSE connections and clean up session state
+        for (Map.Entry<String, SseConnection> entry : sseConnections.entrySet()) {
+            entry.getValue().close();
+            protocolHandler.removeSession(entry.getKey());
         }
         sseConnections.clear();
 
@@ -111,9 +112,11 @@ public class McpHttpTransport {
             try {
                 conn.sendComment("keepalive");
             } catch (IOException e) {
-                Msg.debug(this,"SSE connection " + entry.getKey() + " lost during keepalive");
+                String sid = entry.getKey();
+                Msg.debug(this,"SSE connection " + sid + " lost during keepalive");
                 conn.close();
-                sseConnections.remove(entry.getKey());
+                sseConnections.remove(sid);
+                protocolHandler.removeSession(sid);
             }
         }
     }
@@ -126,9 +129,11 @@ public class McpHttpTransport {
             try {
                 entry.getValue().sendEvent(event, data);
             } catch (IOException e) {
-                Msg.debug(this,"SSE connection " + entry.getKey() + " lost during broadcast");
+                String sid = entry.getKey();
+                Msg.debug(this,"SSE connection " + sid + " lost during broadcast");
                 entry.getValue().close();
-                sseConnections.remove(entry.getKey());
+                sseConnections.remove(sid);
+                protocolHandler.removeSession(sid);
             }
         }
     }
@@ -218,8 +223,8 @@ public class McpHttpTransport {
 
             Msg.debug(this,"Received message from session " + sessionId + ": " + requestBody);
 
-            // Process the JSON-RPC request
-            String response = protocolHandler.handleRequest(requestBody);
+            // Process the JSON-RPC request (with session context for per-session program tracking)
+            String response = protocolHandler.handleRequest(requestBody, sessionId);
 
             // Send 202 Accepted to the POST
             exchange.getResponseHeaders().set("Content-Type", "application/json");
@@ -237,6 +242,7 @@ public class McpHttpTransport {
                         Msg.warn(this,"Failed to send SSE response to session " + sessionId);
                         conn.close();
                         sseConnections.remove(sessionId);
+                        protocolHandler.removeSession(sessionId);
                     }
                 }
             }

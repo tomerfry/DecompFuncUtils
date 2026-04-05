@@ -1,6 +1,7 @@
 package decompfuncutils.mcp;
 
 import com.google.gson.*;
+import ghidra.app.services.ProgramManager;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
 
@@ -9,6 +10,7 @@ import ghidra.util.Msg;
 import javax.swing.SwingUtilities;
 import java.lang.reflect.InvocationTargetException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -35,6 +37,9 @@ public class McpProtocolHandler {
     private final Supplier<Program> programSupplier;
     private final Supplier<PluginTool> toolSupplier;
 
+    // Per-session active program tracking: sessionId -> program name
+    private final ConcurrentHashMap<String, String> sessionPrograms = new ConcurrentHashMap<>();
+
     public McpProtocolHandler(McpToolRegistry toolRegistry,
                               Supplier<Program> programSupplier,
                               Supplier<PluginTool> toolSupplier) {
@@ -46,8 +51,11 @@ public class McpProtocolHandler {
     /**
      * Handle a JSON-RPC 2.0 request string, returning the response string.
      * Returns null for notifications (no response expected).
+     *
+     * @param requestJson the JSON-RPC request body
+     * @param sessionId   the SSE session ID (used for per-session program context)
      */
-    public String handleRequest(String requestJson) {
+    public String handleRequest(String requestJson, String sessionId) {
         JsonObject request;
         try {
             request = JsonParser.parseString(requestJson).getAsJsonObject();
@@ -70,13 +78,22 @@ public class McpProtocolHandler {
         }
 
         try {
-            Object result = dispatch(method, params);
+            Object result = dispatch(method, params, sessionId);
             return successResponse(idElement, result);
         } catch (McpError e) {
             return errorResponse(idElement, e.code, e.getMessage());
         } catch (Exception e) {
             Msg.warn(this, "Error handling " + method + ": " + e.getMessage());
             return errorResponse(idElement, -32603, "Internal error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Remove session state when an SSE connection is closed.
+     */
+    public void removeSession(String sessionId) {
+        if (sessionId != null) {
+            sessionPrograms.remove(sessionId);
         }
     }
 
@@ -93,7 +110,7 @@ public class McpProtocolHandler {
         }
     }
 
-    private Object dispatch(String method, JsonObject params) throws Exception {
+    private Object dispatch(String method, JsonObject params, String sessionId) throws Exception {
         switch (method) {
             case "initialize":
                 return handleInitialize(params);
@@ -102,7 +119,7 @@ public class McpProtocolHandler {
             case "tools/list":
                 return handleToolsList(params);
             case "tools/call":
-                return handleToolsCall(params);
+                return handleToolsCall(params, sessionId);
             default:
                 throw new McpError(-32601, "Method not found: " + method);
         }
@@ -147,8 +164,14 @@ public class McpProtocolHandler {
 
     // ---- tools/call ----
 
+    // Tools that change the active program for a session
+    private static final Set<String> PROGRAM_SWITCHING_TOOLS = Set.of(
+        "ghidra_open_program",
+        "ghidra_switch_program"
+    );
+
     @SuppressWarnings("unchecked")
-    private Object handleToolsCall(JsonObject params) throws Exception {
+    private Object handleToolsCall(JsonObject params, String sessionId) throws Exception {
         if (!params.has("name")) {
             throw new McpError(-32602, "Missing required parameter: name");
         }
@@ -165,11 +188,13 @@ public class McpProtocolHandler {
             arguments = gson.fromJson(params.get("arguments"), Map.class);
         }
 
-        Program program = programSupplier.get();
+        // Resolve program: per-session context first, then global fallback
+        Program program = resolveSessionProgram(sessionId);
         PluginTool pluginTool = toolSupplier.get();
 
         if (program == null && !TOOLS_WITHOUT_PROGRAM.contains(toolName)) {
-            throw new McpError(-32603, "No program is currently open in Ghidra");
+            throw new McpError(-32603, "No program is currently open in Ghidra. " +
+                "Use ghidra_open_program to import and open a binary first.");
         }
 
         // Execute on Swing EDT for thread safety
@@ -178,6 +203,19 @@ public class McpProtocolHandler {
             result = executeOnEdtWithTransaction(mcpTool, arguments, program, pluginTool);
         } else {
             result = executeOnEdt(mcpTool, arguments, program, pluginTool);
+        }
+
+        // After program-switching tools, update session context
+        if (sessionId != null && PROGRAM_SWITCHING_TOOLS.contains(toolName) && result instanceof Map) {
+            Map<String, Object> resultMap = (Map<String, Object>) result;
+            String progName = (String) resultMap.get("name");
+            if (progName == null) {
+                progName = (String) resultMap.get("switched_to");
+            }
+            if (progName != null) {
+                sessionPrograms.put(sessionId, progName);
+                Msg.info(this, "Session " + sessionId + " active program set to: " + progName);
+            }
         }
 
         // Format as MCP tool result
@@ -195,6 +233,34 @@ public class McpProtocolHandler {
 
         callResult.put("content", content);
         return callResult;
+    }
+
+    /**
+     * Resolve the active program for a session.
+     * Checks per-session override first, then falls back to global active program.
+     */
+    private Program resolveSessionProgram(String sessionId) {
+        PluginTool pluginTool = toolSupplier.get();
+        ProgramManager pm = pluginTool != null ? pluginTool.getService(ProgramManager.class) : null;
+
+        // Check per-session program override
+        if (sessionId != null && pm != null) {
+            String sessionProg = sessionPrograms.get(sessionId);
+            if (sessionProg != null) {
+                for (Program p : pm.getAllOpenPrograms()) {
+                    if (p.getName().equals(sessionProg)) {
+                        return p;
+                    }
+                }
+                // Session program no longer open — clear stale mapping
+                Msg.warn(this, "Session " + sessionId + " program '" + sessionProg +
+                    "' is no longer open, falling back to global active program");
+                sessionPrograms.remove(sessionId);
+            }
+        }
+
+        // Fallback to globally active program
+        return programSupplier.get();
     }
 
     private Object executeOnEdt(McpTool tool, Map<String, Object> arguments,

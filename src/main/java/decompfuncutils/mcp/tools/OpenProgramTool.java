@@ -1,6 +1,7 @@
 package decompfuncutils.mcp.tools;
 
 import decompfuncutils.mcp.McpTool;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.services.ProgramManager;
 import ghidra.app.util.importer.AutoImporter;
 import ghidra.app.util.importer.MessageLog;
@@ -10,6 +11,8 @@ import ghidra.framework.model.DomainFolder;
 import ghidra.framework.model.Project;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
+import ghidra.program.util.GhidraProgramUtilities;
+import ghidra.util.Msg;
 import ghidra.util.task.TaskMonitor;
 
 import java.io.File;
@@ -38,6 +41,9 @@ public class OpenProgramTool implements McpTool {
             "description", "Absolute filesystem path to the binary file to import and analyze"));
         props.put("programName", Map.of("type", "string",
             "description", "Optional name for the program in the project (defaults to filename)"));
+        props.put("analyze", Map.of("type", "boolean",
+            "description", "Run auto-analysis after import (default: true). " +
+                "Analysis discovers functions, data types, and cross-references."));
         schema.put("properties", props);
         schema.put("required", List.of("filePath"));
 
@@ -48,10 +54,15 @@ public class OpenProgramTool implements McpTool {
     public Object execute(Map<String, Object> arguments, Program program, PluginTool tool) throws Exception {
         String filePath = (String) arguments.get("filePath");
         String programName = (String) arguments.get("programName");
+        Object analyzeObj = arguments.get("analyze");
+        boolean analyze = analyzeObj == null || Boolean.parseBoolean(analyzeObj.toString());
 
         if (filePath == null || filePath.isEmpty()) {
             throw new IllegalArgumentException("'filePath' is required");
         }
+
+        // Normalize path separators for cross-platform compatibility
+        filePath = filePath.replace('/', File.separatorChar).replace('\\', File.separatorChar);
 
         File file = new File(filePath);
         if (!file.exists()) {
@@ -67,8 +78,9 @@ public class OpenProgramTool implements McpTool {
         }
 
         // Check if this binary is already open
+        String absPath = file.getAbsolutePath();
         for (Program p : pm.getAllOpenPrograms()) {
-            if (p.getExecutablePath().equals(filePath) ||
+            if (absPath.equals(p.getExecutablePath()) ||
                     p.getName().equals(file.getName()) ||
                     (programName != null && p.getName().equals(programName))) {
                 // Already open — just switch to it
@@ -78,6 +90,8 @@ public class OpenProgramTool implements McpTool {
                 result.put("name", p.getName());
                 result.put("executablePath", p.getExecutablePath());
                 result.put("processor", p.getLanguage().getProcessor().toString());
+                result.put("analyzed", GhidraProgramUtilities.isAnalyzed(p));
+                result.put("functionCount", p.getFunctionManager().getFunctionCount());
                 return result;
             }
         }
@@ -95,15 +109,24 @@ public class OpenProgramTool implements McpTool {
                 throw new RuntimeException("Failed to open existing program from project: " + targetName);
             }
             pm.setCurrentProgram(opened);
+
+            // Trigger analysis if not yet analyzed
+            if (analyze && !GhidraProgramUtilities.isAnalyzed(opened)) {
+                triggerAutoAnalysis(opened);
+            }
+
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("status", "opened_from_project");
             result.put("name", opened.getName());
             result.put("executablePath", opened.getExecutablePath());
             result.put("processor", opened.getLanguage().getProcessor().toString());
+            result.put("analyzed", GhidraProgramUtilities.isAnalyzed(opened));
+            result.put("functionCount", opened.getFunctionManager().getFunctionCount());
             return result;
         }
 
         // Import the binary
+        Msg.info(this, "Importing binary: " + absPath);
         MessageLog log = new MessageLog();
         LoadResults<Program> loadResults = AutoImporter.importByUsingBestGuess(file, project,
             rootFolder.getPathname(), this, log, TaskMonitor.DUMMY);
@@ -129,12 +152,19 @@ public class OpenProgramTool implements McpTool {
         imported.save("Initial import", TaskMonitor.DUMMY);
         imported.release(this);
 
-        // Open via ProgramManager (this triggers analysis and proper UI integration)
+        // Open via ProgramManager (this triggers UI integration)
         Program opened = pm.openProgram(domainFile);
         if (opened == null) {
             throw new RuntimeException("Imported but failed to open program in tool");
         }
         pm.setCurrentProgram(opened);
+
+        // Explicitly trigger auto-analysis so functions and data are discovered
+        if (analyze) {
+            triggerAutoAnalysis(opened);
+        }
+
+        Msg.info(this, "Successfully imported and opened: " + opened.getName());
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "imported");
@@ -142,10 +172,28 @@ public class OpenProgramTool implements McpTool {
         result.put("executablePath", opened.getExecutablePath());
         result.put("processor", opened.getLanguage().getProcessor().toString());
         result.put("pointerSize", opened.getDefaultPointerSize());
+        result.put("analyzing", true);
+        result.put("hint", "Auto-analysis has been started. Use ghidra_get_program_info to check " +
+            "functionCount and confirm analysis progress before decompiling.");
         String logMsg = log.toString();
         if (!logMsg.isEmpty()) {
             result.put("importLog", logMsg);
         }
         return result;
+    }
+
+    /**
+     * Trigger Ghidra's auto-analysis on the program.
+     * Analysis runs asynchronously in the background.
+     */
+    private void triggerAutoAnalysis(Program program) {
+        try {
+            AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
+            mgr.initializeOptions();
+            mgr.reAnalyzeAll(null);
+            Msg.info(this, "Auto-analysis triggered for: " + program.getName());
+        } catch (Exception e) {
+            Msg.warn(this, "Failed to trigger auto-analysis: " + e.getMessage());
+        }
     }
 }
