@@ -17,6 +17,10 @@ import docking.action.MenuData;
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Instant;
 
 //@formatter:off
 @PluginInfo(
@@ -41,6 +45,8 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
     private McpHttpTransport transport;
     private McpToolRegistry toolRegistry;
     private McpProtocolHandler protocolHandler;
+    private DecompInterfacePool decompPool;
+    private Path portFile;
 
     private int port = DEFAULT_PORT;
     private String authToken = DEFAULT_AUTH_TOKEN;
@@ -112,11 +118,12 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
 
     private void setupToolRegistry() {
         toolRegistry = new McpToolRegistry();
+        decompPool = new DecompInterfacePool();
 
         // P0 — Core RE Operations (read-only)
         toolRegistry.register(new GetProgramInfoTool());
         toolRegistry.register(new ListFunctionsTool());
-        toolRegistry.register(new DecompileFunctionTool());
+        toolRegistry.register(new DecompileFunctionTool(decompPool));
         toolRegistry.register(new GetFunctionTool());
         toolRegistry.register(new GetXrefsToTool());
         toolRegistry.register(new GetXrefsFromTool());
@@ -151,8 +158,8 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         toolRegistry.register(new SwitchProgramTool());
 
         // P2 — Advanced Analysis
-        toolRegistry.register(new TaintForwardTool());
-        toolRegistry.register(new TaintBackwardTool());
+        toolRegistry.register(new TaintForwardTool(decompPool));
+        toolRegistry.register(new TaintBackwardTool(decompPool));
         toolRegistry.register(new TaintQueryTool());
         toolRegistry.register(new ScanVtableTool());
         toolRegistry.register(new GenerateFuzzerTool());
@@ -187,6 +194,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
                 if (actualPort != port) {
                     Msg.info(this, "Configured port " + port + " was busy, using " + actualPort);
                 }
+                writePortFile(actualPort);
                 return;
             } catch (Exception e) {
                 lastError = e;
@@ -209,6 +217,42 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
             transport = null;
             Msg.info(this, "MCP server stopped");
         }
+        if (decompPool != null) {
+            decompPool.disposeAll();
+        }
+        deletePortFile();
+    }
+
+    private void writePortFile(int actualPort) {
+        try {
+            Path portDir = Paths.get(System.getProperty("user.home"), ".ghidra-mcp");
+            Files.createDirectories(portDir);
+
+            long pid = ProcessHandle.current().pid();
+            portFile = portDir.resolve("server-" + pid + ".json");
+
+            String projectName = tool.getProject() != null ? tool.getProject().getName() : "unknown";
+            String json = String.format(
+                "{\"port\": %d, \"pid\": %d, \"started\": \"%s\", \"project\": \"%s\", \"url\": \"http://127.0.0.1:%d/sse\"}",
+                actualPort, pid, Instant.now().toString(), projectName, actualPort
+            );
+            Files.writeString(portFile, json);
+            portFile.toFile().deleteOnExit();
+            Msg.info(this, "Port file written: " + portFile);
+        } catch (Exception e) {
+            Msg.warn(this, "Failed to write port file: " + e.getMessage());
+        }
+    }
+
+    private void deletePortFile() {
+        if (portFile != null) {
+            try {
+                Files.deleteIfExists(portFile);
+            } catch (Exception e) {
+                Msg.debug(this, "Failed to delete port file: " + e.getMessage());
+            }
+            portFile = null;
+        }
     }
 
     @Override
@@ -222,6 +266,9 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
     @Override
     protected void programDeactivated(Program program) {
         super.programDeactivated(program);
+        if (decompPool != null && program != null) {
+            decompPool.invalidate(program);
+        }
     }
 
     @Override

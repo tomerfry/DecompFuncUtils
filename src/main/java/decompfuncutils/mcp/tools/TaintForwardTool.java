@@ -1,19 +1,19 @@
 package decompfuncutils.mcp.tools;
 
-import decompfuncutils.InterproceduralTaintAnalyzer;
-import decompfuncutils.InterproceduralTaintAnalyzer.TaintPath;
+import decompfuncutils.mcp.DecompInterfacePool;
 import decompfuncutils.mcp.McpTool;
-import decompfuncutils.mcp.StringTaintLog;
-import ghidra.app.decompiler.DecompInterface;
-import ghidra.app.decompiler.DecompileResults;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.*;
-import ghidra.program.model.pcode.*;
-import ghidra.util.task.TaskMonitor;
 
 import java.util.*;
 
 public class TaintForwardTool implements McpTool {
+
+    private final DecompInterfacePool decompPool;
+
+    public TaintForwardTool(DecompInterfacePool decompPool) {
+        this.decompPool = decompPool;
+    }
 
     @Override public String name() { return "ghidra_taint_forward"; }
 
@@ -36,8 +36,10 @@ public class TaintForwardTool implements McpTool {
         return schema;
     }
 
+    @Override public boolean requiresEdt() { return false; }
+
     @Override
     public Object execute(Map<String, Object> arguments, Program program, PluginTool tool) throws Exception {
-        return TaintBackwardTool.runTaintAnalysis(arguments, program, tool, true);
+        return TaintBackwardTool.runTaintAnalysis(arguments, program, tool, true, decompPool);
     }
 }

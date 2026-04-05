@@ -1,5 +1,6 @@
 package decompfuncutils.mcp.tools;
 
+import decompfuncutils.mcp.DecompInterfacePool;
 import decompfuncutils.mcp.McpTool;
 import decompfuncutils.mcp.McpUtil;
 import ghidra.app.decompiler.DecompInterface;
@@ -13,9 +14,11 @@ import java.util.*;
 
 public class DecompileFunctionTool implements McpTool {
 
-    // Cache the decompiler interface per program to avoid repeated setup
-    private DecompInterface cachedDecomp;
-    private Program cachedProgram;
+    private final DecompInterfacePool decompPool;
+
+    public DecompileFunctionTool(DecompInterfacePool decompPool) {
+        this.decompPool = decompPool;
+    }
 
     @Override
     public String name() { return "ghidra_decompile_function"; }
@@ -38,6 +41,8 @@ public class DecompileFunctionTool implements McpTool {
         return schema;
     }
 
+    @Override public boolean requiresEdt() { return false; }
+
     @Override
     public Object execute(Map<String, Object> arguments, Program program, PluginTool tool) throws Exception {
         Function func = resolveFunction(arguments, program);
@@ -45,33 +50,24 @@ public class DecompileFunctionTool implements McpTool {
             throw new IllegalArgumentException("Function not found. Provide a valid 'address' or 'name'.");
         }
 
-        DecompInterface decomp = getDecompiler(program);
-        DecompileResults results = decomp.decompileFunction(func, 30, TaskMonitor.DUMMY);
+        DecompInterface decomp = decompPool.acquire(program);
+        try {
+            DecompileResults results = decomp.decompileFunction(func, 30, TaskMonitor.DUMMY);
 
-        if (!results.decompileCompleted()) {
-            throw new RuntimeException("Decompilation failed: " + results.getErrorMessage());
+            if (!results.decompileCompleted()) {
+                throw new RuntimeException("Decompilation failed: " + results.getErrorMessage());
+            }
+
+            String cCode = results.getDecompiledFunction().getC();
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("function", func.getName());
+            result.put("address", func.getEntryPoint().toString());
+            result.put("decompilation", cCode);
+            return result;
+        } finally {
+            decompPool.release(program, decomp);
         }
-
-        String cCode = results.getDecompiledFunction().getC();
-
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("function", func.getName());
-        result.put("address", func.getEntryPoint().toString());
-        result.put("decompilation", cCode);
-        return result;
-    }
-
-    private DecompInterface getDecompiler(Program program) {
-        if (cachedDecomp != null && cachedProgram == program) {
-            return cachedDecomp;
-        }
-        if (cachedDecomp != null) {
-            cachedDecomp.dispose();
-        }
-        cachedDecomp = new DecompInterface();
-        cachedDecomp.openProgram(program);
-        cachedProgram = program;
-        return cachedDecomp;
     }
 
     static Function resolveFunction(Map<String, Object> arguments, Program program) {

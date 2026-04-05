@@ -37,4 +37,14 @@ public interface McpTool {
     default boolean isMutating() {
         return false;
     }
+
+    /**
+     * Whether this tool must execute on the Swing EDT.
+     * Tools that only read Program data and don't touch Swing services
+     * can return false to enable concurrent execution across agents.
+     * Default is true (safe fallback — EDT serialized).
+     */
+    default boolean requiresEdt() {
+        return true;
+    }
 }

@@ -43,10 +43,15 @@ public class McpHttpTransport {
 
     public void start() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
-        server.setExecutor(Executors.newFixedThreadPool(4));
+        server.setExecutor(Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "mcp-http-worker");
+            t.setDaemon(true);
+            return t;
+        }));
 
         server.createContext("/sse", new SseHandler());
         server.createContext("/message", new MessageHandler());
+        server.createContext("/discovery", new DiscoveryHandler());
 
         server.start();
         Msg.info(this,"MCP server started on http://127.0.0.1:" + port);
@@ -246,6 +251,28 @@ public class McpHttpTransport {
                     }
                 }
             }
+        }
+    }
+
+    // ---- Discovery Handler ----
+
+    private class DiscoveryHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (!"GET".equals(exchange.getRequestMethod())) {
+                sendError(exchange, 405, "Method Not Allowed");
+                return;
+            }
+            String json = String.format(
+                "{\"port\": %d, \"activeSessions\": %d, \"sseUrl\": \"http://127.0.0.1:%d/sse\"}",
+                port, sseConnections.size(), port
+            );
+            byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.getResponseBody().close();
         }
     }
 

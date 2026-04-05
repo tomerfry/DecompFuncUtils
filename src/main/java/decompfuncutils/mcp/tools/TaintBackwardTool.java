@@ -2,6 +2,7 @@ package decompfuncutils.mcp.tools;
 
 import decompfuncutils.InterproceduralTaintAnalyzer;
 import decompfuncutils.InterproceduralTaintAnalyzer.TaintPath;
+import decompfuncutils.mcp.DecompInterfacePool;
 import decompfuncutils.mcp.McpTool;
 import decompfuncutils.mcp.StringTaintLog;
 import ghidra.app.decompiler.DecompInterface;
@@ -14,6 +15,12 @@ import ghidra.util.task.TaskMonitor;
 import java.util.*;
 
 public class TaintBackwardTool implements McpTool {
+
+    private final DecompInterfacePool decompPool;
+
+    public TaintBackwardTool(DecompInterfacePool decompPool) {
+        this.decompPool = decompPool;
+    }
 
     @Override public String name() { return "ghidra_taint_backward"; }
 
@@ -36,16 +43,19 @@ public class TaintBackwardTool implements McpTool {
         return schema;
     }
 
+    @Override public boolean requiresEdt() { return false; }
+
     @Override
     public Object execute(Map<String, Object> arguments, Program program, PluginTool tool) throws Exception {
-        return runTaintAnalysis(arguments, program, tool, false);
+        return runTaintAnalysis(arguments, program, tool, false, decompPool);
     }
 
     /**
      * Shared implementation for forward and backward taint analysis.
      */
     static Object runTaintAnalysis(Map<String, Object> arguments, Program program,
-                                    PluginTool tool, boolean forward) throws Exception {
+                                    PluginTool tool, boolean forward,
+                                    DecompInterfacePool decompPool) throws Exception {
         Map<String, Object> funcArgs = new HashMap<>();
         if (arguments.containsKey("functionAddress")) funcArgs.put("address", arguments.get("functionAddress"));
         if (arguments.containsKey("functionName")) funcArgs.put("name", arguments.get("functionName"));
@@ -56,14 +66,17 @@ public class TaintBackwardTool implements McpTool {
         int maxDepth = ((Number) arguments.getOrDefault("maxDepth", 3)).intValue();
 
         // Decompile to get HighFunction
-        DecompInterface decomp = new DecompInterface();
-        decomp.openProgram(program);
-        DecompileResults results = decomp.decompileFunction(func, 30, TaskMonitor.DUMMY);
-        if (!results.decompileCompleted()) {
-            decomp.dispose();
-            throw new RuntimeException("Decompilation failed: " + results.getErrorMessage());
+        DecompInterface decomp = decompPool.acquire(program);
+        HighFunction highFunc;
+        try {
+            DecompileResults results = decomp.decompileFunction(func, 30, TaskMonitor.DUMMY);
+            if (!results.decompileCompleted()) {
+                throw new RuntimeException("Decompilation failed: " + results.getErrorMessage());
+            }
+            highFunc = results.getHighFunction();
+        } finally {
+            decompPool.release(program, decomp);
         }
-        HighFunction highFunc = results.getHighFunction();
 
         // Find the varnode by name
         Varnode targetVarnode = null;
@@ -77,7 +90,6 @@ public class TaintBackwardTool implements McpTool {
         }
 
         if (targetVarnode == null) {
-            decomp.dispose();
             throw new IllegalArgumentException("Variable '" + varName + "' not found in decompiled function " + func.getName());
         }
 
@@ -86,8 +98,6 @@ public class TaintBackwardTool implements McpTool {
         InterproceduralTaintAnalyzer analyzer = new InterproceduralTaintAnalyzer(program, logPanel);
         analyzer.setMaxDepth(maxDepth);
         analyzer.analyze(highFunc, targetVarnode, forward, TaskMonitor.DUMMY);
-
-        decomp.dispose();
 
         // Build result
         List<Map<String, Object>> paths = new ArrayList<>();

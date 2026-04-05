@@ -11,6 +11,8 @@ import javax.swing.SwingUtilities;
 import java.lang.reflect.InvocationTargetException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -39,6 +41,10 @@ public class McpProtocolHandler {
 
     // Per-session active program tracking: sessionId -> program name
     private final ConcurrentHashMap<String, String> sessionPrograms = new ConcurrentHashMap<>();
+
+    // Serialize EDT access with timeout to prevent agents from hanging indefinitely
+    private static final long EDT_TIMEOUT_MS = 60_000;
+    private final Semaphore edtSemaphore = new Semaphore(1);
 
     public McpProtocolHandler(McpToolRegistry toolRegistry,
                               Supplier<Program> programSupplier,
@@ -197,12 +203,15 @@ public class McpProtocolHandler {
                 "Use ghidra_open_program to import and open a binary first.");
         }
 
-        // Execute on Swing EDT for thread safety
+        // Execute: off-EDT for thread-safe read-only tools, EDT for mutations and Swing-dependent tools
         Object result;
         if (mcpTool.isMutating()) {
             result = executeOnEdtWithTransaction(mcpTool, arguments, program, pluginTool);
-        } else {
+        } else if (mcpTool.requiresEdt()) {
             result = executeOnEdt(mcpTool, arguments, program, pluginTool);
+        } else {
+            // Safe to execute on current HTTP worker thread — enables concurrent multi-agent access
+            result = mcpTool.execute(arguments, program, pluginTool);
         }
 
         // After program-switching tools, update session context
@@ -265,45 +274,59 @@ public class McpProtocolHandler {
 
     private Object executeOnEdt(McpTool tool, Map<String, Object> arguments,
                                  Program program, PluginTool pluginTool) throws Exception {
-        AtomicReference<Object> resultRef = new AtomicReference<>();
-        AtomicReference<Exception> errorRef = new AtomicReference<>();
-
-        SwingUtilities.invokeAndWait(() -> {
-            try {
-                resultRef.set(tool.execute(arguments, program, pluginTool));
-            } catch (Exception e) {
-                errorRef.set(e);
-            }
-        });
-
-        if (errorRef.get() != null) {
-            throw errorRef.get();
+        if (!edtSemaphore.tryAcquire(EDT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            throw new McpError(-32603, "Server busy: another EDT operation is in progress. Try again shortly.");
         }
-        return resultRef.get();
+        try {
+            AtomicReference<Object> resultRef = new AtomicReference<>();
+            AtomicReference<Exception> errorRef = new AtomicReference<>();
+
+            SwingUtilities.invokeAndWait(() -> {
+                try {
+                    resultRef.set(tool.execute(arguments, program, pluginTool));
+                } catch (Exception e) {
+                    errorRef.set(e);
+                }
+            });
+
+            if (errorRef.get() != null) {
+                throw errorRef.get();
+            }
+            return resultRef.get();
+        } finally {
+            edtSemaphore.release();
+        }
     }
 
     private Object executeOnEdtWithTransaction(McpTool tool, Map<String, Object> arguments,
                                                 Program program, PluginTool pluginTool) throws Exception {
-        AtomicReference<Object> resultRef = new AtomicReference<>();
-        AtomicReference<Exception> errorRef = new AtomicReference<>();
-
-        SwingUtilities.invokeAndWait(() -> {
-            int txId = program.startTransaction("MCP: " + tool.name());
-            boolean success = false;
-            try {
-                resultRef.set(tool.execute(arguments, program, pluginTool));
-                success = true;
-            } catch (Exception e) {
-                errorRef.set(e);
-            } finally {
-                program.endTransaction(txId, success);
-            }
-        });
-
-        if (errorRef.get() != null) {
-            throw errorRef.get();
+        if (!edtSemaphore.tryAcquire(EDT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            throw new McpError(-32603, "Server busy: another EDT operation is in progress. Try again shortly.");
         }
-        return resultRef.get();
+        try {
+            AtomicReference<Object> resultRef = new AtomicReference<>();
+            AtomicReference<Exception> errorRef = new AtomicReference<>();
+
+            SwingUtilities.invokeAndWait(() -> {
+                int txId = program.startTransaction("MCP: " + tool.name());
+                boolean success = false;
+                try {
+                    resultRef.set(tool.execute(arguments, program, pluginTool));
+                    success = true;
+                } catch (Exception e) {
+                    errorRef.set(e);
+                } finally {
+                    program.endTransaction(txId, success);
+                }
+            });
+
+            if (errorRef.get() != null) {
+                throw errorRef.get();
+            }
+            return resultRef.get();
+        } finally {
+            edtSemaphore.release();
+        }
     }
 
     // ---- JSON-RPC response helpers ----

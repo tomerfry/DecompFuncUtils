@@ -34,6 +34,8 @@ public class GenerateFuzzerTool implements McpTool {
         return schema;
     }
 
+    @Override public boolean requiresEdt() { return false; }
+
     @Override
     public Object execute(Map<String, Object> arguments, Program program, PluginTool tool) throws Exception {
         Map<String, Object> funcArgs = new HashMap<>();
