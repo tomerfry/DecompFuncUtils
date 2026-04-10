@@ -135,6 +135,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         // P1 — Mutation Operations
         toolRegistry.register(new RenameFunctionTool());
         toolRegistry.register(new RenameVariableTool());
+        toolRegistry.register(new RenameLabelTool());
         toolRegistry.register(new RetypeVariableTool());
         toolRegistry.register(new SetFunctionSignatureTool());
         toolRegistry.register(new SetCommentTool());
