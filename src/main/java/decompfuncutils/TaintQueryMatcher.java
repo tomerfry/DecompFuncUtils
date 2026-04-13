@@ -1898,10 +1898,9 @@ public class TaintQueryMatcher {
         @Override
         public boolean isTainted(Object var) {
             if (!(var instanceof Varnode vn)) return false;
-            
-            // Check if this varnode is reachable from any source
+
+            // Intra-procedural reachability via the matrix (fast path).
             Set<Integer> sources = converter.findSources(data);
-            
             for (int srcId : sources) {
                 float[] taintVector = getTaintFromSource(srcId);
                 Integer varId = data.varnodeToId.get(vn);
@@ -1909,9 +1908,85 @@ public class TaintQueryMatcher {
                     return true;
                 }
             }
-            return false;
+
+            // Inter-procedural fallback: walk the def-use chain and see whether
+            // the value comes (directly or via copies / arithmetic / pointer
+            // adjustments) from the return of a function call whose body itself
+            // touches a taint source. This covers the common pattern where a
+            // user wrapper hides fread/recv/etc. behind a friendlier API.
+            return reachesInterproceduralSource(vn, new HashSet<>(), 0);
         }
-        
+
+        private static final int INTERPROC_DEPTH_LIMIT = 4;
+
+        private boolean reachesInterproceduralSource(Varnode vn, Set<Object> visited, int depth) {
+            if (vn == null || depth > INTERPROC_DEPTH_LIMIT) return false;
+            if (!visited.add(vn)) return false;
+
+            PcodeOp def = vn.getDef();
+            if (def == null) return false;
+            int op = def.getOpcode();
+
+            if (op == PcodeOp.CALL || op == PcodeOp.CALLIND || op == PcodeOp.CALLOTHER) {
+                if (calleeReachesTaintSource(def)) return true;
+            }
+
+            // Pass-through / derived ops — recurse into inputs.
+            switch (op) {
+                case PcodeOp.COPY:
+                case PcodeOp.CAST:
+                case PcodeOp.INT_ZEXT:
+                case PcodeOp.INT_SEXT:
+                case PcodeOp.INT_2COMP:
+                case PcodeOp.INT_NEGATE:
+                case PcodeOp.SUBPIECE:
+                case PcodeOp.PIECE:
+                case PcodeOp.PTRSUB:
+                case PcodeOp.PTRADD:
+                case PcodeOp.INT_ADD:
+                case PcodeOp.INT_SUB:
+                case PcodeOp.INT_MULT:
+                case PcodeOp.INT_DIV:
+                case PcodeOp.INT_AND:
+                case PcodeOp.INT_OR:
+                case PcodeOp.INT_XOR:
+                case PcodeOp.INT_LEFT:
+                case PcodeOp.INT_RIGHT:
+                case PcodeOp.INT_SRIGHT:
+                case PcodeOp.LOAD:
+                case PcodeOp.MULTIEQUAL:
+                case PcodeOp.INDIRECT:
+                    for (int i = 0; i < def.getNumInputs(); i++) {
+                        if (reachesInterproceduralSource(def.getInput(i), visited, depth + 1)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                default:
+                    return false;
+            }
+        }
+
+        private boolean calleeReachesTaintSource(PcodeOp callOp) {
+            Varnode target = callOp.getInput(0);
+            if (target == null || !target.isAddress()) return false;
+            Function callee;
+            try {
+                callee = highFunc.getFunction().getProgram()
+                    .getFunctionManager().getFunctionAt(target.getAddress());
+            } catch (Exception e) {
+                return false;
+            }
+            if (callee == null) return false;
+
+            // Resolve through one thunk hop to catch PLT entries.
+            if (callee.isThunk() && callee.getThunkedFunction(true) != null) {
+                callee = callee.getThunkedFunction(true);
+            }
+
+            return TaintQueryMatcher.this.functionTouchesTaintSource(callee);
+        }
+
         @Override
         public boolean isTaintedBySource(Object var, String sourceName) {
             // For specific source checking - would need more sophisticated tracking
@@ -2101,6 +2176,52 @@ public class TaintQueryMatcher {
         }
     }
     
+    // Cache of "does the body of this function (transitively) call a known
+    // taint source?" — used by the inter-procedural fallback in
+    // TaintContextImpl.isTainted so we can recognise user wrappers around
+    // fread / recv / getline / etc. without rebuilding a second analyzer.
+    private final Map<Address, Boolean> sourceTouchCache = new HashMap<>();
+
+    private boolean functionTouchesTaintSource(Function callee) {
+        if (callee == null) return false;
+        Address key = callee.getEntryPoint();
+        Boolean cached = sourceTouchCache.get(key);
+        if (cached != null) return cached;
+
+        // Pre-seed to false so mutual recursion terminates.
+        sourceTouchCache.put(key, Boolean.FALSE);
+        boolean result = functionTouchesTaintSource(callee, new HashSet<>(), 0);
+        sourceTouchCache.put(key, result);
+        return result;
+    }
+
+    private static final int SOURCE_TOUCH_DEPTH_LIMIT = 3;
+
+    private boolean functionTouchesTaintSource(Function callee, Set<Address> visited, int depth) {
+        if (callee == null) return false;
+        if (depth > SOURCE_TOUCH_DEPTH_LIMIT) return false;
+        if (!visited.add(callee.getEntryPoint())) return false;
+
+        if (TaintMatrixConverter.isTaintSource(callee.getName())) return true;
+        if (callee.isThunk() && callee.getThunkedFunction(true) != null) {
+            Function thunked = callee.getThunkedFunction(true);
+            if (TaintMatrixConverter.isTaintSource(thunked.getName())) return true;
+        }
+        if (callee.isExternal()) {
+            // External without a source-name match: nothing further to inspect.
+            return false;
+        }
+
+        for (Function child : callee.getCalledFunctions(ghidra.util.task.TaskMonitor.DUMMY)) {
+            Boolean cached = sourceTouchCache.get(child.getEntryPoint());
+            if (Boolean.TRUE.equals(cached)) return true;
+            if (cached == null && functionTouchesTaintSource(child, visited, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public List<QueryMatch> getMatches() {
         return matches;
     }

@@ -26,7 +26,7 @@ public class ListDataTypesTool implements McpTool {
         props.put("filter", Map.of("type", "string", "description", "Substring filter on data type name (case-insensitive)"));
         props.put("category", Map.of("type", "string", "description", "Category path filter (e.g. '/MyTypes')"));
         props.put("limit", Map.of("type", "integer", "description", "Maximum results (default 100, max 500)"));
-        props.put("includeBuiltIn", Map.of("type", "boolean", "description", "Also search the built-in data type manager (size_t, uint64_t, etc.). Default false."));
+        props.put("includeBuiltIn", Map.of("type", "boolean", "description", "Also search the built-in data type manager (size_t, uint64_t, etc.). Default true."));
         schema.put("properties", props);
 
         return schema;
@@ -39,9 +39,20 @@ public class ListDataTypesTool implements McpTool {
         String filter = (String) arguments.getOrDefault("filter", null);
         String category = (String) arguments.getOrDefault("category", null);
         int limit = Math.min(((Number) arguments.getOrDefault("limit", 100)).intValue(), 500);
-        boolean includeBuiltIn = (Boolean) arguments.getOrDefault("includeBuiltIn", Boolean.FALSE);
+        // Include built-in DTM by default so callers searching for stdint
+        // aliases (size_t, uint64_t, ...) find them without extra args.
+        boolean includeBuiltIn = (Boolean) arguments.getOrDefault("includeBuiltIn", Boolean.TRUE);
 
         if (filter != null) filter = filter.toLowerCase();
+        if (category != null) {
+            category = category.toLowerCase();
+            // Tolerate callers that forget the leading slash.
+            if (!category.startsWith("/")) category = "/" + category;
+            // Strip a trailing slash so "/foo/" and "/foo" match the same paths.
+            if (category.length() > 1 && category.endsWith("/")) {
+                category = category.substring(0, category.length() - 1);
+            }
+        }
 
         List<Map<String, Object>> types = new ArrayList<>();
         Set<String> seenKeys = new HashSet<>();
@@ -65,7 +76,16 @@ public class ListDataTypesTool implements McpTool {
         while (iter.hasNext() && types.size() < limit) {
             DataType dt = iter.next();
             if (filter != null && !dt.getName().toLowerCase().contains(filter)) continue;
-            if (category != null && !dt.getCategoryPath().getPath().contains(category)) continue;
+            if (category != null) {
+                String path = dt.getCategoryPath().getPath().toLowerCase();
+                // Match the category as a path prefix at a segment boundary so
+                // "/shapes" matches "/shapes" and "/shapes/nested" but not
+                // "/shapesOther". Plain substring fallback keeps ad-hoc
+                // searches like "nested" working.
+                boolean prefixMatch = path.equals(category)
+                        || path.startsWith(category + "/");
+                if (!prefixMatch && !path.contains(category)) continue;
+            }
 
             String key = dt.getCategoryPath().getPath() + "::" + dt.getName();
             if (!seenKeys.add(key)) continue;

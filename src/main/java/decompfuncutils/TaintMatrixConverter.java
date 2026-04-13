@@ -229,7 +229,7 @@ public class TaintMatrixConverter {
         return n;
     }
 
-    private static boolean isTaintSource(String funcName) {
+    static boolean isTaintSource(String funcName) {
         if (funcName == null) return false;
         if (TAINT_SOURCES.contains(funcName)) return true;
         String normalized = normalizeFuncName(funcName);
