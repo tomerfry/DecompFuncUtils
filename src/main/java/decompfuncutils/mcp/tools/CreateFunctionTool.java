@@ -26,7 +26,8 @@ public class CreateFunctionTool implements McpTool {
         schema.put("properties", Map.of(
             "address", Map.of("type", "string", "description", "Function entry point address in hex"),
             "name", Map.of("type", "string", "description", "Function name (optional, auto-generated if omitted)"),
-            "endAddress", Map.of("type", "string", "description", "Function end address in hex (optional, auto-detected if omitted)")
+            "endAddress", Map.of("type", "string", "description", "Function end address in hex (optional, auto-detected if omitted)"),
+            "overwrite", Map.of("type", "boolean", "description", "If true and a function already exists at this address, remove it first (then recreate with the requested name/body). Default false.")
         ));
         schema.put("required", List.of("address"));
         return schema;
@@ -39,13 +40,18 @@ public class CreateFunctionTool implements McpTool {
         String addrStr = (String) arguments.get("address");
         String name = (String) arguments.getOrDefault("name", null);
         String endAddrStr = (String) arguments.getOrDefault("endAddress", null);
+        boolean overwrite = (Boolean) arguments.getOrDefault("overwrite", Boolean.FALSE);
 
         Address entryPoint = McpUtil.parseAddress(addrStr, program);
 
         // Check if function already exists
         Function existing = program.getFunctionManager().getFunctionAt(entryPoint);
         if (existing != null) {
-            throw new IllegalArgumentException("Function already exists at " + addrStr + ": " + existing.getName());
+            if (!overwrite) {
+                throw new IllegalArgumentException("Function already exists at " + addrStr + ": " +
+                    existing.getName() + ". Pass overwrite=true to replace it, or use rename_function to rename.");
+            }
+            program.getFunctionManager().removeFunction(entryPoint);
         }
 
         AddressSet body = null;

@@ -16,7 +16,7 @@ public class ScanVtableTool implements McpTool {
 
     @Override
     public String description() {
-        return "Scan for a virtual table (vtable) at a given address. Reads consecutive pointer-sized entries and resolves them to functions. Stops when a non-function pointer is encountered.";
+        return "Scan for a virtual table (vtable) at a given address. Reads consecutive pointer-sized entries and resolves them to functions. By default stops at the first entry that does not point to a function (null, RTTI, or the next vtable).";
     }
 
     @Override
@@ -25,7 +25,8 @@ public class ScanVtableTool implements McpTool {
         schema.put("type", "object");
         schema.put("properties", Map.of(
             "address", Map.of("type", "string", "description", "Address of the vtable in hex"),
-            "maxEntries", Map.of("type", "integer", "description", "Maximum entries to scan (default 100)")
+            "maxEntries", Map.of("type", "integer", "description", "Maximum entries to scan (default 100)"),
+            "tolerateMisses", Map.of("type", "integer", "description", "Number of consecutive non-function entries to skip over before stopping. Default 0 (stop at first miss). Increase only if you know the vtable has embedded data.")
         ));
         schema.put("required", List.of("address"));
         return schema;
@@ -37,6 +38,7 @@ public class ScanVtableTool implements McpTool {
     public Object execute(Map<String, Object> arguments, Program program, PluginTool tool) throws Exception {
         String addrStr = (String) arguments.get("address");
         int maxEntries = ((Number) arguments.getOrDefault("maxEntries", 100)).intValue();
+        int tolerateMisses = ((Number) arguments.getOrDefault("tolerateMisses", 0)).intValue();
 
         Address addr = McpUtil.parseAddress(addrStr, program);
 
@@ -74,13 +76,14 @@ public class ScanVtableTool implements McpTool {
                 entry.put("signature", func.getPrototypeString(false, false));
                 entry.put("isResolved", true);
                 consecutiveMisses = 0;
+                entries.add(entry);
             } else {
                 entry.put("isResolved", false);
                 consecutiveMisses++;
-                if (consecutiveMisses > 2) break; // Likely past the vtable
+                if (consecutiveMisses > tolerateMisses) break;
+                entries.add(entry);
             }
 
-            entries.add(entry);
             current = current.add(ptrSize);
         }
 

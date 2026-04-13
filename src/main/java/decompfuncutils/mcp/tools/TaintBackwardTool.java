@@ -78,19 +78,52 @@ public class TaintBackwardTool implements McpTool {
             decompPool.release(program, decomp);
         }
 
-        // Find the varnode by name
+        // Find the varnode by name. Match against high symbols (locals + params),
+        // then fall back to scanning all HighVariable names reachable via the
+        // function's p-code (catches split/merged variables that no longer have
+        // a matching HighSymbol). On failure, surface the full list of valid
+        // names so callers know exactly what this engine recognizes.
+        LinkedHashSet<String> availableNames = new LinkedHashSet<>();
         Varnode targetVarnode = null;
+
         Iterator<HighSymbol> symbols = highFunc.getLocalSymbolMap().getSymbols();
         while (symbols.hasNext()) {
             HighSymbol sym = symbols.next();
-            if (sym.getName().equals(varName)) {
+            String n = sym.getName();
+            availableNames.add(n);
+            if (targetVarnode == null && n.equals(varName) && sym.getHighVariable() != null) {
                 targetVarnode = sym.getHighVariable().getRepresentative();
-                break;
             }
         }
 
         if (targetVarnode == null) {
-            throw new IllegalArgumentException("Variable '" + varName + "' not found in decompiled function " + func.getName());
+            Iterator<PcodeOpAST> ops = highFunc.getPcodeOps();
+            while (ops.hasNext()) {
+                PcodeOpAST op = ops.next();
+                collectHighNames(op.getOutput(), availableNames);
+                for (int i = 0; i < op.getNumInputs(); i++) {
+                    collectHighNames(op.getInput(i), availableNames);
+                }
+            }
+            for (String n : availableNames) {
+                if (n.equals(varName)) {
+                    Iterator<PcodeOpAST> ops2 = highFunc.getPcodeOps();
+                    while (ops2.hasNext() && targetVarnode == null) {
+                        PcodeOpAST op = ops2.next();
+                        targetVarnode = firstMatchingHigh(op.getOutput(), varName);
+                        if (targetVarnode != null) break;
+                        for (int i = 0; i < op.getNumInputs() && targetVarnode == null; i++) {
+                            targetVarnode = firstMatchingHigh(op.getInput(i), varName);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (targetVarnode == null) {
+            throw new IllegalArgumentException("Variable '" + varName + "' not found in decompiled function "
+                + func.getName() + ". Known variables: " + String.join(", ", availableNames));
         }
 
         // Run taint analysis
@@ -119,5 +152,20 @@ public class TaintBackwardTool implements McpTool {
         result.put("pathCount", paths.size());
         result.put("log", logPanel.getOutput());
         return result;
+    }
+
+    private static void collectHighNames(Varnode vn, LinkedHashSet<String> out) {
+        if (vn == null) return;
+        HighVariable hv = vn.getHigh();
+        if (hv == null) return;
+        String n = hv.getName();
+        if (n != null && !n.isEmpty()) out.add(n);
+    }
+
+    private static Varnode firstMatchingHigh(Varnode vn, String name) {
+        if (vn == null) return null;
+        HighVariable hv = vn.getHigh();
+        if (hv == null) return null;
+        return name.equals(hv.getName()) ? hv.getRepresentative() : null;
     }
 }

@@ -26,6 +26,7 @@ public class ListDataTypesTool implements McpTool {
         props.put("filter", Map.of("type", "string", "description", "Substring filter on data type name (case-insensitive)"));
         props.put("category", Map.of("type", "string", "description", "Category path filter (e.g. '/MyTypes')"));
         props.put("limit", Map.of("type", "integer", "description", "Maximum results (default 100, max 500)"));
+        props.put("includeBuiltIn", Map.of("type", "boolean", "description", "Also search the built-in data type manager (size_t, uint64_t, etc.). Default false."));
         schema.put("properties", props);
 
         return schema;
@@ -38,18 +39,36 @@ public class ListDataTypesTool implements McpTool {
         String filter = (String) arguments.getOrDefault("filter", null);
         String category = (String) arguments.getOrDefault("category", null);
         int limit = Math.min(((Number) arguments.getOrDefault("limit", 100)).intValue(), 500);
+        boolean includeBuiltIn = (Boolean) arguments.getOrDefault("includeBuiltIn", Boolean.FALSE);
 
         if (filter != null) filter = filter.toLowerCase();
 
-        DataTypeManager dtm = program.getDataTypeManager();
-        Iterator<DataType> iter = dtm.getAllDataTypes();
-
         List<Map<String, Object>> types = new ArrayList<>();
+        Set<String> seenKeys = new HashSet<>();
+
+        collectFromManager(program.getDataTypeManager(), filter, category, limit, types, seenKeys, false);
+
+        if (includeBuiltIn && types.size() < limit) {
+            collectFromManager(BuiltInDataTypeManager.getDataTypeManager(),
+                               filter, category, limit, types, seenKeys, true);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("dataTypes", types);
+        result.put("count", types.size());
+        return result;
+    }
+
+    private void collectFromManager(DataTypeManager dtm, String filter, String category, int limit,
+                                    List<Map<String, Object>> types, Set<String> seenKeys, boolean fromBuiltIn) {
+        Iterator<DataType> iter = dtm.getAllDataTypes();
         while (iter.hasNext() && types.size() < limit) {
             DataType dt = iter.next();
-
             if (filter != null && !dt.getName().toLowerCase().contains(filter)) continue;
             if (category != null && !dt.getCategoryPath().getPath().contains(category)) continue;
+
+            String key = dt.getCategoryPath().getPath() + "::" + dt.getName();
+            if (!seenKeys.add(key)) continue;
 
             Map<String, Object> t = new LinkedHashMap<>();
             t.put("name", dt.getName());
@@ -57,8 +76,8 @@ public class ListDataTypesTool implements McpTool {
             t.put("size", dt.getLength());
             t.put("kind", getKind(dt));
             t.put("displayName", dt.getDisplayName());
+            if (fromBuiltIn) t.put("source", "builtIn");
 
-            // Extra detail for structs
             if (dt instanceof Structure) {
                 Structure struct = (Structure) dt;
                 List<Map<String, Object>> fields = new ArrayList<>();
@@ -73,23 +92,17 @@ public class ListDataTypesTool implements McpTool {
                 t.put("fields", fields);
             }
 
-            // Extra detail for enums
             if (dt instanceof ghidra.program.model.data.Enum) {
                 ghidra.program.model.data.Enum enumDt = (ghidra.program.model.data.Enum) dt;
                 Map<String, Long> values = new LinkedHashMap<>();
-                for (String name : enumDt.getNames()) {
-                    values.put(name, enumDt.getValue(name));
+                for (String n : enumDt.getNames()) {
+                    values.put(n, enumDt.getValue(n));
                 }
                 t.put("values", values);
             }
 
             types.add(t);
         }
-
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("dataTypes", types);
-        result.put("count", types.size());
-        return result;
     }
 
     private String getKind(DataType dt) {

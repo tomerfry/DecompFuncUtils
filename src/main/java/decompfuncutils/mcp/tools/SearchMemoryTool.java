@@ -5,6 +5,8 @@ import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
+import ghidra.util.task.TaskMonitor;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -55,34 +57,60 @@ public class SearchMemoryTool implements McpTool {
         }
 
         Memory memory = program.getMemory();
-        Address start = memory.getMinAddress();
         List<Map<String, Object>> matches = new ArrayList<>();
 
-        while (start != null && matches.size() < maxResults) {
-            Address found = memory.findBytes(start, searchBytes, null, true, null);
-            if (found == null) break;
+        // Iterate per initialized & loaded block — findBytes over the full address space
+        // can hit uninitialized/overlay blocks and throw, and Ghidra's modern findBytes
+        // requires a non-null TaskMonitor.
+        outer:
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (!block.isInitialized() || !block.isLoaded()) continue;
+            Address blockEnd = block.getEnd();
+            Address start = block.getStart();
 
-            Map<String, Object> match = new LinkedHashMap<>();
-            match.put("address", found.toString());
+            while (start != null && matches.size() < maxResults) {
+                Address found;
+                try {
+                    found = memory.findBytes(start, blockEnd, searchBytes, null, true, TaskMonitor.DUMMY);
+                } catch (Exception e) {
+                    break;
+                }
+                if (found == null) break;
 
-            // Try to find containing function
-            Function func = program.getFunctionManager().getFunctionContaining(found);
-            if (func != null) {
-                match.put("function", func.getName());
-                match.put("functionAddress", func.getEntryPoint().toString());
+                Map<String, Object> match = new LinkedHashMap<>();
+                match.put("address", found.toString());
+                match.put("block", block.getName());
+
+                Function func = program.getFunctionManager().getFunctionContaining(found);
+                if (func != null) {
+                    match.put("function", func.getName());
+                    match.put("functionAddress", func.getEntryPoint().toString());
+                }
+
+                // Context: up to 32 bytes, clipped to the block end
+                long remaining = blockEnd.subtract(found) + 1;
+                int ctxLen = (int) Math.min(32L, Math.max(0L, remaining));
+                if (ctxLen > 0) {
+                    byte[] context = new byte[ctxLen];
+                    try {
+                        memory.getBytes(found, context);
+                        StringBuilder hex = new StringBuilder();
+                        for (byte b : context) hex.append(String.format("%02x ", b & 0xFF));
+                        match.put("contextHex", hex.toString().trim());
+                    } catch (Exception ignored) {}
+                }
+
+                matches.add(match);
+                if (matches.size() >= maxResults) break outer;
+
+                // Advance past the match; stop if we overflow the block.
+                try {
+                    start = found.add(1);
+                } catch (Exception e) {
+                    break;
+                }
+                if (start.compareTo(blockEnd) > 0) break;
             }
-
-            // Context: show surrounding bytes
-            byte[] context = new byte[Math.min(32, (int) (memory.getMaxAddress().getOffset() - found.getOffset()))];
-            try {
-                memory.getBytes(found, context);
-                StringBuilder hex = new StringBuilder();
-                for (byte b : context) hex.append(String.format("%02x ", b & 0xFF));
-                match.put("contextHex", hex.toString().trim());
-            } catch (Exception ignored) {}
-
-            matches.add(match);
-            start = found.add(1);
         }
 
         Map<String, Object> result = new LinkedHashMap<>();

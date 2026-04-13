@@ -201,14 +201,40 @@ public class TaintMatrixConverter {
         DANGEROUS_SINKS.put("mysql_query", Set.of(1));
     }
     
-    // Known taint sources
+    // Known taint sources. Names are matched after stripping common wrapper
+    // prefixes (__, _, __imp_, __isoc99_, __wrap_) and suffixes (_chk, @plt),
+    // so e.g. __read_chk, read@plt, __isoc99_sscanf all resolve to a source.
     private static final Set<String> TAINT_SOURCES = Set.of(
         "recv", "recvfrom", "recvmsg",
-        "read", "fread", "fgets", "gets",
-        "scanf", "fscanf", "sscanf",
-        "getenv", "getchar", "fgetc",
-        "accept", "listen"
+        "read", "pread", "readv", "fread", "fgets", "gets", "getline",
+        "scanf", "fscanf", "sscanf", "vscanf", "vfscanf", "vsscanf",
+        "getenv", "secure_getenv", "getchar", "fgetc", "getc",
+        "accept", "accept4", "listen",
+        "mq_receive", "msgrcv", "recvmmsg"
     );
+
+    private static String normalizeFuncName(String name) {
+        if (name == null) return null;
+        String n = name;
+        int at = n.indexOf('@');
+        if (at > 0) n = n.substring(0, at);
+        String[] prefixes = {"__imp_", "__wrap_", "__isoc99_", "__isoc23_", "__", "_"};
+        for (String p : prefixes) {
+            if (n.startsWith(p) && n.length() > p.length()) {
+                n = n.substring(p.length());
+                break;
+            }
+        }
+        if (n.endsWith("_chk")) n = n.substring(0, n.length() - 4);
+        return n;
+    }
+
+    private static boolean isTaintSource(String funcName) {
+        if (funcName == null) return false;
+        if (TAINT_SOURCES.contains(funcName)) return true;
+        String normalized = normalizeFuncName(funcName);
+        return normalized != null && TAINT_SOURCES.contains(normalized);
+    }
     
     /**
      * Convert a HighFunction to CSR sparse matrix
@@ -458,10 +484,14 @@ public class TaintMatrixConverter {
                 NodeInfo info = data.nodeInfo.get(argId);
                 if (info != null) {
                     // Check if this is a dangerous sink parameter
-                    if (funcName != null && DANGEROUS_SINKS.containsKey(funcName)) {
-                        if (DANGEROUS_SINKS.get(funcName).contains(i - 1)) {
-                            info.isSink = true;
-                        }
+                    String sinkLookup = funcName;
+                    Set<Integer> sinkArgs = sinkLookup != null ? DANGEROUS_SINKS.get(sinkLookup) : null;
+                    if (sinkArgs == null && funcName != null) {
+                        String norm = normalizeFuncName(funcName);
+                        if (norm != null) sinkArgs = DANGEROUS_SINKS.get(norm);
+                    }
+                    if (sinkArgs != null && sinkArgs.contains(i - 1)) {
+                        info.isSink = true;
                     }
                 }
                 
@@ -478,8 +508,8 @@ public class TaintMatrixConverter {
             NodeInfo info = data.nodeInfo.get(retId);
             if (info != null) {
                 info.type = NodeInfo.NodeType.CALL_SITE;
-                // Check if this is a taint source
-                if (funcName != null && TAINT_SOURCES.contains(funcName)) {
+                // Check if this is a taint source (with wrapper-aware matching)
+                if (isTaintSource(funcName)) {
                     info.isSource = true;
                 }
             }

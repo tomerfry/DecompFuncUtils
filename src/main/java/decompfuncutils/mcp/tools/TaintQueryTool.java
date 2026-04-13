@@ -96,7 +96,7 @@ public class TaintQueryTool implements McpTool {
                     m.put("functionAddress", func.getEntryPoint().toString());
                     m.put("matchAddress", match.address != null ? match.address.toString() : null);
                     m.put("matchedCode", match.matchedCode);
-                    m.put("bindings", match.bindings);
+                    m.put("bindings", stringifyBindings(match.bindings));
                     m.put("confidence", match.confidence);
                     matches.add(m);
                 }
@@ -110,6 +110,31 @@ public class TaintQueryTool implements McpTool {
             return result;
         } finally {
             decomp.dispose();
+        }
+    }
+
+    /**
+     * Bindings values may hold Varnode / PcodeOp / HighVariable — objects that
+     * contain WeakReferences and pull in non-exported java.lang.ref internals
+     * when Gson walks them reflectively. Flatten to safe primitives/strings.
+     */
+    private static Map<String, Object> stringifyBindings(Map<String, Object> raw) {
+        if (raw == null) return Collections.emptyMap();
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : raw.entrySet()) {
+            out.put(e.getKey(), stringifyValue(e.getValue()));
+        }
+        return out;
+    }
+
+    private static Object stringifyValue(Object v) {
+        if (v == null) return null;
+        if (v instanceof String || v instanceof Number || v instanceof Boolean) return v;
+        // Everything else (Varnode, PcodeOp, HighVariable, etc.) — use toString().
+        try {
+            return v.toString();
+        } catch (Exception e) {
+            return v.getClass().getSimpleName();
         }
     }
 }

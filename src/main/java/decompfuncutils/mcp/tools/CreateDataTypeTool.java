@@ -82,7 +82,11 @@ public class CreateDataTypeTool implements McpTool {
         DataType retType = RetypeVariableTool.resolveDataType(retTypeName, program);
         if (retType == null) throw new IllegalArgumentException("Unknown return type: " + retTypeName);
 
-        FunctionDefinitionDataType funcDef = new FunctionDefinitionDataType(catPath, name, dtm);
+        // Give the underlying FunctionDefinition a distinct internal name so the user-
+        // supplied name applies to the final typedef (e.g. handler_fn_t) rather than
+        // the auto-generated pointer name ("handler_fn_t *64").
+        String funcDefName = name.endsWith("_fn") ? name + "_def" : name + "_fn";
+        FunctionDefinitionDataType funcDef = new FunctionDefinitionDataType(catPath, funcDefName, dtm);
         funcDef.setReturnType(retType);
 
         List<Map<String, Object>> params = (List<Map<String, Object>>) args.getOrDefault("parameters", List.of());
@@ -106,7 +110,9 @@ public class CreateDataTypeTool implements McpTool {
             }
         }
 
-        return new PointerDataType(funcDef, program.getDefaultPointerSize());
+        DataType resolvedFuncDef = dtm.addDataType(funcDef, DataTypeConflictHandler.REPLACE_HANDLER);
+        PointerDataType ptr = new PointerDataType(resolvedFuncDef, program.getDefaultPointerSize(), dtm);
+        return new TypedefDataType(catPath, name, ptr, dtm);
     }
 
     private DataType createTypedef(Map<String, Object> args, String name, CategoryPath catPath,

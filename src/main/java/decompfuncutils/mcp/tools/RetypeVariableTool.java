@@ -72,9 +72,32 @@ public class RetypeVariableTool implements McpTool {
     }
 
     static DataType resolveDataType(String typeName, Program program) {
+        if (typeName == null) return null;
+        typeName = typeName.trim();
+        if (typeName.isEmpty()) return null;
+
         DataTypeManager dtm = program.getDataTypeManager();
 
-        // Check for pointer types
+        // Array syntax: "T[N]" or "T [N]"
+        int lb = typeName.lastIndexOf('[');
+        int rb = typeName.lastIndexOf(']');
+        if (lb > 0 && rb == typeName.length() - 1 && rb > lb) {
+            String baseName = typeName.substring(0, lb).trim();
+            String lenStr = typeName.substring(lb + 1, rb).trim();
+            try {
+                int n = Integer.parseInt(lenStr);
+                if (n <= 0) return null;
+                DataType baseType = resolveDataType(baseName, program);
+                if (baseType == null) return null;
+                int elemLen = baseType.getLength();
+                if (elemLen <= 0) elemLen = 1;
+                return new ArrayDataType(baseType, n, elemLen);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+
+        // Pointer types: "T *" / "T**"
         if (typeName.endsWith("*")) {
             String baseName = typeName.substring(0, typeName.lastIndexOf('*')).trim();
             DataType baseType = resolveDataType(baseName, program);
@@ -83,6 +106,14 @@ public class RetypeVariableTool implements McpTool {
             }
             return null;
         }
+
+        // Canonical aliases — check first so uint64_t etc. resolve consistently
+        DataType aliased = resolveAlias(typeName);
+        if (aliased != null) return aliased;
+
+        // Pointer-sized aliases (size_t, ssize_t, etc.)
+        DataType ptrSized = resolvePointerSizedAlias(typeName, program);
+        if (ptrSized != null) return ptrSized;
 
         // Try exact match in program DTM
         Iterator<DataType> iter = dtm.getAllDataTypes();
@@ -99,20 +130,35 @@ public class RetypeVariableTool implements McpTool {
             if (dt.getName().equals(typeName)) return dt;
         }
 
-        // Common aliases
+        return null;
+    }
+
+    private static DataType resolveAlias(String typeName) {
+        switch (typeName) {
+            // C stdint (case-sensitive — these have canonical casing)
+            case "uint8_t": case "u8":   return UnsignedCharDataType.dataType;
+            case "int8_t":  case "i8": case "s8": return SignedCharDataType.dataType;
+            case "uint16_t": case "u16": return UnsignedShortDataType.dataType;
+            case "int16_t":  case "i16": case "s16": return ShortDataType.dataType;
+            case "uint32_t": case "u32": return UnsignedIntegerDataType.dataType;
+            case "int32_t":  case "i32": case "s32": return IntegerDataType.dataType;
+            case "uint64_t": case "u64": return UnsignedLongLongDataType.dataType;
+            case "int64_t":  case "i64": case "s64": return LongLongDataType.dataType;
+        }
         switch (typeName.toLowerCase()) {
             case "int": return IntegerDataType.dataType;
-            case "uint": return UnsignedIntegerDataType.dataType;
+            case "uint": case "unsigned": case "unsigned int": return UnsignedIntegerDataType.dataType;
             case "long": return LongDataType.dataType;
-            case "ulong": return UnsignedLongDataType.dataType;
+            case "ulong": case "unsigned long": return UnsignedLongDataType.dataType;
             case "short": return ShortDataType.dataType;
-            case "ushort": return UnsignedShortDataType.dataType;
+            case "ushort": case "unsigned short": return UnsignedShortDataType.dataType;
             case "char": return CharDataType.dataType;
-            case "uchar": return UnsignedCharDataType.dataType;
+            case "uchar": case "unsigned char": return UnsignedCharDataType.dataType;
+            case "signed char": case "schar": return SignedCharDataType.dataType;
             case "byte": return ByteDataType.dataType;
             case "ubyte": return UnsignedCharDataType.dataType;
             case "void": return VoidDataType.dataType;
-            case "bool": return BooleanDataType.dataType;
+            case "bool": case "_bool": return BooleanDataType.dataType;
             case "float": return FloatDataType.dataType;
             case "double": return DoubleDataType.dataType;
             case "longlong": case "long long": return LongLongDataType.dataType;
@@ -123,8 +169,28 @@ public class RetypeVariableTool implements McpTool {
             case "undefined4": return Undefined4DataType.dataType;
             case "undefined8": return Undefined8DataType.dataType;
         }
-
         return null;
+    }
+
+    private static DataType resolvePointerSizedAlias(String typeName, Program program) {
+        int ptrSize = program.getDefaultPointerSize();
+        boolean is64 = ptrSize == 8;
+        switch (typeName.toLowerCase()) {
+            case "size_t": case "usize":
+                return is64 ? UnsignedLongLongDataType.dataType : UnsignedIntegerDataType.dataType;
+            case "ssize_t": case "isize":
+                return is64 ? LongLongDataType.dataType : IntegerDataType.dataType;
+            case "ptrdiff_t":
+                return is64 ? LongLongDataType.dataType : IntegerDataType.dataType;
+            case "intptr_t":
+                return is64 ? LongLongDataType.dataType : IntegerDataType.dataType;
+            case "uintptr_t":
+                return is64 ? UnsignedLongLongDataType.dataType : UnsignedIntegerDataType.dataType;
+            case "off_t":
+                return is64 ? LongLongDataType.dataType : IntegerDataType.dataType;
+            default:
+                return null;
+        }
     }
 
     private Map<String, Object> successResult(Function func, String varName, String oldType, String newType, String varKind) {

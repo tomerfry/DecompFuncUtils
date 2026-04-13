@@ -46,28 +46,37 @@ public class SetMemoryBlockFlagsTool implements McpTool {
             throw new IllegalArgumentException("No memory block at address: " + addrStr);
         }
 
-        Map<String, Object> oldFlags = Map.of(
-            "read", block.isRead(), "write", block.isWrite(),
-            "execute", block.isExecute(), "volatile", block.isVolatile()
-        );
+        Map<String, Object> oldFlags = snapshot(block);
+        List<String> requested = new ArrayList<>();
+        List<String> changed = new ArrayList<>();
 
-        if (arguments.containsKey("read")) block.setRead((Boolean) arguments.get("read"));
-        if (arguments.containsKey("write")) block.setWrite((Boolean) arguments.get("write"));
-        if (arguments.containsKey("execute")) block.setExecute((Boolean) arguments.get("execute"));
-        if (arguments.containsKey("volatile")) block.setVolatile((Boolean) arguments.get("volatile"));
+        if (arguments.containsKey("read")) { requested.add("read"); block.setRead((Boolean) arguments.get("read")); }
+        if (arguments.containsKey("write")) { requested.add("write"); block.setWrite((Boolean) arguments.get("write")); }
+        if (arguments.containsKey("execute")) { requested.add("execute"); block.setExecute((Boolean) arguments.get("execute")); }
+        if (arguments.containsKey("volatile")) { requested.add("volatile"); block.setVolatile((Boolean) arguments.get("volatile")); }
 
-        // Constant: setting constant=true means write=false
+        // Ghidra has no distinct "constant" flag on MemoryBlock; constant=true is
+        // modeled by clearing the write bit. Report truthfully.
+        String constantNote = null;
         if (arguments.containsKey("constant")) {
             boolean isConstant = (Boolean) arguments.get("constant");
+            requested.add("constant");
             if (isConstant) {
-                block.setWrite(false);
+                if (block.isWrite()) {
+                    block.setWrite(false);
+                    constantNote = "constant=true cleared the write flag";
+                } else {
+                    constantNote = "block was already read-only; no change";
+                }
+            } else {
+                constantNote = "constant=false does not automatically set write=true; pass write=true explicitly if intended";
             }
         }
 
-        Map<String, Object> newFlags = Map.of(
-            "read", block.isRead(), "write", block.isWrite(),
-            "execute", block.isExecute(), "volatile", block.isVolatile()
-        );
+        Map<String, Object> newFlags = snapshot(block);
+        for (String k : newFlags.keySet()) {
+            if (!Objects.equals(oldFlags.get(k), newFlags.get(k))) changed.add(k);
+        }
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("blockName", block.getName());
@@ -75,7 +84,19 @@ public class SetMemoryBlockFlagsTool implements McpTool {
         result.put("end", block.getEnd().toString());
         result.put("oldFlags", oldFlags);
         result.put("newFlags", newFlags);
-        result.put("status", "flags_updated");
+        result.put("requested", requested);
+        result.put("changed", changed);
+        if (constantNote != null) result.put("constantNote", constantNote);
+        result.put("status", changed.isEmpty() ? "no_change" : "flags_updated");
         return result;
+    }
+
+    private static Map<String, Object> snapshot(MemoryBlock block) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("read", block.isRead());
+        m.put("write", block.isWrite());
+        m.put("execute", block.isExecute());
+        m.put("volatile", block.isVolatile());
+        return m;
     }
 }

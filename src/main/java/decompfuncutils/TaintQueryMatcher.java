@@ -515,6 +515,12 @@ public class TaintQueryMatcher {
         variants.add(baseName + "@PLT");       // PLT entry (ELF)
         variants.add("__imp_" + baseName);     // Import entry (PE/Windows)
         variants.add(baseName + "_impl");      // Implementation variant
+        // _FORTIFY_SOURCE — e.g. memcpy → __memcpy_chk, printf → __printf_chk
+        variants.add("__" + baseName + "_chk");
+        variants.add(baseName + "_chk");
+        // isoc99 scanf family
+        variants.add("__isoc99_" + baseName);
+        variants.add("__isoc23_" + baseName);
         return variants;
     }
 
@@ -1339,9 +1345,49 @@ public class TaintQueryMatcher {
         if (calledName.equals("__" + patternName)) {
             return true;
         }
-        
+        // _FORTIFY_SOURCE wrappers: __memcpy_chk, __snprintf_chk, __printf_chk, etc.
+        // The "_chk" suffix is always on the __-prefixed name; the fortified
+        // function shares the semantics of the base function for taint purposes.
+        if (calledName.equals("__" + patternName + "_chk")) {
+            return true;
+        }
+        if (calledName.equals(patternName + "_chk")) {
+            return true;
+        }
+        // PLT / import / glibc internal stripping
+        if (stripWrapperPrefixes(calledName).equals(patternName)) {
+            return true;
+        }
+
         // No match
         return false;
+    }
+
+    /**
+     * Strip common wrapper / mangling prefixes and suffixes so that
+     * '__memcpy_chk', 'memcpy@plt', '__imp_memcpy', '_memcpy' all reduce
+     * to 'memcpy' for pattern matching. Conservative: only strip if we
+     * recognize the prefix/suffix.
+     */
+    private static String stripWrapperPrefixes(String name) {
+        if (name == null) return "";
+        String n = name;
+        // Trim @plt / @got / @version suffixes
+        int at = n.indexOf('@');
+        if (at > 0) n = n.substring(0, at);
+        // Common glibc/linker prefixes
+        String[] prefixes = {"__imp_", "__wrap_", "__isoc99_", "__isoc23_", "__", "_"};
+        for (String p : prefixes) {
+            if (n.startsWith(p) && n.length() > p.length()) {
+                n = n.substring(p.length());
+                break;
+            }
+        }
+        // Fortify suffix
+        if (n.endsWith("_chk")) {
+            n = n.substring(0, n.length() - 4);
+        }
+        return n;
     }
 
     /**
