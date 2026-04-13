@@ -163,6 +163,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         toolRegistry.register(new TaintBackwardTool(decompPool));
         toolRegistry.register(new TaintQueryTool());
         toolRegistry.register(new ScanVtableTool());
+        toolRegistry.register(new CreateVtableStructTool());
         toolRegistry.register(new GenerateFuzzerTool());
         toolRegistry.register(new GetCallGraphTool());
         toolRegistry.register(new NavigateToTool());
