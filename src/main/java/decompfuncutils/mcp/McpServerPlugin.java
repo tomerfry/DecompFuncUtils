@@ -169,6 +169,9 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         toolRegistry.register(new NavigateToTool());
         toolRegistry.register(new SearchMemoryTool());
 
+        // Emulation
+        toolRegistry.register(new EmulateFunctionTool());
+
         protocolHandler = new McpProtocolHandler(
             toolRegistry,
             this::getCurrentProgram,
