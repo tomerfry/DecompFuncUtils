@@ -1,15 +1,22 @@
 package decompfuncutils.mcp.tools;
 
+import decompfuncutils.mcp.DecompInterfacePool;
 import decompfuncutils.mcp.McpTool;
 import decompfuncutils.mcp.McpUtil;
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.emulator.EmulatorHelper;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.pcode.HighFunction;
+import ghidra.program.model.pcode.PcodeBlockBasic;
+import ghidra.program.model.pcode.PcodeOp;
 import ghidra.util.task.TaskMonitor;
 
 import java.math.BigInteger;
@@ -28,6 +35,15 @@ public class EmulateFunctionTool implements McpTool {
     private static final int MAX_MEM_WRITE_INLINE_HEX = 256;
     private static final int MAX_FINAL_REGS = 128;
     private static final int MAX_BRANCH_TRACE = 5000;
+    private static final int DEFAULT_SYMBOLIC_EXPR_DEPTH = 8;
+
+    private final DecompInterfacePool decompPool;
+
+    public EmulateFunctionTool() { this(null); }
+
+    public EmulateFunctionTool(DecompInterfacePool decompPool) {
+        this.decompPool = decompPool;
+    }
 
     @Override
     public String name() { return "ghidra_emulate_function"; }
@@ -69,6 +85,10 @@ public class EmulateFunctionTool implements McpTool {
             "description", "Max instructions to step (default 100000, hard cap 2000000)"));
         props.put("recordBranches", Map.of("type", "boolean",
             "description", "If true, emit a branchTrace of conditional branches encountered and whether each was taken (default false)"));
+        props.put("symbolicBranches", Map.of("type", "boolean",
+            "description", "If true (requires recordBranches), annotate each branch with its decompiler-level symbolic condition (e.g. '(param_1 & 0xff) == 0x5f'). Requires successful decompilation of the containing function."));
+        props.put("symbolicExpressionDepth", Map.of("type", "integer",
+            "description", "Max recursion depth for symbolic expression rendering (default 8)"));
         props.put("trackMemoryWrites", Map.of("type", "boolean",
             "description", "If true, return the set of memory ranges written during emulation (default true)"));
         schema.put("properties", props);
@@ -89,6 +109,9 @@ public class EmulateFunctionTool implements McpTool {
             ((Number) arguments.getOrDefault("maxSteps", DEFAULT_MAX_STEPS)).intValue(),
             HARD_MAX_STEPS);
         boolean recordBranches = Boolean.TRUE.equals(arguments.get("recordBranches"));
+        boolean symbolicBranches = Boolean.TRUE.equals(arguments.get("symbolicBranches")) && recordBranches;
+        int symExprDepth = ((Number) arguments.getOrDefault(
+            "symbolicExpressionDepth", DEFAULT_SYMBOLIC_EXPR_DEPTH)).intValue();
         boolean trackMemoryWrites = !Boolean.FALSE.equals(arguments.get("trackMemoryWrites"));
 
         Map<String, Object> regSeeds = (Map<String, Object>)
@@ -162,6 +185,12 @@ public class EmulateFunctionTool implements McpTool {
             Register pcReg = emu.getPCRegister();
             emu.writeRegister(pcReg, entry.getOffset());
 
+            // --- Symbolic resolver (only active when symbolicBranches=true) ---
+            SymbolicBranchResolver symResolver =
+                (symbolicBranches && decompPool != null)
+                    ? new SymbolicBranchResolver(program, decompPool, symExprDepth)
+                    : null;
+
             // --- Step loop ---
             List<Map<String, Object>> branches = new ArrayList<>();
             String stopReason = "max_steps";
@@ -202,7 +231,7 @@ public class EmulateFunctionTool implements McpTool {
                         && instr.getFlowType() != null
                         && instr.getFlowType().isConditional()
                         && branches.size() < MAX_BRANCH_TRACE) {
-                    recordBranch(branches, emu, pc, instr);
+                    recordBranch(branches, emu, pc, instr, symResolver);
                 }
             }
 
@@ -234,7 +263,8 @@ public class EmulateFunctionTool implements McpTool {
     }
 
     private static void recordBranch(List<Map<String, Object>> out,
-                                     EmulatorHelper emu, Address pc, Instruction instr) {
+                                     EmulatorHelper emu, Address pc, Instruction instr,
+                                     SymbolicBranchResolver symResolver) {
         Address newPc = emu.getExecutionAddress();
         Address fallThrough = instr.getFallThrough();
         boolean taken = (fallThrough == null) || !newPc.equals(fallThrough);
@@ -259,6 +289,17 @@ public class EmulateFunctionTool implements McpTool {
             }
         } catch (Exception ignored) {}
         if (!inputs.isEmpty()) b.put("inputs", inputs);
+
+        if (symResolver != null) {
+            SymbolicBranchResolver.Result sr = symResolver.resolve(pc);
+            if (sr != null) {
+                String expr = sr.rawCondition;
+                b.put("symbolic", taken ? expr : "!(" + expr + ")");
+                b.put("rawSymbolic", expr);
+            } else {
+                b.put("symbolicUnavailable", symResolver.lastReason(pc));
+            }
+        }
 
         out.add(b);
     }
