@@ -120,6 +120,14 @@ public class SuggestBranchFlipTool implements McpTool {
             if (a.mask != null) result.put("mask", "0x" + a.mask.toString(16));
             result.put("constant", "0x" + a.constant.toString(16));
             result.put("signed", a.signed);
+            if (a.isMemLoad) {
+                result.put("basePointer", a.basePointer);
+                result.put("offset", a.memOffset);
+                if (a.fieldName != null) result.put("fieldName", a.fieldName);
+                result.put("hint", "Write the suggested value at [" + a.basePointer
+                    + " + 0x" + Long.toHexString(a.memOffset) + "] "
+                    + "(" + a.leafSize + " byte" + (a.leafSize == 1 ? "" : "s") + ") to flip the branch.");
+            }
             result.put("valuesMakingTrue", hexList(a.valuesForTrue()));
             result.put("valuesMakingFalse", hexList(a.valuesForFalse()));
             result.put("note",
@@ -149,7 +157,7 @@ public class SuggestBranchFlipTool implements McpTool {
     private enum Cmp { EQ, NEQ, ULT, ULE, UGT, UGE, SLT, SLE, SGT, SGE }
 
     private static class Analysis {
-        String shape;     // e.g. "EQ", "AND_MASK_EQ"
+        String shape;     // e.g. "EQ", "AND_MASK_EQ", "MEM_EQ"
         String leafName;
         int leafSize;     // bytes
         Cmp cmp;
@@ -157,6 +165,11 @@ public class SuggestBranchFlipTool implements McpTool {
         BigInteger constant;
         BigInteger mask;  // null if no mask
         boolean negated;  // BOOL_NEGATE wrapping
+        // Memory-load shape: condition compares *(base + memOffset) against constant.
+        boolean isMemLoad;
+        String basePointer;
+        Long memOffset;   // byte offset from basePointer
+        String fieldName; // struct field name when resolvable, otherwise null
 
         BigInteger modulus() { return BigInteger.ONE.shiftLeft(leafSize * 8); }
         BigInteger maxU() { return modulus().subtract(BigInteger.ONE); }
@@ -266,6 +279,29 @@ public class SuggestBranchFlipTool implements McpTool {
         // Peel transparent ops (COPY/CAST/ZEXT/SEXT) to find the named leaf
         Varnode leaf = peelTransparent(exprVn);
 
+        // Memory-load leaf: comparison like `*(base + offset) == c` — common for
+        // struct-field dispatch (`r->magic == 'P'`, `buf[0] == 0xff`, etc.).
+        PcodeOp leafDef = leaf.getDef();
+        if (leafDef != null && leafDef.getOpcode() == PcodeOp.LOAD) {
+            Varnode loadPtr = leafDef.getInput(1);
+            BaseOffset bo = baseOffsetOf(loadPtr);
+            if (bo != null) {
+                String baseName = leafName(bo.base, program);
+                if (baseName != null) {
+                    a.isMemLoad = true;
+                    a.basePointer = baseName;
+                    a.memOffset = bo.offset;
+                    a.fieldName = lookupFieldName(bo.base, bo.offset);
+                    a.leafName = a.fieldName != null
+                        ? baseName + "->" + a.fieldName
+                        : "*(" + baseName + " + 0x" + Long.toHexString(bo.offset) + ")";
+                    a.leafSize = Math.max(1, leaf.getSize());
+                    a.shape = (a.mask != null ? "AND_MASK_" : "") + "MEM_" + a.cmp.name();
+                    return a;
+                }
+            }
+        }
+
         // Leaf must be namable — param/local/global or a register.
         String name = leafName(leaf, program);
         if (name == null) return null;
@@ -274,6 +310,60 @@ public class SuggestBranchFlipTool implements McpTool {
         a.leafSize = Math.max(1, leaf.getSize());
         a.shape = (a.mask != null ? "AND_MASK_" : "") + a.cmp.name();
         return a;
+    }
+
+    /**
+     * Resolve `base + constOffset` through PTRSUB/PTRADD/INT_ADD/COPY/CAST.
+     * Returns null if the varnode isn't an offset-from-a-base expression.
+     */
+    private static BaseOffset baseOffsetOf(Varnode vn) {
+        if (vn == null) return null;
+        PcodeOp def = vn.getDef();
+        if (def == null) return new BaseOffset(vn, 0L);
+        int op = def.getOpcode();
+        if (op == PcodeOp.COPY || op == PcodeOp.CAST) {
+            return baseOffsetOf(def.getInput(0));
+        }
+        if (op == PcodeOp.PTRSUB || op == PcodeOp.PTRADD || op == PcodeOp.INT_ADD) {
+            Varnode aIn = def.getInput(0);
+            Varnode bIn = def.getInput(1);
+            if (aIn != null && bIn != null && bIn.isConstant()) {
+                long mult = (op == PcodeOp.PTRADD && def.getNumInputs() >= 3
+                    && def.getInput(2) != null && def.getInput(2).isConstant())
+                    ? def.getInput(2).getOffset() : 1L;
+                return new BaseOffset(aIn, bIn.getOffset() * mult);
+            }
+            if (aIn != null && bIn != null && aIn.isConstant()) {
+                return new BaseOffset(bIn, aIn.getOffset());
+            }
+        }
+        return new BaseOffset(vn, 0L);
+    }
+
+    private static String lookupFieldName(Varnode base, long offset) {
+        if (base == null) return null;
+        HighVariable hv = base.getHigh();
+        if (hv == null) return null;
+        ghidra.program.model.data.DataType dt = hv.getDataType();
+        ghidra.program.model.data.Structure s = null;
+        if (dt instanceof ghidra.program.model.data.Pointer p
+                && p.getDataType() instanceof ghidra.program.model.data.Structure sp) {
+            s = sp;
+        } else if (dt instanceof ghidra.program.model.data.Structure sd) {
+            s = sd;
+        }
+        if (s == null) return null;
+        if (offset < 0 || offset >= s.getLength()) return null;
+        ghidra.program.model.data.DataTypeComponent comp = s.getComponentContaining((int) offset);
+        if (comp == null || comp.getOffset() != (int) offset) return null;
+        String n = comp.getFieldName();
+        return (n == null || n.isEmpty()) ? null : n;
+    }
+
+    private static final class BaseOffset {
+        final Varnode base;
+        final long offset;
+        BaseOffset(Varnode base, long offset) { this.base = base; this.offset = offset; }
     }
 
     private static Varnode peelTransparent(Varnode vn) {

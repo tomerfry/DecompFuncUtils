@@ -268,14 +268,16 @@ public class TaintQueryMatcher {
                 }
             }
             else if (elem instanceof TaintQuery.Assignment assign) {
-                // Check RHS for function calls like "$ptr = malloc($size)"
+                // Check RHS for function calls like "$ptr = malloc($size)".
+                // Skip RHS that starts with "(" — that's a cast like "(int)$big",
+                // not a call, and substring(0, parenIdx) would be empty.
                 String rhs = assign.rhs;
-                if (rhs != null && rhs.contains("(") && !rhs.startsWith("$")) {
+                if (rhs != null && rhs.contains("(") && !rhs.startsWith("$") && !rhs.startsWith("(")) {
                     // Extract function name from "funcname(...)"
                     int parenIdx = rhs.indexOf('(');
                     if (parenIdx > 0) {
                         String funcName = rhs.substring(0, parenIdx).trim();
-                        if (!funcName.startsWith("$")) {
+                        if (!funcName.isEmpty() && !funcName.startsWith("$")) {
                             concreteNames.add(funcName);
                         }
                     }
@@ -1364,6 +1366,53 @@ public class TaintQueryMatcher {
     }
 
     /**
+     * When matching an `__X_chk` FORTIFY wrapper against the plain-function
+     * pattern `X(...)`, some wrappers insert extra arguments *before* / *between*
+     * the user-visible args (e.g. `__printf_chk(flag, fmt, ...)` vs `printf(fmt, ...)`).
+     * For those families we need to remap pattern-arg index → actual call-input index.
+     *
+     * Returns null when no remapping is needed (the default `inputs[i+1]` mapping
+     * is correct — this is the case for families where FORTIFY only appends a
+     * `__bos`/`destlen` argument at the end, like `__memcpy_chk`/`__strcpy_chk`).
+     *
+     * When non-null, `result[i]` is the offset from `inputs[1]` for pattern arg i,
+     * i.e. the actual varnode is `inputs[1 + result[i]]`.
+     *
+     * Only consulted when calledName ends with `_chk`.
+     */
+    private static int[] getFortifyArgMapping(String calledName, String patternName) {
+        if (calledName == null || !calledName.endsWith("_chk")) return null;
+        String stripped = calledName;
+        if (stripped.startsWith("__")) stripped = stripped.substring(2);
+        stripped = stripped.substring(0, stripped.length() - 4);
+        if (!stripped.equals(patternName)) return null;
+        switch (stripped) {
+            // printf family: FORTIFY inserts a leading `flag` argument.
+            case "printf":     return new int[]{1};            // __printf_chk(flag, fmt, ...)
+            case "vprintf":    return new int[]{1, 2};         // __vprintf_chk(flag, fmt, ap)
+            case "fprintf":    return new int[]{0, 2};         // __fprintf_chk(stream, flag, fmt, ...)
+            case "vfprintf":   return new int[]{0, 2, 3};      // __vfprintf_chk(stream, flag, fmt, ap)
+            case "dprintf":    return new int[]{0, 2};         // __dprintf_chk(fd, flag, fmt, ...)
+            // sprintf family: FORTIFY inserts `flag` and `slen` between dst and fmt.
+            case "sprintf":    return new int[]{0, 3};         // __sprintf_chk(dst, flag, slen, fmt, ...)
+            case "vsprintf":   return new int[]{0, 3, 4};      // __vsprintf_chk(dst, flag, slen, fmt, ap)
+            case "snprintf":   return new int[]{0, 1, 4};      // __snprintf_chk(dst, size, flag, slen, fmt, ...)
+            case "vsnprintf":  return new int[]{0, 1, 4, 5};   // __vsnprintf_chk(dst, size, flag, slen, fmt, ap)
+            case "asprintf":   return new int[]{0, 2};         // __asprintf_chk(result, flag, fmt, ...)
+            case "obstack_printf":  return new int[]{0, 2};
+            case "obstack_vprintf": return new int[]{0, 2, 3};
+            // fgets: FORTIFY inserts `buflen` between buf and the user's `n` arg.
+            case "fgets":          return new int[]{0, 2, 3}; // __fgets_chk(buf, buflen, n, fp)
+            case "fgets_unlocked": return new int[]{0, 2, 3};
+            default:
+                // memcpy/memmove/mempcpy/strcpy/strncpy/strcat/strncat/read/pread/recv/... :
+                // FORTIFY only appends a trailing `__bos`/`destlen` argument. The default
+                // inputs[i+1] mapping is correct — return null to use it.
+                return null;
+        }
+    }
+
+    /**
      * Strip common wrapper / mangling prefixes and suffixes so that
      * '__memcpy_chk', 'memcpy@plt', '__imp_memcpy', '_memcpy' all reduce
      * to 'memcpy' for pattern matching. Conservative: only strip if we
@@ -1415,18 +1464,26 @@ public class TaintQueryMatcher {
         PcodeOp callOp = findCallPcodeOp(funcToken, highFunc);
         if (callOp != null) {
             Varnode[] inputs = callOp.getInputs();
-            for (int i = 0; i < fc.args.size() && i + 1 < inputs.length; i++) {
+            // For FORTIFY `__X_chk` wrappers that shift user-visible args, remap
+            // pattern-arg index → actual input index. Null means default i+1 mapping.
+            int[] fortifyMap = getFortifyArgMapping(calledName, fc.funcName);
+            for (int i = 0; i < fc.args.size(); i++) {
                 String argPattern = fc.args.get(i);
                 if (argPattern.equals("...")) break;
-                
-                Varnode currentArg = inputs[i + 1];
-                
+
+                int inputIdx = (fortifyMap != null && i < fortifyMap.length)
+                    ? 1 + fortifyMap[i]
+                    : i + 1;
+                if (inputIdx >= inputs.length) break;
+
+                Varnode currentArg = inputs[inputIdx];
+
                 if (!matchArgument(argPattern, currentArg, highFunc, bindings)) {
                     return false;  // Argument doesn't match pattern
                 }
             }
         }
-        
+
         return true;
     }
 
@@ -1442,10 +1499,22 @@ public class TaintQueryMatcher {
                                                 HighFunction highFunc, Map<String, Object> bindings) {
         Address stmtAddr = stmt.getMinAddress();
         if (stmtAddr == null) return false;
-        
+
         // Parse the RHS to determine what operation we're looking for
         String rhs = assign.rhs;
-        
+
+        // Truncation cast pattern: "(int)$big", "(uint32_t)$x", "(short)$y", etc.
+        // Matches SUBPIECE, INT_AND-with-mask, or CAST p-code ops at this statement.
+        if (matchTruncCast(assign.lhs, rhs, stmt, highFunc, bindings)) {
+            return true;
+        }
+
+        // Bitmask truncation: "$big & 0xffffffff", "$x & 0xffff", "$y & 0xff".
+        // A very common decompilation of `(int)$big` / `(short)$y` / `(char)$x`.
+        if (matchBitmaskTrunc(assign.lhs, rhs, stmt, highFunc, bindings)) {
+            return true;
+        }
+
         // Check for binary operation patterns like "$a * $b", "$a + $b", etc.
         java.util.regex.Pattern binOpPattern = java.util.regex.Pattern.compile(
             "^(\\$\\w+)\\s*([+\\-*/%&|^]|<<|>>)\\s*(\\$\\w+)$");
@@ -1507,14 +1576,19 @@ public class TaintQueryMatcher {
                         if (assign.lhs.startsWith("$") && output != null) {
                             bindings.put(assign.lhs, output);
                         }
-                        
+
                         // Bind arguments using matchArgument (handles expression patterns like $b * $c)
                         String stmtText = extractCodeText(stmt);
                         List<String> args = parseArgumentList(argsStr);
                         Varnode[] inputs = callOp.getInputs();
-                        for (int i = 0; i < args.size() && i + 1 < inputs.length; i++) {
+                        int[] fortifyMap = getFortifyArgMapping(calledName, funcName);
+                        for (int i = 0; i < args.size(); i++) {
+                            int inputIdx = (fortifyMap != null && i < fortifyMap.length)
+                                ? 1 + fortifyMap[i]
+                                : i + 1;
+                            if (inputIdx >= inputs.length) break;
                             String argPattern = args.get(i);
-                            if (!matchArgument(argPattern, inputs[i + 1], highFunc, bindings, stmtText)) {
+                            if (!matchArgument(argPattern, inputs[inputIdx], highFunc, bindings, stmtText)) {
                                 return false;  // Argument doesn't match pattern
                             }
                         }
@@ -1538,15 +1612,20 @@ public class TaintQueryMatcher {
                         if (assign.lhs.startsWith("$") && output != null) {
                             bindings.put(assign.lhs, output);
                         }
-                        
+
                         // Bind arguments using matchArgument (handles expression patterns like $b * $c)
                         String stmtText = extractCodeText(stmt);
                         List<String> args = parseArgumentList(argsStr);
                         Varnode[] inputs = op.getInputs();
+                        int[] fortifyMap = getFortifyArgMapping(calledName, funcName);
                         boolean argsMatched = true;
-                        for (int i = 0; i < args.size() && i + 1 < inputs.length; i++) {
+                        for (int i = 0; i < args.size(); i++) {
+                            int inputIdx = (fortifyMap != null && i < fortifyMap.length)
+                                ? 1 + fortifyMap[i]
+                                : i + 1;
+                            if (inputIdx >= inputs.length) break;
                             String argPattern = args.get(i);
-                            if (!matchArgument(argPattern, inputs[i + 1], highFunc, bindings, stmtText)) {
+                            if (!matchArgument(argPattern, inputs[inputIdx], highFunc, bindings, stmtText)) {
                                 argsMatched = false;
                                 break;
                             }
@@ -1562,6 +1641,169 @@ public class TaintQueryMatcher {
         
         // Fall back to simple assignment matching
         return matchAssignment(assign, stmt, highFunc, bindings);
+    }
+
+    /**
+     * Match a truncation cast pattern on the RHS of an assignment.
+     * Recognises `(type)$var` where type is an integer type narrower than the source.
+     * The corresponding p-code is typically SUBPIECE, INT_AND-with-mask, or CAST with
+     * a smaller output size.
+     *
+     * Example DSL: `$small = (int)$big;`
+     * Binds `$small` to the op's output and `$big` to the source varnode.
+     */
+    private boolean matchTruncCast(String lhs, String rhs, ClangStatement stmt,
+                                   HighFunction highFunc, Map<String, Object> bindings) {
+        // Match (type)$var  —  type may have one or more identifier words ("unsigned int")
+        java.util.regex.Pattern castPat = java.util.regex.Pattern.compile(
+            "^\\(\\s*([\\w\\s]+?)\\s*\\)\\s*(\\$\\w+)\\s*$");
+        java.util.regex.Matcher m = castPat.matcher(rhs);
+        if (!m.matches()) return false;
+
+        String typeName = m.group(1).trim().toLowerCase().replaceAll("\\s+", " ");
+        String rhsVar = m.group(2);
+        int targetBits = castBitWidth(typeName);
+        if (targetBits <= 0) return false;
+        int targetBytes = targetBits / 8;
+
+        Address stmtAddr = stmt.getMinAddress();
+        if (stmtAddr == null) return false;
+
+        Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            int opcode = op.getOpcode();
+            Varnode output = op.getOutput();
+            if (output == null) continue;
+
+            // SUBPIECE(v, 0) taking low bytes, output size == targetBytes
+            if (opcode == PcodeOp.SUBPIECE) {
+                Varnode src = op.getInput(0);
+                Varnode lowOff = op.getInput(1);
+                if (src == null || lowOff == null) continue;
+                if (lowOff.isConstant() && lowOff.getOffset() == 0 &&
+                    output.getSize() == targetBytes && src.getSize() > targetBytes) {
+                    if (bindOutputAndSource(lhs, rhsVar, output, src, bindings)) return true;
+                }
+            }
+            // INT_AND v, mask — where mask is (1 << targetBits) - 1
+            else if (opcode == PcodeOp.INT_AND) {
+                Varnode a = op.getInput(0);
+                Varnode b = op.getInput(1);
+                Varnode maskVn = b != null && b.isConstant() ? b : (a != null && a.isConstant() ? a : null);
+                Varnode srcVn = maskVn == b ? a : b;
+                if (maskVn != null && srcVn != null) {
+                    long expectedMask = targetBits >= 64 ? -1L : ((1L << targetBits) - 1L);
+                    if (maskVn.getOffset() == expectedMask) {
+                        if (bindOutputAndSource(lhs, rhsVar, output, srcVn, bindings)) return true;
+                    }
+                }
+            }
+            // CAST with narrower output
+            else if (opcode == PcodeOp.CAST || opcode == PcodeOp.COPY) {
+                Varnode src = op.getInput(0);
+                if (src != null && output.getSize() == targetBytes && src.getSize() > targetBytes) {
+                    if (bindOutputAndSource(lhs, rhsVar, output, src, bindings)) return true;
+                }
+            }
+            // INT_2COMP etc. — not a truncation.
+        }
+        return false;
+    }
+
+    /**
+     * Match a bitmask-style truncation like `$big & 0xffffffff` / `& 0xffff` / `& 0xff`.
+     * Covers a common decompiler rendering of narrowing casts.
+     */
+    private boolean matchBitmaskTrunc(String lhs, String rhs, ClangStatement stmt,
+                                      HighFunction highFunc, Map<String, Object> bindings) {
+        java.util.regex.Pattern maskPat = java.util.regex.Pattern.compile(
+            "^(\\$\\w+)\\s*&\\s*(?:0x([0-9a-fA-F]+)|(\\d+))\\s*$");
+        java.util.regex.Matcher m = maskPat.matcher(rhs);
+        if (!m.matches()) return false;
+
+        String rhsVar = m.group(1);
+        long mask;
+        try {
+            mask = m.group(2) != null
+                ? Long.parseUnsignedLong(m.group(2), 16)
+                : Long.parseLong(m.group(3));
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        // Only treat power-of-two-minus-one masks as truncations here.
+        if (mask != 0xffL && mask != 0xffffL && mask != 0xffffffffL && mask != -1L) return false;
+
+        Address stmtAddr = stmt.getMinAddress();
+        if (stmtAddr == null) return false;
+
+        Iterator<PcodeOpAST> ops = highFunc.getPcodeOps(stmtAddr);
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            if (op.getOpcode() != PcodeOp.INT_AND) continue;
+            Varnode output = op.getOutput();
+            Varnode a = op.getInput(0);
+            Varnode b = op.getInput(1);
+            if (output == null || a == null || b == null) continue;
+            Varnode maskVn = b.isConstant() ? b : (a.isConstant() ? a : null);
+            if (maskVn == null) continue;
+            if (maskVn.getOffset() != mask) continue;
+            Varnode srcVn = maskVn == b ? a : b;
+            if (bindOutputAndSource(lhs, rhsVar, output, srcVn, bindings)) return true;
+        }
+        return false;
+    }
+
+    private boolean bindOutputAndSource(String lhsPat, String rhsPat,
+                                        Varnode output, Varnode src,
+                                        Map<String, Object> bindings) {
+        if (lhsPat != null && lhsPat.startsWith("$")) {
+            if (!bindOrVerify(lhsPat, output, bindings)) return false;
+        }
+        if (rhsPat != null && rhsPat.startsWith("$")) {
+            if (!bindOrVerify(rhsPat, src, bindings)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * If `$var` is already bound, verify the new varnode matches (exact or alias).
+     * Otherwise bind it. Returns false on a conflicting rebind.
+     */
+    private boolean bindOrVerify(String var, Varnode vn, Map<String, Object> bindings) {
+        Object existing = bindings.get(var);
+        if (existing == null) {
+            bindings.put(var, vn);
+            return true;
+        }
+        if (existing instanceof Varnode existingVn) {
+            if (existingVn.equals(vn)) return true;
+            if (aliasTracker != null && aliasTracker.areAliases(vn, existingVn)) return true;
+            return false;
+        }
+        return true; // non-Varnode binding — don't attempt consistency check
+    }
+
+    /**
+     * Bit width for a C integer type name in a truncation cast.
+     * Returns -1 when the type isn't a recognised narrowing integer type.
+     */
+    private static int castBitWidth(String typeName) {
+        if (typeName == null) return -1;
+        switch (typeName) {
+            case "char": case "int8_t": case "uint8_t": case "signed char":
+            case "unsigned char": case "byte":
+                return 8;
+            case "short": case "short int": case "int16_t": case "uint16_t":
+            case "signed short": case "unsigned short": case "unsigned short int":
+            case "word":
+                return 16;
+            case "int": case "int32_t": case "uint32_t": case "signed int":
+            case "unsigned int": case "uint": case "dword":
+                return 32;
+            default:
+                return -1;
+        }
     }
 
     /**

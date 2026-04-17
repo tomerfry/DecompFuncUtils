@@ -7,6 +7,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
 
 import java.util.*;
 import java.util.regex.Pattern;
@@ -39,6 +40,7 @@ public class CreateVtableStructTool implements McpTool {
         props.put("includeHeader", Map.of("type", "boolean", "description", "If true and header is detected, include offset_to_top / typeinfo as typed fields in the struct. Default false (struct starts at first method)."));
         props.put("applyAtAddress", Map.of("type", "boolean", "description", "Apply the generated struct as data at the vtable address. Default true."));
         props.put("fieldPrefix", Map.of("type", "string", "description", "Prefix for slot field names when the callee has no meaningful name (default 'vfunc_')."));
+        props.put("stopAtExternal", Map.of("type", "boolean", "description", "If true (default), stop the scan when the next entry points into the EXTERNAL block, a PLT/import thunk, or a non-executable segment. Prevents overshoot into the GOT/PLT area that follows real vtables."));
         schema.put("properties", props);
         schema.put("required", List.of("address", "structName"));
         return schema;
@@ -56,6 +58,7 @@ public class CreateVtableStructTool implements McpTool {
         boolean includeHeader = (Boolean) arguments.getOrDefault("includeHeader", Boolean.FALSE);
         boolean applyAt = (Boolean) arguments.getOrDefault("applyAtAddress", Boolean.TRUE);
         String fieldPrefix = (String) arguments.getOrDefault("fieldPrefix", "vfunc_");
+        boolean stopAtExternal = !Boolean.FALSE.equals(arguments.get("stopAtExternal"));
 
         Address base = McpUtil.parseAddress(addrStr, program);
         int ptrSize = program.getDefaultPointerSize();
@@ -69,17 +72,37 @@ public class CreateVtableStructTool implements McpTool {
 
         // Walk the method slots, pulling the callee and its signature.
         List<SlotInfo> slots = new ArrayList<>();
+        String scanStopReason = "max_entries";
+        String scanStopAt = null;
+        String scanStopDetail = null;
         Address cursor = methodsStart;
         for (int i = 0; i < maxEntries; i++) {
             long value;
             try {
                 value = (ptrSize == 8) ? memory.getLong(cursor) : memory.getInt(cursor) & 0xFFFFFFFFL;
             } catch (Exception e) {
+                scanStopReason = "read_failed";
+                scanStopAt = cursor.toString();
+                scanStopDetail = e.getMessage();
                 break;
             }
             Address target = program.getAddressFactory().getDefaultAddressSpace().getAddress(value);
             Function func = fm.getFunctionAt(target);
-            if (func == null) break;
+            if (func == null) {
+                scanStopReason = "unresolved_target";
+                scanStopAt = cursor.toString();
+                scanStopDetail = "no function at " + target;
+                break;
+            }
+            if (stopAtExternal) {
+                String foreignKind = classifyForeignEntry(target, func, memory);
+                if (foreignKind != null) {
+                    scanStopReason = "external_entry";
+                    scanStopAt = cursor.toString();
+                    scanStopDetail = foreignKind + " at " + target + " ('" + func.getName() + "')";
+                    break;
+                }
+            }
             slots.add(new SlotInfo(i, cursor, target, func));
             cursor = cursor.add(ptrSize);
         }
@@ -155,6 +178,9 @@ public class CreateVtableStructTool implements McpTool {
         result.put("headerSkipped", skip);
         result.put("headerIncluded", includeHeader && skip > 0);
         result.put("methodCount", slots.size());
+        result.put("scanStopReason", scanStopReason);
+        if (scanStopAt != null) result.put("scanStoppedAt", scanStopAt);
+        if (scanStopDetail != null) result.put("scanStopDetail", scanStopDetail);
         result.put("fields", fieldReport);
         result.put("applyStatus", applyStatus);
         if (appliedAt != null) result.put("appliedAt", appliedAt);
@@ -177,6 +203,37 @@ public class CreateVtableStructTool implements McpTool {
             }
         }
         return skip;
+    }
+
+    /**
+     * E2: decide whether a resolved vtable entry actually lives in user code or has
+     * overshot into the GOT/PLT area that typically follows a real vtable. Returns a
+     * non-null tag describing the mismatch when we should stop scanning.
+     */
+    private static String classifyForeignEntry(Address target, Function func, Memory memory) {
+        MemoryBlock block = memory.getBlock(target);
+        if (block != null) {
+            String blockName = block.getName();
+            if ("EXTERNAL".equalsIgnoreCase(blockName)) return "EXTERNAL block";
+            if (!block.isExecute()) return "non-executable block '" + blockName + "'";
+            String ln = blockName == null ? "" : blockName.toLowerCase();
+            if (ln.equals(".plt") || ln.equals(".plt.got") || ln.equals(".plt.sec")
+                    || ln.equals(".got") || ln.equals(".got.plt")) {
+                return "PLT/GOT block '" + blockName + "'";
+            }
+        }
+        if (func.isExternal()) return "external function";
+        if (func.isThunk()) {
+            Function thunked = func.getThunkedFunction(true);
+            if (thunked != null && thunked.isExternal()) return "PLT thunk to external";
+            if (thunked != null) {
+                MemoryBlock tblock = memory.getBlock(thunked.getEntryPoint());
+                if (tblock != null && "EXTERNAL".equalsIgnoreCase(tblock.getName())) {
+                    return "thunk into EXTERNAL block";
+                }
+            }
+        }
+        return null;
     }
 
     private static Function resolveFunctionAt(Address slot, int ptrSize, Memory memory,

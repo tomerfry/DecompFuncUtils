@@ -1,5 +1,9 @@
 package decompfuncutils.mcp.tools;
 
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeComponent;
+import ghidra.program.model.data.Pointer;
+import ghidra.program.model.data.Structure;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.pcode.*;
@@ -93,16 +97,36 @@ public final class PcodeExpressionRenderer {
                 return "sext(" + render(op.getInput(0), d, visiting) + ")";
             case PcodeOp.SUBPIECE: {
                 Varnode piece = op.getInput(1);
-                long shift = piece.isConstant() ? piece.getOffset() : -1;
-                return "subpiece(" + render(op.getInput(0), d, visiting)
-                    + ", " + shift + ", size=" + op.getOutput().getSize() + ")";
+                Varnode src = op.getInput(0);
+                int outSize = op.getOutput() != null ? op.getOutput().getSize() : -1;
+                // Low-bytes narrowing cast: render as `(uintN_t)expr` instead of `subpiece(expr, 0, size=N)`.
+                if (piece != null && piece.isConstant() && piece.getOffset() == 0
+                        && (outSize == 1 || outSize == 2 || outSize == 4)) {
+                    String typeName = outSize == 1 ? "uint8_t"
+                                    : outSize == 2 ? "uint16_t" : "uint32_t";
+                    return "(" + typeName + ")" + render(src, d, visiting);
+                }
+                long shift = piece != null && piece.isConstant() ? piece.getOffset() : -1;
+                return "subpiece(" + render(src, d, visiting)
+                    + ", " + shift + ", size=" + outSize + ")";
             }
-            case PcodeOp.LOAD:
-                // inputs[0] = space id, inputs[1] = pointer
-                return "*(" + render(op.getInput(1), d, visiting) + ")";
-            case PcodeOp.PTRSUB:
+            case PcodeOp.LOAD: {
+                // inputs[0] = space id, inputs[1] = pointer.
+                // If the pointer is (named struct pointer + constant field offset),
+                // render as base->field rather than *((base + 0xN)).
+                Varnode ptr = op.getInput(1);
+                String fieldAccess = tryRenderStructFieldLoad(ptr);
+                if (fieldAccess != null) return fieldAccess;
+                return "*(" + render(ptr, d, visiting) + ")";
+            }
+            case PcodeOp.PTRSUB: {
+                // PTRSUB is used for struct-field pointer math: base + constOffset.
+                // Prefer base->field rendering when types permit.
+                String fieldAccess = tryRenderStructFieldPointer(op.getInput(0), op.getInput(1));
+                if (fieldAccess != null) return "&" + fieldAccess;
                 return "(" + render(op.getInput(0), d, visiting) + " + "
                     + render(op.getInput(1), d, visiting) + ")";
+            }
             case PcodeOp.MULTIEQUAL: {
                 StringBuilder sb = new StringBuilder("phi(");
                 for (int i = 0; i < op.getNumInputs(); i++) {
@@ -179,6 +203,101 @@ public final class PcodeExpressionRenderer {
             return sp + "[" + Long.toHexString(vn.getOffset()) + "]";
         }
         return "<vn@" + vn.getOffset() + ">";
+    }
+
+    /**
+     * If `ptr` is `(namedStructPointer + constOffset)`, render the corresponding
+     * load as `base->field`. Returns null when the pattern doesn't apply.
+     */
+    private String tryRenderStructFieldLoad(Varnode ptr) {
+        if (ptr == null) return null;
+        BaseOffset bo = baseOffsetOf(ptr);
+        if (bo == null) return null;
+        String baseName = tryName(bo.base);
+        if (baseName == null) return null;
+        Structure s = pointedStructure(bo.base);
+        if (s == null) return null;
+        int offset = (int) bo.offset;
+        if (offset < 0 || offset >= s.getLength()) return null;
+        DataTypeComponent comp = s.getComponentContaining(offset);
+        if (comp == null) return null;
+        String field = comp.getFieldName();
+        if (field == null || field.isEmpty()) {
+            field = "field_" + Integer.toHexString(comp.getOffset());
+        }
+        // If the load aligns to the start of the component, use -> directly;
+        // otherwise annotate the sub-offset so the reader knows we're inside a field.
+        if (offset == comp.getOffset()) {
+            return baseName + "->" + field;
+        }
+        return baseName + "->" + field + "+" + (offset - comp.getOffset());
+    }
+
+    /**
+     * PTRSUB(base, const) → render as `base->field` (address-of used separately).
+     */
+    private String tryRenderStructFieldPointer(Varnode base, Varnode off) {
+        if (base == null || off == null || !off.isConstant()) return null;
+        String baseName = tryName(base);
+        if (baseName == null) return null;
+        Structure s = pointedStructure(base);
+        if (s == null) return null;
+        int offset = (int) off.getOffset();
+        if (offset < 0 || offset >= s.getLength()) return null;
+        DataTypeComponent comp = s.getComponentContaining(offset);
+        if (comp == null || comp.getOffset() != offset) return null;
+        String field = comp.getFieldName();
+        if (field == null || field.isEmpty()) {
+            field = "field_" + Integer.toHexString(comp.getOffset());
+        }
+        return baseName + "->" + field;
+    }
+
+    /**
+     * Resolve a varnode of the form `base + constant` (via PTRADD/PTRSUB/INT_ADD)
+     * into a (base, offset) pair. Returns (vn, 0) for a plain base pointer.
+     */
+    private BaseOffset baseOffsetOf(Varnode vn) {
+        if (vn == null) return null;
+        PcodeOp def = vn.getDef();
+        if (def == null) return new BaseOffset(vn, 0);
+        int op = def.getOpcode();
+        if (op == PcodeOp.COPY || op == PcodeOp.CAST) {
+            return baseOffsetOf(def.getInput(0));
+        }
+        if (op == PcodeOp.PTRSUB || op == PcodeOp.PTRADD || op == PcodeOp.INT_ADD) {
+            Varnode a = def.getInput(0);
+            Varnode b = def.getInput(1);
+            if (a != null && b != null && b.isConstant()) {
+                long mult = (op == PcodeOp.PTRADD && def.getNumInputs() >= 3
+                    && def.getInput(2) != null && def.getInput(2).isConstant())
+                    ? def.getInput(2).getOffset() : 1L;
+                return new BaseOffset(a, b.getOffset() * mult);
+            }
+            if (a != null && b != null && a.isConstant()) {
+                return new BaseOffset(b, a.getOffset());
+            }
+        }
+        return new BaseOffset(vn, 0);
+    }
+
+    private Structure pointedStructure(Varnode base) {
+        if (base == null) return null;
+        HighVariable hv = base.getHigh();
+        if (hv == null) return null;
+        DataType dt = hv.getDataType();
+        if (dt instanceof Pointer p) {
+            DataType pointed = p.getDataType();
+            if (pointed instanceof Structure s) return s;
+        }
+        if (dt instanceof Structure s) return s;
+        return null;
+    }
+
+    private static final class BaseOffset {
+        final Varnode base;
+        final long offset;
+        BaseOffset(Varnode base, long offset) { this.base = base; this.offset = offset; }
     }
 
     private static String hex(long value, int size) {

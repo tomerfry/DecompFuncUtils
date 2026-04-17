@@ -47,7 +47,13 @@ public class PathConstraintsTool implements McpTool {
                "conditional-branch conditions each path requires. Conditions are rendered as " +
                "expressions in terms of decompiler-named variables (params, locals, globals) " +
                "when available. Loops are bounded by 'loopUnroll' (visits per block per path); " +
-               "results are an under-approximation when unroll is exceeded (see 'truncated' flag).";
+               "results are an under-approximation when unroll is exceeded (see 'truncated' flag). " +
+               "SCOPE: strictly intra-procedural. CALL instructions are treated as opaque — any " +
+               "conditions enforced inside a callee (e.g. argument validation, parsers reading " +
+               "from a buffer passed in) are NOT reflected in the returned path condition. To " +
+               "reason about cross-function constraints, run this tool separately on each " +
+               "callee of interest (pass the callee's entry as 'function' and the interesting " +
+               "instruction in that callee as 'targetAddress').";
     }
 
     @Override
@@ -65,6 +71,12 @@ public class PathConstraintsTool implements McpTool {
             "description", "Max times a block may appear in one path minus 1 (default 1 → block can appear twice; 0 → acyclic only)"));
         props.put("maxExpressionDepth", Map.of("type", "integer",
             "description", "Max recursion depth when rendering a condition expression (default 8)"));
+        props.put("inlineCallees", Map.of("type", "boolean",
+            "description", "Reserved for future use. When false (default) the tool is strictly " +
+                "intra-procedural and CALL instructions are opaque. Setting this to true currently " +
+                "emits a 'warning' field in the result but does NOT alter analysis — use this flag " +
+                "to assert you have understood the intra-procedural limitation. Cross-function " +
+                "constraint merging is not yet implemented; invoke the tool on each callee instead."));
         schema.put("properties", props);
         schema.put("required", List.of("function", "targetAddress"));
         return schema;
@@ -85,6 +97,7 @@ public class PathConstraintsTool implements McpTool {
             ((Number) arguments.getOrDefault("loopUnroll", DEFAULT_LOOP_UNROLL)).intValue());
         int maxExprDepth = ((Number) arguments.getOrDefault("maxExpressionDepth",
             DEFAULT_MAX_EXPR_DEPTH)).intValue();
+        boolean inlineCallees = Boolean.TRUE.equals(arguments.get("inlineCallees"));
 
         Function func = program.getFunctionManager().getFunctionAt(funcAddr);
         if (func == null) {
@@ -143,6 +156,17 @@ public class PathConstraintsTool implements McpTool {
             out.put("targetBlocks", targetBlocks.size());
             out.put("pathCount", paths.size());
             out.put("paths", paths);
+            out.put("scope", "intraprocedural");
+            out.put("scopeNote",
+                "Conditions enforced inside callees are NOT included. Each path's " +
+                "'opaqueCalls' field lists CALL sites crossed on that path — invoke this tool on " +
+                "those callees to reason about their internal constraints.");
+            if (inlineCallees) {
+                out.put("warning",
+                    "inlineCallees=true was set, but cross-function constraint merging is not " +
+                    "yet implemented. Analysis remains intra-procedural. Use the 'opaqueCalls' " +
+                    "field to identify callees that may carry additional constraints.");
+            }
             if (truncated[0]) {
                 out.put("truncated", true);
                 out.put("truncatedNote",
@@ -198,6 +222,7 @@ public class PathConstraintsTool implements McpTool {
 
         List<Map<String, Object>> blocks = new ArrayList<>();
         List<Map<String, Object>> conditions = new ArrayList<>();
+        List<Map<String, Object>> opaqueCalls = new ArrayList<>();
         for (int i = 0; i < seq.size(); i++) {
             PcodeBlockBasic b = seq.get(i);
             Map<String, Object> bi = new LinkedHashMap<>();
@@ -205,6 +230,8 @@ public class PathConstraintsTool implements McpTool {
             bi.put("start", b.getStart() != null ? b.getStart().toString() : null);
             bi.put("stop", b.getStop() != null ? b.getStop().toString() : null);
             blocks.add(bi);
+
+            collectOpaqueCalls(b, opaqueCalls, renderer);
 
             if (i + 1 < seq.size()) {
                 PcodeBlockBasic next = seq.get(i + 1);
@@ -218,7 +245,36 @@ public class PathConstraintsTool implements McpTool {
         out.put("blockCount", seq.size());
         out.put("conditions", conditions);
         out.put("conditionSummary", summarize(conditions));
+        out.put("opaqueCalls", opaqueCalls);
         return out;
+    }
+
+    /**
+     * B1: walk a block's p-code ops and record every CALL/CALLIND. Callers use this
+     * to see which callees lie on the path — reminding them that inner constraints
+     * are not reflected in the returned condition.
+     */
+    private void collectOpaqueCalls(PcodeBlockBasic block, List<Map<String, Object>> out,
+                                    PcodeExpressionRenderer renderer) {
+        Iterator<PcodeOp> it = block.getIterator();
+        while (it.hasNext()) {
+            PcodeOp op = it.next();
+            int opc = op.getOpcode();
+            if (opc != PcodeOp.CALL && opc != PcodeOp.CALLIND && opc != PcodeOp.CALLOTHER) continue;
+            Map<String, Object> call = new LinkedHashMap<>();
+            call.put("pc", op.getSeqnum() != null && op.getSeqnum().getTarget() != null
+                ? op.getSeqnum().getTarget().toString() : null);
+            call.put("kind", opc == PcodeOp.CALL ? "direct"
+                : opc == PcodeOp.CALLIND ? "indirect" : "other");
+            if (op.getNumInputs() > 0 && op.getInput(0) != null) {
+                if (opc == PcodeOp.CALL && op.getInput(0).isAddress()) {
+                    call.put("target", op.getInput(0).getAddress().toString());
+                } else if (opc == PcodeOp.CALLIND) {
+                    call.put("target", renderer.render(op.getInput(0)));
+                }
+            }
+            out.add(call);
+        }
     }
 
     private Map<String, Object> edgeCondition(PcodeBlockBasic from, PcodeBlockBasic to,

@@ -14,9 +14,11 @@ import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.PcodeBlockBasic;
 import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.symbol.Symbol;
 import ghidra.util.task.TaskMonitor;
 
 import java.math.BigInteger;
@@ -90,7 +92,12 @@ public class EmulateFunctionTool implements McpTool {
         props.put("symbolicExpressionDepth", Map.of("type", "integer",
             "description", "Max recursion depth for symbolic expression rendering (default 8)"));
         props.put("trackMemoryWrites", Map.of("type", "boolean",
-            "description", "If true, return the set of memory ranges written during emulation (default true)"));
+            "description", "If true, return the set of memory ranges written during emulation (default true). " +
+                "Real-memory writes land in 'memoryWrites'; register-space writes in 'registerWrites'. " +
+                "Unique/scratch-space writes are suppressed unless 'includeScratch' is true."));
+        props.put("includeScratch", Map.of("type", "boolean",
+            "description", "If true, also include writes to the p-code 'unique' (scratch) space in 'scratchWrites'. " +
+                "Usually noise; default false."));
         schema.put("properties", props);
         schema.put("required", List.of("entry"));
         return schema;
@@ -113,6 +120,7 @@ public class EmulateFunctionTool implements McpTool {
         int symExprDepth = ((Number) arguments.getOrDefault(
             "symbolicExpressionDepth", DEFAULT_SYMBOLIC_EXPR_DEPTH)).intValue();
         boolean trackMemoryWrites = !Boolean.FALSE.equals(arguments.get("trackMemoryWrites"));
+        boolean includeScratch = Boolean.TRUE.equals(arguments.get("includeScratch"));
 
         Map<String, Object> regSeeds = (Map<String, Object>)
             arguments.getOrDefault("registers", Collections.emptyMap());
@@ -244,7 +252,36 @@ public class EmulateFunctionTool implements McpTool {
             result.put("registers", collectFinalRegisters(emu, program));
 
             if (trackMemoryWrites) {
-                result.put("memoryWrites", collectMemoryWrites(emu));
+                SplitWrites sw = collectMemoryWrites(emu, includeScratch);
+                result.put("memoryWrites", sw.real);
+                result.put("registerWrites", sw.register);
+                if (includeScratch) result.put("scratchWrites", sw.scratch);
+            }
+
+            // A5: if we errored inside an EXTERNAL/PLT/thunk block, replace the opaque
+            // "Instruction decode failed" message with actionable guidance.
+            if ("error".equals(stopReason)) {
+                Map<String, Object> extHint = externalCallHint(program, lastPc);
+                if (extHint != null) {
+                    result.put("hint", extHint);
+                    Object sym = extHint.get("symbol");
+                    Object thunkAt = extHint.get("thunkAt");
+                    String actionable = "PC=" + thunkAt + " is the PLT thunk for '" + sym +
+                        "' (EXTERNAL block). Add this address to stopAddresses, or seed a return-value " +
+                        "register and skip past the CALL.";
+                    result.put("lastError", actionable);
+                    if (lastError != null) result.put("originalError", lastError);
+                }
+
+                // A6: detect exploit-primitive controlledPc: the faulting PC value was
+                // written to memory during emulation (classic stack-smash / RIP control).
+                if (trackMemoryWrites) {
+                    Map<String, Object> controlled = findControlledPc(emu, program, lastPc);
+                    if (controlled != null) {
+                        result.put("controlledPc", true);
+                        result.put("controlledBy", controlled);
+                    }
+                }
             }
 
             if (recordBranches) {
@@ -283,7 +320,7 @@ public class EmulateFunctionTool implements McpTool {
                     Register r = (Register) obj;
                     try {
                         BigInteger v = emu.readRegister(r);
-                        if (v != null) inputs.put(r.getName(), "0x" + v.toString(16));
+                        if (v != null) inputs.put(r.getName(), formatUnsignedHex(v, r.getMinimumByteSize()));
                     } catch (Exception ignored) {}
                 }
             }
@@ -324,21 +361,53 @@ public class EmulateFunctionTool implements McpTool {
     private static void tryPutReg(Map<String, String> out, EmulatorHelper emu, Register r) {
         try {
             BigInteger v = emu.readRegister(r);
-            if (v != null) out.put(r.getName(), "0x" + v.toString(16));
+            if (v != null) out.put(r.getName(), formatUnsignedHex(v, r.getMinimumByteSize()));
         } catch (Exception ignored) {}
     }
 
-    private static List<Map<String, Object>> collectMemoryWrites(EmulatorHelper emu) {
-        List<Map<String, Object>> out = new ArrayList<>();
+    /**
+     * A3: render a register value as unsigned hex, masked to the register's width.
+     * Avoids the '-0x1' artifact Java's BigInteger.toString(16) produces for signed values.
+     */
+    private static String formatUnsignedHex(BigInteger v, int byteSize) {
+        if (byteSize <= 0 || byteSize > 16) {
+            return "0x" + (v.signum() < 0 ? "-" : "") + v.abs().toString(16);
+        }
+        BigInteger mask = BigInteger.ONE.shiftLeft(byteSize * 8).subtract(BigInteger.ONE);
+        return "0x" + v.and(mask).toString(16);
+    }
+
+    private static final class SplitWrites {
+        final List<Map<String, Object>> real = new ArrayList<>();
+        final List<Map<String, Object>> register = new ArrayList<>();
+        final List<Map<String, Object>> scratch = new ArrayList<>();
+    }
+
+    /**
+     * A4: split the tracked-write set by address-space kind. Real-memory ranges go to
+     * {@code real}; register-space ranges (coalesced p-code register writes) to {@code register};
+     * p-code unique/scratch space (largely noise) only kept when the caller asked for it.
+     */
+    private static SplitWrites collectMemoryWrites(EmulatorHelper emu, boolean includeScratch) {
+        SplitWrites out = new SplitWrites();
         AddressSetView written = emu.getTrackedMemoryWriteSet();
         if (written == null) return out;
         for (AddressRange range : written) {
-            if (out.size() >= MAX_MEM_WRITE_RANGES) break;
+            String spaceName = range.getAddressSpace().getName();
+            boolean isRegister = "register".equalsIgnoreCase(spaceName);
+            boolean isUnique = "unique".equalsIgnoreCase(spaceName);
+            List<Map<String, Object>> bucket;
+            if (isRegister) bucket = out.register;
+            else if (isUnique) { if (!includeScratch) continue; bucket = out.scratch; }
+            else bucket = out.real;
+
+            if (bucket.size() >= MAX_MEM_WRITE_RANGES) continue;
+
             Map<String, Object> mw = new LinkedHashMap<>();
             mw.put("address", range.getMinAddress().toString());
             long len = range.getLength();
             mw.put("length", len);
-            if (len > 0 && len <= MAX_MEM_WRITE_INLINE_HEX) {
+            if (!isRegister && !isUnique && len > 0 && len <= MAX_MEM_WRITE_INLINE_HEX) {
                 try {
                     byte[] bytes = emu.readMemory(range.getMinAddress(), (int) len);
                     StringBuilder hex = new StringBuilder();
@@ -346,9 +415,102 @@ public class EmulateFunctionTool implements McpTool {
                     mw.put("hex", hex.toString());
                 } catch (Exception ignored) {}
             }
-            out.add(mw);
+            if (isRegister || isUnique) mw.put("space", spaceName);
+            bucket.add(mw);
         }
         return out;
+    }
+
+    /**
+     * A5: If the faulting PC is an EXTERNAL-block address or a thunk to an external
+     * function, resolve the symbol and return a hint describing it. Callers get a
+     * clear "you hit a PLT thunk for X" message instead of "instruction decode failed".
+     */
+    private static Map<String, Object> externalCallHint(Program program, Address pc) {
+        if (pc == null) return null;
+        MemoryBlock block = program.getMemory().getBlock(pc);
+        boolean inExternalBlock = block != null && "EXTERNAL".equalsIgnoreCase(block.getName());
+
+        Function func = program.getFunctionManager().getFunctionAt(pc);
+        if (func == null) {
+            func = program.getFunctionManager().getFunctionContaining(pc);
+        }
+        boolean isThunk = func != null && func.isThunk();
+        boolean isExternalFunc = func != null && func.isExternal();
+
+        if (!inExternalBlock && !isThunk && !isExternalFunc) return null;
+
+        // Resolve the best external/target symbol.
+        String symbolName = null;
+        if (func != null) {
+            if (func.isThunk()) {
+                Function thunked = func.getThunkedFunction(true);
+                if (thunked != null) symbolName = thunked.getName();
+            }
+            if (symbolName == null) symbolName = func.getName();
+        }
+        if (symbolName == null) {
+            Symbol[] syms = program.getSymbolTable().getSymbols(pc);
+            if (syms != null && syms.length > 0) symbolName = syms[0].getName();
+        }
+
+        Map<String, Object> hint = new LinkedHashMap<>();
+        hint.put("kind", "external_call");
+        if (symbolName != null) hint.put("symbol", symbolName);
+        hint.put("thunkAt", pc.toString());
+        if (block != null) hint.put("block", block.getName());
+        return hint;
+    }
+
+    /**
+     * A6: Scan the tracked memory-write set for the faulting PC value encoded as a
+     * little-endian pointer. If found, the attacker-controlled write produced the
+     * current PC — surface this as a controlledPc signal (stack-smash → RIP control).
+     */
+    private static Map<String, Object> findControlledPc(EmulatorHelper emu, Program program, Address pc) {
+        if (pc == null) return null;
+        AddressSetView writes = emu.getTrackedMemoryWriteSet();
+        if (writes == null || writes.isEmpty()) return null;
+
+        int ptrSize = program.getDefaultPointerSize();
+        if (ptrSize <= 0 || ptrSize > 8) return null;
+
+        // Encode pc as little-endian ptrSize-byte pattern.
+        long pcVal = pc.getOffset();
+        byte[] needle = new byte[ptrSize];
+        for (int i = 0; i < ptrSize; i++) {
+            needle[i] = (byte) ((pcVal >>> (8 * i)) & 0xFF);
+        }
+
+        for (AddressRange range : writes) {
+            String spaceName = range.getAddressSpace().getName();
+            if ("register".equalsIgnoreCase(spaceName) || "unique".equalsIgnoreCase(spaceName)) continue;
+            long len = range.getLength();
+            if (len < ptrSize || len > (1 << 20)) continue; // cap per-range scan at 1 MiB
+            byte[] buf;
+            try {
+                buf = emu.readMemory(range.getMinAddress(), (int) len);
+            } catch (Exception e) {
+                continue;
+            }
+            for (int i = 0; i <= buf.length - ptrSize; i++) {
+                boolean match = true;
+                for (int j = 0; j < ptrSize; j++) {
+                    if (buf[i + j] != needle[j]) { match = false; break; }
+                }
+                if (match) {
+                    Address writeAddr = range.getMinAddress().add(i);
+                    Map<String, Object> out = new LinkedHashMap<>();
+                    out.put("writeAddress", writeAddr.toString());
+                    out.put("rangeStart", range.getMinAddress().toString());
+                    out.put("rangeLength", len);
+                    out.put("note", "The faulting PC value was written to memory during emulation; " +
+                        "this is typically a stack-smash → controlled RIP primitive.");
+                    return out;
+                }
+            }
+        }
+        return null;
     }
 
     private static BigInteger parseBigInt(String s) {

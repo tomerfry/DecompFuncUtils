@@ -95,6 +95,37 @@ public class TaintQueryParser {
             "    ...;\n" +
             "    free($ptr);\n" +
             "}");
+
+        // D1: UAF where the freed pointer is passed to another function instead of
+        // being dereferenced directly. Covers strlen(p) / puts(p) / fclose(p) /
+        // printf("%s", p) / any_wrapper(p) patterns — the same bug class as *$ptr
+        // but far more common in real code.
+        BUILTIN_PATTERNS.put("use_after_free_as_arg",
+            "PATTERN use_after_free_as_arg {\n" +
+            "    free($ptr);\n" +
+            "    ... not:$ptr=_;\n" +
+            "    $usefn($ptr);\n" +
+            "}");
+
+        // D1 variant: freed pointer passed as the 2nd argument (memcpy(dst,p,n),
+        // fprintf(stream,p,...), etc.). Kept as a separate pattern so each
+        // built-in is predictable about which slot it matches.
+        BUILTIN_PATTERNS.put("use_after_free_as_arg2",
+            "PATTERN use_after_free_as_arg2 {\n" +
+            "    free($ptr);\n" +
+            "    ... not:$ptr=_;\n" +
+            "    $usefn(_, $ptr);\n" +
+            "}");
+
+        // D2: double-free through a free-like wrapper (my_free / xfree / g_free /
+        // close / fclose etc.). The function name is bound on the first call and
+        // must match on the second, so we don't falsely pair free(p) with close(p).
+        BUILTIN_PATTERNS.put("double_free_like",
+            "PATTERN double_free_like {\n" +
+            "    $freefn($ptr);\n" +
+            "    ... not:$ptr=_;\n" +
+            "    $freefn($ptr);\n" +
+            "}");
         
         // Integer overflow
         BUILTIN_PATTERNS.put("int_overflow_malloc",
@@ -102,6 +133,25 @@ public class TaintQueryParser {
             "    $size = $a * $b;\n" +
             "    malloc($size);\n" +
             "} WHERE tainted($a) OR tainted($b)");
+
+        // Integer-truncation → heap-overflow: narrow a 64-bit tainted value
+        // to pass malloc sizing, then copy the full 64-bit value into the buffer.
+        // The cast appears in the decompiler as either `(int)x` (SUBPIECE/CAST)
+        // or `x & 0xffffffff` (INT_AND) depending on compiler optimisation.
+        BUILTIN_PATTERNS.put("int_trunc_heap_overflow",
+            "PATTERN int_trunc_heap_overflow {\n" +
+            "    $small = (int)$big;\n" +
+            "    $buf = malloc($small);\n" +
+            "    memcpy($buf, $src, $big);\n" +
+            "} WHERE tainted($big)");
+
+        // Variant: same bug expressed via bitmask truncation.
+        BUILTIN_PATTERNS.put("int_trunc_heap_overflow_mask",
+            "PATTERN int_trunc_heap_overflow_mask {\n" +
+            "    $small = $big & 0xffffffff;\n" +
+            "    $buf = malloc($small);\n" +
+            "    memcpy($buf, $src, $big);\n" +
+            "} WHERE tainted($big)");
         
         // Null pointer dereference
         BUILTIN_PATTERNS.put("null_deref_after_malloc",
