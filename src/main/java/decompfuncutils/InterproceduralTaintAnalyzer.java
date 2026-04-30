@@ -23,6 +23,7 @@ public class InterproceduralTaintAnalyzer {
     private int maxDepth = 3;
     private int maxIterations = 30;
     private float taintThreshold = 0.1f;
+    private int decompileTimeoutSeconds = 30;
     
     // Cache decompiled functions to avoid re-decompiling
     private Map<Address, HighFunction> decompileCache = new HashMap<>();
@@ -80,6 +81,15 @@ public class InterproceduralTaintAnalyzer {
     
     public void setMaxIterations(int iterations) {
         this.maxIterations = iterations;
+    }
+
+    /**
+     * Set per-function decompile timeout in seconds. Pass a non-positive value
+     * (e.g. -1) to disable the timeout — useful for batch MCP runs where the
+     * 30-second default truncates large functions and silently drops paths.
+     */
+    public void setDecompileTimeout(int seconds) {
+        this.decompileTimeoutSeconds = seconds <= 0 ? Integer.MAX_VALUE : seconds;
     }
     
     public List<TaintPath> getFoundPaths() {
@@ -431,7 +441,7 @@ public class InterproceduralTaintAnalyzer {
         Function func = program.getFunctionManager().getFunctionAt(funcAddr);
         if (func == null) return null;
         
-        DecompileResults results = decompiler.decompileFunction(func, 30, monitor);
+        DecompileResults results = decompiler.decompileFunction(func, decompileTimeoutSeconds, monitor);
         if (results == null || !results.decompileCompleted()) {
             return null;
         }

@@ -30,7 +30,9 @@ public class TaintForwardTool implements McpTool {
             "functionAddress", Map.of("type", "string", "description", "Address of the function in hex"),
             "functionName", Map.of("type", "string", "description", "Function name"),
             "variableName", Map.of("type", "string", "description", "Name of the variable to taint"),
-            "maxDepth", Map.of("type", "integer", "description", "Maximum call depth to follow (default 3)")
+            "maxDepth", Map.of("type", "integer", "description", "Maximum call depth to follow (default 3)"),
+            "decompileTimeout", Map.of("type", "integer", "description",
+                "Per-function decompile timeout in seconds. Pass -1 (or 0) to disable the timeout — useful when running this tool over many large functions in a batch.")
         ));
         schema.put("required", List.of("variableName"));
         return schema;

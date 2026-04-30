@@ -137,10 +137,23 @@ public class MemoryToStructPlugin extends ProgramPlugin {
                         } else if (pointerSize == 4) {
                             pointerValue = memory.getInt(currentAddr) & 0xFFFFFFFFL;
                         }
-                        
+
                         // Check if this looks like a valid address
-                        Address targetAddr = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(pointerValue);
-                        
+                        AddressSpace defSpace = currentProgram.getAddressFactory().getDefaultAddressSpace();
+                        Address targetAddr = defSpace.getAddress(pointerValue);
+                        // ARM/Thumb function pointers carry a low-bit marker; the symbol
+                        // lives at the cleared address. Prefer the aligned form when it
+                        // resolves to a function and the raw form does not.
+                        if (targetAddr != null && (pointerValue & 1L) != 0) {
+                            FunctionManager fm = currentProgram.getFunctionManager();
+                            if (fm.getFunctionAt(targetAddr) == null) {
+                                Address aligned = defSpace.getAddress(pointerValue & ~1L);
+                                if (aligned != null && fm.getFunctionAt(aligned) != null) {
+                                    targetAddr = aligned;
+                                }
+                            }
+                        }
+
                         // Get field name based on what this pointer references
                         String fieldName = getFieldNameForPointer(currentAddr, targetAddr, symbolTable, refMgr);
                         

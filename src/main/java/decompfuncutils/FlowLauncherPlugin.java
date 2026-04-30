@@ -114,7 +114,23 @@ public class FlowLauncherPlugin extends ProgramPlugin {
             parent = KeyboardFocusManager.getCurrentKeyboardFocusManager().getActiveWindow();
         }
 
-        dialog = new FlowLauncherDialog(parent);
+        // Capture the originating component provider BEFORE the dialog steals
+        // focus — once the dialog is up, getActiveComponentProvider() returns
+        // null or stale data, so deferred actions like "Rename Function" fail
+        // their isEnabledForContext check and silently no-op.
+        docking.ComponentProvider origin = null;
+        ActionContext originContext = null;
+        try {
+            DockingWindowManager dwm = DockingWindowManager.getActiveInstance();
+            if (dwm != null) {
+                origin = dwm.getActiveComponentProvider();
+                if (origin != null) {
+                    originContext = origin.getActionContext(null);
+                }
+            }
+        } catch (Exception ignored) {}
+
+        dialog = new FlowLauncherDialog(parent, origin, originContext);
         dialog.setVisible(true);
     }
 
@@ -428,11 +444,12 @@ public class FlowLauncherPlugin extends ProgramPlugin {
     // Navigate to item
     // ===================================================================
 
-    private void navigateToItem(LauncherItem item) {
+    private void navigateToItem(LauncherItem item, docking.ComponentProvider originProvider,
+                                ActionContext originContext) {
         if (item == null) return;
 
         if (item.category == ItemCategory.ACTION) {
-            executeAction(item.actionName);
+            executeAction(item.actionName, originProvider, originContext);
             return;
         }
 
@@ -460,7 +477,8 @@ public class FlowLauncherPlugin extends ProgramPlugin {
         }
     }
 
-    private void executeAction(String actionKey) {
+    private void executeAction(String actionKey, docking.ComponentProvider originProvider,
+                               ActionContext originContext) {
         if (actionKey == null) return;
         String[] parts = actionKey.split("\\|", 2);
         String name = parts[0];
@@ -470,39 +488,75 @@ public class FlowLauncherPlugin extends ProgramPlugin {
         SwingUtilities.invokeLater(() -> {
             try {
                 Set<DockingActionIf> allActions = tool.getAllActions();
+                DockingActionIf foundAction = null;
+                String enabledFailureReason = null;
+
                 for (DockingActionIf action : allActions) {
-                    if (action.getName().equals(name)
-                            && (owner == null || action.getOwner().equals(owner))) {
-                        // Try to get a meaningful context from the active provider
-                        ActionContext ctx = null;
+                    if (!action.getName().equals(name)) continue;
+                    if (owner != null && !action.getOwner().equals(owner)) continue;
+                    foundAction = action;
+
+                    // Try, in order: the context captured before the dialog opened
+                    // (most reliable — this is the listing/decompiler the user was
+                    // actually working in), a fresh pull from the same provider
+                    // (in case state changed), the currently active provider, and
+                    // generic fallbacks.
+                    List<ActionContext> candidates = new ArrayList<>();
+                    if (originContext != null) candidates.add(originContext);
+                    if (originProvider != null) {
                         try {
-                            DockingWindowManager dwm = DockingWindowManager.getActiveInstance();
-                            if (dwm != null) {
-                                docking.ComponentProvider provider = dwm.getActiveComponentProvider();
-                                if (provider != null) {
-                                    ctx = provider.getActionContext(null);
-                                }
-                            }
+                            ActionContext fresh = originProvider.getActionContext(null);
+                            if (fresh != null && fresh != originContext) candidates.add(fresh);
                         } catch (Exception ignored) {}
-
-                        // Fall back to a ProgramActionContext so program-aware actions work
-                        if (ctx == null && currentProgram != null) {
-                            ctx = new ghidra.app.context.ProgramActionContext(null, currentProgram);
+                    }
+                    try {
+                        DockingWindowManager dwm = DockingWindowManager.getActiveInstance();
+                        if (dwm != null) {
+                            docking.ComponentProvider provider = dwm.getActiveComponentProvider();
+                            if (provider != null && provider != originProvider) {
+                                ActionContext c = provider.getActionContext(null);
+                                if (c != null) candidates.add(c);
+                            }
                         }
-                        if (ctx == null) {
-                            ctx = new docking.DefaultActionContext();
-                        }
+                    } catch (Exception ignored) {}
+                    if (currentProgram != null) {
+                        candidates.add(new ghidra.app.context.ProgramActionContext(null, currentProgram));
+                    }
+                    candidates.add(new docking.DefaultActionContext());
 
+                    for (ActionContext ctx : candidates) {
                         if (action.isEnabledForContext(ctx)) {
                             action.actionPerformed(ctx);
                             return;
                         }
                     }
+                    enabledFailureReason = describeContext(originContext, originProvider);
+                }
+
+                if (foundAction != null) {
+                    String hint = enabledFailureReason == null
+                            ? "no available context made it active"
+                            : enabledFailureReason;
+                    tool.setStatusInfo("Action '" + name + "' is not applicable here ("
+                            + hint + "). Place the cursor on a relevant token first.", true);
+                } else {
+                    tool.setStatusInfo("Action '" + name + "' is no longer registered.", true);
                 }
             } catch (Exception e) {
-                Msg.warn(this, "Failed to execute action: " + name);
+                Msg.warn(this, "Failed to execute action: " + name + " — " + e.getMessage());
+                tool.setStatusInfo("Action '" + name + "' failed: " + e.getMessage(), true);
             }
         });
+    }
+
+    private static String describeContext(ActionContext ctx, docking.ComponentProvider provider) {
+        StringBuilder sb = new StringBuilder();
+        if (provider != null) sb.append("from ").append(provider.getName());
+        if (ctx != null) {
+            if (sb.length() > 0) sb.append(", ");
+            sb.append("ctx=").append(ctx.getClass().getSimpleName());
+        }
+        return sb.length() == 0 ? "no context available" : sb.toString();
     }
 
     // ===================================================================
@@ -525,6 +579,11 @@ public class FlowLauncherPlugin extends ProgramPlugin {
         private List<JPanel> resultRows = new ArrayList<>();
         private int selectedIndex = 0;
 
+        /** Component provider that was active before the launcher took focus. */
+        private final docking.ComponentProvider originProvider;
+        /** Action context snapshot from that provider (cursor, selection, etc.). */
+        private final ActionContext originContext;
+
         /** Currently active category filter, null = all */
         private ItemCategory activeFilter = null;
 
@@ -543,8 +602,11 @@ public class FlowLauncherPlugin extends ProgramPlugin {
         /** Debounce timer for search */
         private Timer searchTimer;
 
-        FlowLauncherDialog(Window parent) {
+        FlowLauncherDialog(Window parent, docking.ComponentProvider originProvider,
+                           ActionContext originContext) {
             super(parent, "Flow Launcher", ModalityType.MODELESS);
+            this.originProvider = originProvider;
+            this.originContext = originContext;
             setUndecorated(true);
             setAlwaysOnTop(true);
 
@@ -946,7 +1008,7 @@ public class FlowLauncherPlugin extends ProgramPlugin {
                 navigateToAddress(addrStr);
             } else {
                 closeDialog();
-                navigateToItem(item);
+                navigateToItem(item, originProvider, originContext);
             }
         }
     }

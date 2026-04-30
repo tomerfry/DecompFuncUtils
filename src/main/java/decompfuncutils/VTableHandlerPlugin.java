@@ -336,7 +336,17 @@ public class VTableHandlerPlugin extends ProgramPlugin {
                 if (raw == 0)
                     break; // null terminator
 
-                Address tgt = space.getAddress(raw);
+                // ARM/Thumb pointers carry a low-bit marker; the actual function
+                // entry point lives at the cleared address.
+                Address tgtRaw = space.getAddress(raw);
+                Address tgt = tgtRaw;
+                if (tgtRaw != null && (raw & 1L) != 0
+                        && program.getFunctionManager().getFunctionAt(tgtRaw) == null) {
+                    Address aligned = space.getAddress(raw & ~1L);
+                    if (aligned != null && program.getFunctionManager().getFunctionAt(aligned) != null) {
+                        tgt = aligned;
+                    }
+                }
                 if (tgt == null || !program.getMemory().contains(tgt)) {
                     badStreak++;
                 } else {

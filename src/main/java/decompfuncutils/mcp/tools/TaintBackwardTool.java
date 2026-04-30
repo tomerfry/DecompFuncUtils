@@ -4,6 +4,7 @@ import decompfuncutils.InterproceduralTaintAnalyzer;
 import decompfuncutils.InterproceduralTaintAnalyzer.TaintPath;
 import decompfuncutils.mcp.DecompInterfacePool;
 import decompfuncutils.mcp.McpTool;
+import decompfuncutils.mcp.McpUtil;
 import decompfuncutils.mcp.StringTaintLog;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
@@ -37,7 +38,9 @@ public class TaintBackwardTool implements McpTool {
             "functionAddress", Map.of("type", "string", "description", "Address of the function in hex"),
             "functionName", Map.of("type", "string", "description", "Function name"),
             "variableName", Map.of("type", "string", "description", "Name of the variable to trace"),
-            "maxDepth", Map.of("type", "integer", "description", "Maximum call depth to follow (default 3)")
+            "maxDepth", Map.of("type", "integer", "description", "Maximum call depth to follow (default 3)"),
+            "decompileTimeout", Map.of("type", "integer", "description",
+                "Per-function decompile timeout in seconds. Pass -1 (or 0) to disable the timeout — useful when running this tool over many large functions in a batch.")
         ));
         schema.put("required", List.of("variableName"));
         return schema;
@@ -64,12 +67,14 @@ public class TaintBackwardTool implements McpTool {
 
         String varName = (String) arguments.get("variableName");
         int maxDepth = ((Number) arguments.getOrDefault("maxDepth", 3)).intValue();
+        int decompileTimeout = McpUtil.resolveDecompileTimeout(arguments.get("decompileTimeout"), 30);
+        TaskMonitor monitor = McpUtil.activeMonitor();
 
         // Decompile to get HighFunction
         DecompInterface decomp = decompPool.acquire(program);
         HighFunction highFunc;
         try {
-            DecompileResults results = decomp.decompileFunction(func, 30, TaskMonitor.DUMMY);
+            DecompileResults results = decomp.decompileFunction(func, decompileTimeout, monitor);
             if (!results.decompileCompleted()) {
                 throw new RuntimeException("Decompilation failed: " + results.getErrorMessage());
             }
@@ -130,7 +135,8 @@ public class TaintBackwardTool implements McpTool {
         StringTaintLog logPanel = new StringTaintLog(tool);
         InterproceduralTaintAnalyzer analyzer = new InterproceduralTaintAnalyzer(program, logPanel);
         analyzer.setMaxDepth(maxDepth);
-        analyzer.analyze(highFunc, targetVarnode, forward, TaskMonitor.DUMMY);
+        analyzer.setDecompileTimeout(decompileTimeout);
+        analyzer.analyze(highFunc, targetVarnode, forward, monitor);
 
         // Build result
         List<Map<String, Object>> paths = new ArrayList<>();
@@ -148,6 +154,8 @@ public class TaintBackwardTool implements McpTool {
         result.put("variable", varName);
         result.put("direction", forward ? "forward" : "backward");
         result.put("maxDepth", maxDepth);
+        result.put("decompileTimeout", decompileTimeout == Integer.MAX_VALUE ? "disabled" : decompileTimeout);
+        result.put("cancelled", monitor.isCancelled());
         result.put("dangerousPaths", paths);
         result.put("pathCount", paths.size());
         result.put("log", logPanel.getOutput());

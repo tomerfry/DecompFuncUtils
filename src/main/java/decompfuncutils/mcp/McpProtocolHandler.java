@@ -6,6 +6,8 @@ import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
 
 import ghidra.util.Msg;
+import ghidra.util.task.TaskMonitor;
+import ghidra.util.task.TaskMonitorAdapter;
 
 import javax.swing.SwingUtilities;
 import java.lang.reflect.InvocationTargetException;
@@ -46,6 +48,11 @@ public class McpProtocolHandler {
     private static final long EDT_TIMEOUT_MS = 60_000;
     private final Semaphore edtSemaphore = new Semaphore(1);
 
+    // Active per-request cancellation monitors keyed by JSON-RPC request id.
+    // Long-running tools (taint analysis) poll the monitor; the client can
+    // cancel via a `notifications/cancelled` notification carrying the same id.
+    private final ConcurrentHashMap<String, TaskMonitor> activeRequests = new ConcurrentHashMap<>();
+
     public McpProtocolHandler(McpToolRegistry toolRegistry,
                               Supplier<Program> programSupplier,
                               Supplier<PluginTool> toolSupplier) {
@@ -83,6 +90,12 @@ public class McpProtocolHandler {
             return null;
         }
 
+        // Register a per-request cancellable monitor so the client can interrupt
+        // long-running tools by sending notifications/cancelled.
+        String requestKey = idElement.isJsonPrimitive() ? idElement.getAsString() : idElement.toString();
+        TaskMonitor monitor = new CancellingTaskMonitor();
+        activeRequests.put(requestKey, monitor);
+        McpUtil.setActiveMonitor(monitor);
         try {
             Object result = dispatch(method, params, sessionId);
             return successResponse(idElement, result);
@@ -91,7 +104,18 @@ public class McpProtocolHandler {
         } catch (Exception e) {
             Msg.warn(this, "Error handling " + method + ": " + e.getMessage());
             return errorResponse(idElement, -32603, "Internal error: " + e.getMessage());
+        } finally {
+            activeRequests.remove(requestKey);
+            McpUtil.setActiveMonitor(null);
         }
+    }
+
+    /**
+     * Lightweight monitor: only tracks cancellation, ignores progress/messages.
+     * Avoids pulling in Ghidra's full task-monitor UI machinery on the EDT.
+     */
+    private static final class CancellingTaskMonitor extends TaskMonitorAdapter {
+        CancellingTaskMonitor() { setCancelEnabled(true); }
     }
 
     /**
@@ -109,10 +133,24 @@ public class McpProtocolHandler {
                 Msg.info(this, "MCP client initialized");
                 break;
             case "notifications/cancelled":
-                Msg.info(this, "MCP client cancelled request");
+                handleCancellation(params);
                 break;
             default:
                 Msg.debug(this, "Unknown notification: " + method);
+        }
+    }
+
+    private void handleCancellation(JsonObject params) {
+        if (params == null) return;
+        JsonElement reqId = params.get("requestId");
+        if (reqId == null) return;
+        String key = reqId.isJsonPrimitive() ? reqId.getAsString() : reqId.toString();
+        TaskMonitor monitor = activeRequests.get(key);
+        if (monitor != null) {
+            monitor.cancel();
+            Msg.info(this, "MCP cancelled request " + key);
+        } else {
+            Msg.debug(this, "MCP cancellation for unknown request " + key);
         }
     }
 
@@ -281,11 +319,17 @@ public class McpProtocolHandler {
             AtomicReference<Object> resultRef = new AtomicReference<>();
             AtomicReference<Exception> errorRef = new AtomicReference<>();
 
+            // Propagate the per-request monitor onto the EDT so any tool can
+            // honour cancellation regardless of which thread it ends up on.
+            TaskMonitor monitor = McpUtil.activeMonitor();
             SwingUtilities.invokeAndWait(() -> {
+                McpUtil.setActiveMonitor(monitor);
                 try {
                     resultRef.set(tool.execute(arguments, program, pluginTool));
                 } catch (Exception e) {
                     errorRef.set(e);
+                } finally {
+                    McpUtil.setActiveMonitor(null);
                 }
             });
 
@@ -307,7 +351,9 @@ public class McpProtocolHandler {
             AtomicReference<Object> resultRef = new AtomicReference<>();
             AtomicReference<Exception> errorRef = new AtomicReference<>();
 
+            TaskMonitor monitor = McpUtil.activeMonitor();
             SwingUtilities.invokeAndWait(() -> {
+                McpUtil.setActiveMonitor(monitor);
                 int txId = program.startTransaction("MCP: " + tool.name());
                 boolean success = false;
                 try {
@@ -317,6 +363,7 @@ public class McpProtocolHandler {
                     errorRef.set(e);
                 } finally {
                     program.endTransaction(txId, success);
+                    McpUtil.setActiveMonitor(null);
                 }
             });
 

@@ -5,6 +5,7 @@ import decompfuncutils.TaintQueryMatcher;
 import decompfuncutils.TaintQueryMatcher.QueryMatch;
 import decompfuncutils.TaintQuery;
 import decompfuncutils.mcp.McpTool;
+import decompfuncutils.mcp.McpUtil;
 import decompfuncutils.mcp.StringTaintLog;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
@@ -36,7 +37,9 @@ public class TaintQueryTool implements McpTool {
                 "Taint query DSL string. Example: PATTERN buf_overflow { memcpy($dst, $src, $len); } WHERE tainted($len)"),
             "functionAddress", Map.of("type", "string", "description", "Restrict search to a single function (address in hex). If omitted, scans all functions."),
             "functionName", Map.of("type", "string", "description", "Restrict search to a single function by name."),
-            "maxFunctions", Map.of("type", "integer", "description", "Maximum number of functions to scan when searching all (default 1000)")
+            "maxFunctions", Map.of("type", "integer", "description", "Maximum number of functions to scan when searching all (default 1000)"),
+            "decompileTimeout", Map.of("type", "integer", "description",
+                "Per-function decompile timeout in seconds. Pass -1 (or 0) to disable the timeout — useful for batch scans across many large functions where the 30s default truncates and silently drops matches.")
         ));
         schema.put("required", List.of("query"));
         return schema;
@@ -46,6 +49,8 @@ public class TaintQueryTool implements McpTool {
     public Object execute(Map<String, Object> arguments, Program program, PluginTool tool) throws Exception {
         String queryStr = (String) arguments.get("query");
         int maxFunctions = ((Number) arguments.getOrDefault("maxFunctions", 1000)).intValue();
+        int decompileTimeout = McpUtil.resolveDecompileTimeout(arguments.get("decompileTimeout"), 30);
+        TaskMonitor monitor = McpUtil.activeMonitor();
 
         // Parse the query
         TaintQueryParser parser = new TaintQueryParser();
@@ -81,10 +86,11 @@ public class TaintQueryTool implements McpTool {
             int functionsScanned = 0;
 
             for (Function func : functions) {
+                if (monitor.isCancelled()) break;
                 functionsScanned++;
 
                 // Decompile to get HighFunction
-                DecompileResults results = decomp.decompileFunction(func, 30, TaskMonitor.DUMMY);
+                DecompileResults results = decomp.decompileFunction(func, decompileTimeout, monitor);
                 if (!results.decompileCompleted()) continue;
                 HighFunction highFunc = results.getHighFunction();
                 if (highFunc == null) continue;
@@ -105,6 +111,8 @@ public class TaintQueryTool implements McpTool {
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("query", queryStr);
             result.put("functionsScanned", functionsScanned);
+            result.put("decompileTimeout", decompileTimeout == Integer.MAX_VALUE ? "disabled" : decompileTimeout);
+            result.put("cancelled", monitor.isCancelled());
             result.put("matches", matches);
             result.put("matchCount", matches.size());
             return result;

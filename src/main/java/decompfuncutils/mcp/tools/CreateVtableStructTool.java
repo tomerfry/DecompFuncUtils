@@ -4,6 +4,7 @@ import decompfuncutils.mcp.McpTool;
 import decompfuncutils.mcp.McpUtil;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
@@ -86,8 +87,9 @@ public class CreateVtableStructTool implements McpTool {
                 scanStopDetail = e.getMessage();
                 break;
             }
-            Address target = program.getAddressFactory().getDefaultAddressSpace().getAddress(value);
-            Function func = fm.getFunctionAt(target);
+            AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
+            Function func = McpUtil.resolveFunctionFromPointer(value, space, fm);
+            Address target = (func != null) ? func.getEntryPoint() : space.getAddress(value);
             if (func == null) {
                 scanStopReason = "unresolved_target";
                 scanStopAt = cursor.toString();
@@ -240,8 +242,8 @@ public class CreateVtableStructTool implements McpTool {
                                               FunctionManager fm, Program program) {
         try {
             long value = (ptrSize == 8) ? memory.getLong(slot) : memory.getInt(slot) & 0xFFFFFFFFL;
-            Address target = program.getAddressFactory().getDefaultAddressSpace().getAddress(value);
-            return fm.getFunctionAt(target);
+            return McpUtil.resolveFunctionFromPointer(value,
+                    program.getAddressFactory().getDefaultAddressSpace(), fm);
         } catch (Exception e) {
             return null;
         }
