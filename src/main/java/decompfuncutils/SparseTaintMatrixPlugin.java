@@ -13,6 +13,9 @@ import ghidra.app.plugin.ProgramPlugin;
 import ghidra.app.plugin.core.decompile.DecompilerActionContext;
 import ghidra.app.decompiler.*;
 import ghidra.app.decompiler.component.DecompilerPanel;
+import ghidra.app.decompiler.CTokenHighlightMatcher;
+import ghidra.app.decompiler.DecompilerHighlightService;
+import ghidra.app.decompiler.DecompilerHighlighter;
 import ghidra.program.model.pcode.*;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Program;
@@ -71,6 +74,12 @@ public class SparseTaintMatrixPlugin extends ProgramPlugin {
     // Current analysis state
     private TaintMatrixConverter.CsrData currentData;
     private float[] currentTaintVector;
+
+    // Highlight state (Ghidra >= 11 service-based highlighting)
+    private DecompilerHighlighter taintHighlighter;
+    private DecompilerHighlighter sourceSinkHighlighter;
+    private final Map<Varnode, Color> taintColors = new HashMap<>();
+    private final Map<Varnode, Color> sourceSinkColors = new HashMap<>();
     
     public SparseTaintMatrixPlugin(PluginTool tool) {
         super(tool);
@@ -92,7 +101,8 @@ public class SparseTaintMatrixPlugin extends ProgramPlugin {
         Msg.info(this, "=== SparseTaintMatrixPlugin ready ===");
         Msg.info(this, "Right-click on variable in Decompiler → Taint Analysis menu");
     }
-    
+
+
     private void createActions() {
         // Show Log Panel
         DockingAction showLogAction = new DockingAction("Show Taint Log", getName()) {
@@ -383,16 +393,10 @@ public class SparseTaintMatrixPlugin extends ProgramPlugin {
         
         currentData = data;
         currentTaintVector = taintVector;
-        
-        ClangTokenGroup root = dac.getCCodeModel();
-        if (root != null) {
-            highlightTaintedTokens(root, taintVector, data);
-        }
-        
-        DecompilerPanel panel = dac.getDecompilerPanel();
-        if (panel != null) panel.repaint();
+
+        highlightTaintedTokens(highFunc.getFunction(), taintVector, data);
     }
-    
+
     // ===================== Single Function Analysis =====================
     
     private void runSingleFunctionTaint(DecompilerActionContext dac, boolean forward) {
@@ -549,16 +553,10 @@ public class SparseTaintMatrixPlugin extends ProgramPlugin {
         // Store results and highlight
         currentData = forward ? data : workingData;
         currentTaintVector = taintVector;
-        
-        ClangTokenGroup root = dac.getCCodeModel();
-        if (root != null) {
-            highlightTaintedTokens(root, taintVector, workingData);
-        }
-        
-        DecompilerPanel panel = dac.getDecompilerPanel();
-        if (panel != null) panel.repaint();
-        
-        tool.setStatusInfo(String.format("Taint analysis: %d variables tainted (%d ms)", 
+
+        highlightTaintedTokens(highFunc.getFunction(), taintVector, workingData);
+
+        tool.setStatusInfo(String.format("Taint analysis: %d variables tainted (%d ms)",
             tainted.size(), elapsed));
     }
     
@@ -608,85 +606,100 @@ public class SparseTaintMatrixPlugin extends ProgramPlugin {
         }
         
         // Highlight
-        ClangTokenGroup root = dac.getCCodeModel();
-        if (root != null) {
-            highlightSourcesSinks(root, sourceVarnodes, sinkVarnodes);
-        }
-        
-        DecompilerPanel panel = dac.getDecompilerPanel();
-        if (panel != null) panel.repaint();
-        
+        highlightSourcesSinks(func, sourceVarnodes, sinkVarnodes);
+
         tool.setStatusInfo(String.format("Found %d sources, %d sinks", sources.size(), sinks.size()));
     }
     
     // ===================== Highlighting =====================
-    
-    private void highlightTaintedTokens(ClangNode node, float[] taintVector, 
+
+    private DecompilerHighlightService getHighlightService() {
+        DecompilerHighlightService service = tool.getService(DecompilerHighlightService.class);
+        if (service == null) {
+            Msg.warn(this, "DecompilerHighlightService not available; cannot apply highlights");
+        }
+        return service;
+    }
+
+    private void highlightTaintedTokens(Function function, float[] taintVector,
                                         TaintMatrixConverter.CsrData data) {
-        if (node instanceof ClangVariableToken varToken) {
-            Varnode vn = varToken.getVarnode();
-            if (vn != null) {
-                Integer id = data.varnodeToId.get(vn);
-                if (id != null && id < taintVector.length) {
-                    float taint = taintVector[id];
-                    if (taint >= THRESHOLD_HIGH) {
-                        varToken.setHighlight(COLOR_TAINT_HIGH);
-                    } else if (taint >= THRESHOLD_MEDIUM) {
-                        varToken.setHighlight(COLOR_TAINT_MEDIUM);
-                    } else if (taint >= THRESHOLD_LOW) {
-                        varToken.setHighlight(COLOR_TAINT_LOW);
-                    }
+        taintColors.clear();
+        for (Map.Entry<Varnode, Integer> entry : data.varnodeToId.entrySet()) {
+            int id = entry.getValue();
+            if (id < 0 || id >= taintVector.length) continue;
+            float taint = taintVector[id];
+            Color color;
+            if (taint >= THRESHOLD_HIGH) {
+                color = COLOR_TAINT_HIGH;
+            } else if (taint >= THRESHOLD_MEDIUM) {
+                color = COLOR_TAINT_MEDIUM;
+            } else if (taint >= THRESHOLD_LOW) {
+                color = COLOR_TAINT_LOW;
+            } else {
+                continue;
+            }
+            taintColors.put(entry.getKey(), color);
+        }
+
+        if (taintHighlighter == null) {
+            DecompilerHighlightService service = getHighlightService();
+            if (service == null) return;
+            CTokenHighlightMatcher matcher = token -> {
+                if (token instanceof ClangVariableToken varToken) {
+                    return taintColors.get(varToken.getVarnode());
                 }
-            }
+                return null;
+            };
+            taintHighlighter = service.createHighlighter(
+                "DecompFuncUtils.Taint", function, matcher);
         }
-        if (node instanceof ClangTokenGroup group) {
-            for (int i = 0; i < group.numChildren(); i++) {
-                highlightTaintedTokens(group.Child(i), taintVector, data);
-            }
-        }
+        taintHighlighter.applyHighlights();
     }
-    
-    private void highlightSourcesSinks(ClangNode node, Set<Varnode> sources, Set<Varnode> sinks) {
-        if (node instanceof ClangVariableToken varToken) {
-            Varnode vn = varToken.getVarnode();
-            if (vn != null) {
-                if (sinks.contains(vn)) {
-                    varToken.setHighlight(COLOR_SINK);
-                } else if (sources.contains(vn)) {
-                    varToken.setHighlight(COLOR_SOURCE);
+
+    private void highlightSourcesSinks(Function function, Set<Varnode> sources, Set<Varnode> sinks) {
+        sourceSinkColors.clear();
+        for (Varnode vn : sources) {
+            sourceSinkColors.put(vn, COLOR_SOURCE);
+        }
+        // Sinks override sources (matches prior behavior).
+        for (Varnode vn : sinks) {
+            sourceSinkColors.put(vn, COLOR_SINK);
+        }
+
+        if (sourceSinkHighlighter == null) {
+            DecompilerHighlightService service = getHighlightService();
+            if (service == null) return;
+            CTokenHighlightMatcher matcher = token -> {
+                if (token instanceof ClangVariableToken varToken) {
+                    return sourceSinkColors.get(varToken.getVarnode());
                 }
-            }
+                return null;
+            };
+            sourceSinkHighlighter = service.createHighlighter(
+                "DecompFuncUtils.SourcesSinks", function, matcher);
         }
-        if (node instanceof ClangTokenGroup group) {
-            for (int i = 0; i < group.numChildren(); i++) {
-                highlightSourcesSinks(group.Child(i), sources, sinks);
-            }
-        }
+        sourceSinkHighlighter.applyHighlights();
     }
-    
+
     private void clearHighlights(DecompilerActionContext dac) {
-        ClangTokenGroup root = dac.getCCodeModel();
-        if (root != null) {
-            clearHighlightsRecursive(root);
+        taintColors.clear();
+        sourceSinkColors.clear();
+
+        if (taintHighlighter != null) {
+            taintHighlighter.clearHighlights();
+            taintHighlighter.dispose();
+            taintHighlighter = null;
         }
-        DecompilerPanel panel = dac.getDecompilerPanel();
-        if (panel != null) panel.repaint();
-        
+        if (sourceSinkHighlighter != null) {
+            sourceSinkHighlighter.clearHighlights();
+            sourceSinkHighlighter.dispose();
+            sourceSinkHighlighter = null;
+        }
+
         currentData = null;
         currentTaintVector = null;
-        
+
         tool.setStatusInfo("Highlights cleared");
-    }
-    
-    private void clearHighlightsRecursive(ClangNode node) {
-        if (node instanceof ClangToken token) {
-            token.setHighlight(null);
-        }
-        if (node instanceof ClangTokenGroup group) {
-            for (int i = 0; i < group.numChildren(); i++) {
-                clearHighlightsRecursive(group.Child(i));
-            }
-        }
     }
     
     // ===================== Utilities =====================
@@ -736,6 +749,14 @@ public class SparseTaintMatrixPlugin extends ProgramPlugin {
     protected void dispose() {
         if (currentAnalyzer != null) {
             currentAnalyzer.dispose();
+        }
+        if (taintHighlighter != null) {
+            taintHighlighter.dispose();
+            taintHighlighter = null;
+        }
+        if (sourceSinkHighlighter != null) {
+            sourceSinkHighlighter.dispose();
+            sourceSinkHighlighter = null;
         }
         super.dispose();
     }
