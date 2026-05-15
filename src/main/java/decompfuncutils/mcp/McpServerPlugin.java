@@ -175,6 +175,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         // Constraint / symbolic-lite analysis
         toolRegistry.register(new PathConstraintsTool(decompPool));
         toolRegistry.register(new SuggestBranchFlipTool(decompPool));
+        toolRegistry.register(new FindIntegerTruncationTool(decompPool));
 
         protocolHandler = new McpProtocolHandler(
             toolRegistry,

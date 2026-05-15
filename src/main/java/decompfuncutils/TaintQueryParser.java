@@ -134,10 +134,18 @@ public class TaintQueryParser {
             "    malloc($size);\n" +
             "} WHERE tainted($a) OR tainted($b)");
 
-        // Integer-truncation → heap-overflow: narrow a 64-bit tainted value
-        // to pass malloc sizing, then copy the full 64-bit value into the buffer.
-        // The cast appears in the decompiler as either `(int)x` (SUBPIECE/CAST)
-        // or `x & 0xffffffff` (INT_AND) depending on compiler optimisation.
+        // Integer-truncation → heap-overflow.
+        //
+        // NOTE (field note 2026-04-17): these two DSL patterns are kept for
+        // completeness but do NOT reliably fire on real binaries. The cast
+        // almost never decompiles as a stand-alone statement — it is folded
+        // into `malloc((int)x)` / `malloc(x & 0xffffffff)`, so there is no
+        // ClangStatement whose stmtAddr maps to a SUBPIECE / INT_AND with
+        // the right shape, and the three-statement sequence below never
+        // matches. For real audits use the dedicated MCP tool
+        // `ghidra_find_integer_truncation`, which walks the p-code def-use
+        // chain of every alloc/copy size argument directly and cross-
+        // references shared sources at different widths.
         BUILTIN_PATTERNS.put("int_trunc_heap_overflow",
             "PATTERN int_trunc_heap_overflow {\n" +
             "    $small = (int)$big;\n" +
@@ -145,7 +153,8 @@ public class TaintQueryParser {
             "    memcpy($buf, $src, $big);\n" +
             "} WHERE tainted($big)");
 
-        // Variant: same bug expressed via bitmask truncation.
+        // Variant: same bug expressed via bitmask truncation. Same caveat as
+        // above — prefer `ghidra_find_integer_truncation`.
         BUILTIN_PATTERNS.put("int_trunc_heap_overflow_mask",
             "PATTERN int_trunc_heap_overflow_mask {\n" +
             "    $small = $big & 0xffffffff;\n" +
