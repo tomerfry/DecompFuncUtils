@@ -45,6 +45,11 @@ public class TaintQueryTool implements McpTool {
         return schema;
     }
 
+    // Read-only analysis: creates a private DecompInterface, only reads Program
+    // data, and logs to a headless StringTaintLog. Running off the EDT keeps the
+    // Ghidra UI responsive while long multi-function scans execute.
+    @Override public boolean requiresEdt() { return false; }
+
     @Override
     public Object execute(Map<String, Object> arguments, Program program, PluginTool tool) throws Exception {
         String queryStr = (String) arguments.get("query");
