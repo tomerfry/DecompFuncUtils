@@ -178,6 +178,9 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         toolRegistry.register(new SuggestBranchFlipTool(decompPool));
         toolRegistry.register(new FindIntegerTruncationTool(decompPool));
 
+        // GUI
+        toolRegistry.register(new ScreenshotTool());
+
         protocolHandler = new McpProtocolHandler(
             toolRegistry,
             this::getCurrentProgram,

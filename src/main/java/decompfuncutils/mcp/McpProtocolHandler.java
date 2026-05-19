@@ -29,7 +29,8 @@ public class McpProtocolHandler {
         "ghidra_get_program_info",
         "ghidra_list_open_programs",
         "ghidra_open_program",
-        "ghidra_switch_program"
+        "ghidra_switch_program",
+        "ghidra_screenshot"
     );
 
     private static final String PROTOCOL_VERSION = "2024-11-05";
@@ -269,14 +270,30 @@ public class McpProtocolHandler {
         Map<String, Object> callResult = new LinkedHashMap<>();
         List<Map<String, Object>> content = new ArrayList<>();
 
-        Map<String, Object> textContent = new LinkedHashMap<>();
-        textContent.put("type", "text");
-        if (result instanceof String) {
-            textContent.put("text", result);
+        if (result instanceof McpImageContent) {
+            // Image-bearing result: emit an optional caption + an MCP image block.
+            McpImageContent img = (McpImageContent) result;
+            if (img.caption != null && !img.caption.isEmpty()) {
+                Map<String, Object> caption = new LinkedHashMap<>();
+                caption.put("type", "text");
+                caption.put("text", img.caption);
+                content.add(caption);
+            }
+            Map<String, Object> imageContent = new LinkedHashMap<>();
+            imageContent.put("type", "image");
+            imageContent.put("data", img.base64Data);
+            imageContent.put("mimeType", img.mimeType);
+            content.add(imageContent);
         } else {
-            textContent.put("text", gson.toJson(result));
+            Map<String, Object> textContent = new LinkedHashMap<>();
+            textContent.put("type", "text");
+            if (result instanceof String) {
+                textContent.put("text", result);
+            } else {
+                textContent.put("text", gson.toJson(result));
+            }
+            content.add(textContent);
         }
-        content.add(textContent);
 
         callResult.put("content", content);
         return callResult;
