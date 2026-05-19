@@ -14,7 +14,10 @@ public class EditStructFieldTool implements McpTool {
 
     @Override
     public String description() {
-        return "Edit a structure field: rename, retype, add, or remove a field. Actions: 'rename', 'retype', 'add', 'remove'.";
+        return "Edit a structure field: rename, retype, add, or remove a field. Actions: 'rename', 'retype', 'add', 'remove'. " +
+               "For 'add' with an 'offset', the field overwrites the undefined filler at that offset in place — " +
+               "it does NOT grow the struct or shift later field offsets. Set 'insert' true only when you " +
+               "deliberately want to push every subsequent field down.";
     }
 
     @Override
@@ -27,7 +30,12 @@ public class EditStructFieldTool implements McpTool {
             "fieldName", Map.of("type", "string", "description", "Existing field name (for rename/retype/remove)"),
             "newName", Map.of("type", "string", "description", "New field name (for rename/add)"),
             "newType", Map.of("type", "string", "description", "New data type (for retype/add)"),
-            "offset", Map.of("type", "integer", "description", "Offset for add (appends if not specified)")
+            "offset", Map.of("type", "integer", "description",
+                "Offset for add. The field overwrites the undefined bytes at this offset in place; " +
+                "struct size and later field offsets are unchanged. Appends at the end if not specified."),
+            "insert", Map.of("type", "boolean", "description",
+                "For 'add' with 'offset': if true, INSERT the field — growing the struct and shifting " +
+                "every subsequent field down by the field's length. Default false (overwrite in place).")
         ));
         schema.put("required", List.of("structName", "action"));
         return schema;
@@ -115,16 +123,43 @@ public class EditStructFieldTool implements McpTool {
         DataType newType = RetypeVariableTool.resolveDataType(newTypeName, program);
         if (newType == null) throw new IllegalArgumentException("Unknown type: " + newTypeName);
 
+        int sizeBefore = struct.getLength();
+        String placement;
+
         if (args.containsKey("offset")) {
             int offset = ((Number) args.get("offset")).intValue();
-            struct.insertAtOffset(offset, newType, newType.getLength(), newName, null);
+            boolean insert = Boolean.TRUE.equals(args.get("insert"));
+            if (insert) {
+                // Explicit insert: shifts every following field down by the
+                // field's length. Only correct when deliberately growing the
+                // layout — corrupts a fixed/recovered layout otherwise.
+                struct.insertAtOffset(offset, newType, newType.getLength(), newName, null);
+                placement = "inserted";
+            } else {
+                // Default: overwrite the undefined filler bytes at this offset
+                // in place. Does NOT grow the struct or shift the offsets of
+                // subsequent fields — the correct behaviour for placing a field
+                // into a fixed-size, memory-recovered structure layout.
+                struct.replaceAtOffset(offset, newType, newType.getLength(), newName, null);
+                placement = "replaced";
+            }
         } else {
             struct.add(newType, newName, null);
+            placement = "appended";
         }
 
-        return Map.of("struct", struct.getName(), "action", "add",
-            "field", newName, "type", newType.getDisplayName(),
-            "newSize", struct.getLength(), "status", "field_added");
+        int sizeAfter = struct.getLength();
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("struct", struct.getName());
+        result.put("action", "add");
+        result.put("field", newName);
+        result.put("type", newType.getDisplayName());
+        result.put("placement", placement);
+        result.put("sizeBefore", sizeBefore);
+        result.put("newSize", sizeAfter);
+        result.put("status", "field_added");
+        return result;
     }
 
     private Object doRemove(Map<String, Object> args, Structure struct) {
