@@ -34,8 +34,10 @@ import ghidra.framework.plugintool.*;
 import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressFactory;
+import ghidra.program.model.data.StringDataInstance;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
+import ghidra.program.util.DefinedDataIterator;
 import ghidra.util.Msg;
 
 import java.awt.*;
@@ -259,27 +261,29 @@ public class FlowLauncherPlugin extends ProgramPlugin {
     }
 
     private void indexStrings(Program program, List<LauncherItem> items) {
-        DataIterator iter = program.getListing().getDefinedData(true);
+        // Use DefinedDataIterator so strings nested inside structs and arrays are
+        // indexed too. getListing().getDefinedData() only yields top-level data
+        // items, so string members of composite types (struct fields, string
+        // arrays) were silently dropped — that's why some strings that clearly
+        // exist in a binary never showed up in the launcher.
+        DataIterator iter = DefinedDataIterator.byDataInstance(program, StringDataInstance::isString);
         int count = 0;
-        int limit = 20000;
+        int limit = 50000;
         while (iter.hasNext() && count < limit) {
             Data data = iter.next();
-            if (data.hasStringValue()) {
-                try {
-                    Object val = data.getValue();
-                    if (val instanceof String s && !s.isEmpty()) {
-                        String display = s;
-                        if (display.length() > 80) {
-                            display = display.substring(0, 77) + "...";
-                        }
-                        String detail = data.getAddress().toString()
-                                + " [" + data.getDataType().getName() + "]";
-                        items.add(new LauncherItem("\"" + display + "\"", detail,
-                                ItemCategory.STRING, data.getAddress(), null));
-                        count++;
-                    }
-                } catch (Exception ignored) {}
-            }
+            try {
+                String s = StringDataInstance.getStringDataInstance(data).getStringValue();
+                if (s == null || s.isEmpty()) continue;
+                String display = s;
+                if (display.length() > 80) {
+                    display = display.substring(0, 77) + "...";
+                }
+                String detail = data.getAddress().toString()
+                        + " [" + data.getDataType().getName() + "]";
+                items.add(new LauncherItem("\"" + display + "\"", detail,
+                        ItemCategory.STRING, data.getAddress(), null));
+                count++;
+            } catch (Exception ignored) {}
         }
     }
 
