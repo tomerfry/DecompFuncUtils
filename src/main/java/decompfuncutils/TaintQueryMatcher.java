@@ -220,9 +220,24 @@ public class TaintQueryMatcher {
     }
 
     /**
-     * Search for pattern matches in a single function with pre-provided markup
+     * Search for pattern matches in a single function with pre-provided markup.
+     * Accumulates into the shared {@code matches} list (used by whole-program scans).
      */
     public List<QueryMatch> matchInFunctionWithMarkup(TaintQuery query, HighFunction highFunc, ClangTokenGroup root) {
+        return matchInFunctionWithMarkup(query, highFunc, root, false);
+    }
+
+    /**
+     * Search for pattern matches in a single function with pre-provided markup.
+     *
+     * @param clearFirst when true, reset the match list before searching so the
+     *        returned list contains only this function's matches. Per-function
+     *        callers (e.g. the MCP taint-query tool) pass true; the whole-program
+     *        scanner passes false because it clears once and accumulates.
+     */
+    public List<QueryMatch> matchInFunctionWithMarkup(TaintQuery query, HighFunction highFunc,
+                                                      ClangTokenGroup root, boolean clearFirst) {
+        if (clearFirst) matches.clear();
         if (highFunc == null || root == null) return matches;
         
         Function func = highFunc.getFunction();

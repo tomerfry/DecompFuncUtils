@@ -11,6 +11,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.symbol.FlowType;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
@@ -37,6 +38,7 @@ public class EmulateFunctionTool implements McpTool {
     private static final int MAX_MEM_WRITE_INLINE_HEX = 256;
     private static final int MAX_FINAL_REGS = 128;
     private static final int MAX_BRANCH_TRACE = 5000;
+    private static final int MAX_SKIPPED_CALLS = 2000;
     private static final int DEFAULT_SYMBOLIC_EXPR_DEPTH = 8;
 
     private final DecompInterfacePool decompPool;
@@ -98,6 +100,18 @@ public class EmulateFunctionTool implements McpTool {
         props.put("includeScratch", Map.of("type", "boolean",
             "description", "If true, also include writes to the p-code 'unique' (scratch) space in 'scratchWrites'. " +
                 "Usually noise; default false."));
+        props.put("skipCalls", Map.of("type", "boolean",
+            "description", "If true, automatically step over CALL instructions whose target cannot be emulated " +
+                "(external/imported functions, PLT thunks, or addresses with no initialized bytes) instead of " +
+                "faulting with 'instruction decode failed'. Execution resumes at the call's fall-through. " +
+                "Internal calls and indirect calls with unknown targets are still executed normally. " +
+                "Skipped calls are reported in 'skippedCalls'. Default false."));
+        props.put("skipCallReturnRegister", Map.of("type", "string",
+            "description", "When skipCalls is set, optionally seed this register with 'skipCallReturnValue' after " +
+                "each skipped call (e.g. a return-value register like 'RAX'/'EAX'/'r0'). If omitted, the register " +
+                "is left untouched."));
+        props.put("skipCallReturnValue", Map.of("type", "string",
+            "description", "Value (decimal or 0x-hex) written to skipCallReturnRegister after each skipped call (default 0)."));
         schema.put("properties", props);
         schema.put("required", List.of("entry"));
         return schema;
@@ -121,6 +135,9 @@ public class EmulateFunctionTool implements McpTool {
             "symbolicExpressionDepth", DEFAULT_SYMBOLIC_EXPR_DEPTH)).intValue();
         boolean trackMemoryWrites = !Boolean.FALSE.equals(arguments.get("trackMemoryWrites"));
         boolean includeScratch = Boolean.TRUE.equals(arguments.get("includeScratch"));
+        boolean skipCalls = Boolean.TRUE.equals(arguments.get("skipCalls"));
+        String skipRetRegName = (String) arguments.get("skipCallReturnRegister");
+        String skipRetValStr = (String) arguments.get("skipCallReturnValue");
 
         Map<String, Object> regSeeds = (Map<String, Object>)
             arguments.getOrDefault("registers", Collections.emptyMap());
@@ -193,6 +210,14 @@ public class EmulateFunctionTool implements McpTool {
             Register pcReg = emu.getPCRegister();
             emu.writeRegister(pcReg, entry.getOffset());
 
+            // --- Resolve optional skip-call return register/value ---
+            Register skipRetReg = (skipCalls && skipRetRegName != null && !skipRetRegName.isEmpty())
+                ? program.getLanguage().getRegister(skipRetRegName) : null;
+            BigInteger skipRetVal = (skipRetReg != null)
+                ? parseBigInt(skipRetValStr != null && !skipRetValStr.isEmpty() ? skipRetValStr : "0")
+                : null;
+            List<Map<String, Object>> skippedCalls = new ArrayList<>();
+
             // --- Symbolic resolver (only active when symbolicBranches=true) ---
             SymbolicBranchResolver symResolver =
                 (symbolicBranches && decompPool != null)
@@ -217,8 +242,31 @@ public class EmulateFunctionTool implements McpTool {
                     break;
                 }
 
-                Instruction instr = recordBranches
+                Instruction instr = (recordBranches || skipCalls)
                     ? program.getListing().getInstructionAt(pc) : null;
+
+                // --- Auto-skip un-emulatable external CALLs (opt-in) ---
+                if (skipCalls && instr != null) {
+                    String skippedSym = resolveSkippableCall(program, instr);
+                    if (skippedSym != null) {
+                        Address fall = instr.getFallThrough();
+                        if (fall != null) {
+                            emu.writeRegister(pcReg, fall.getOffset());
+                            if (skipRetReg != null) {
+                                try { emu.writeRegister(skipRetReg, skipRetVal); } catch (Exception ignored) {}
+                            }
+                            if (skippedCalls.size() < MAX_SKIPPED_CALLS) {
+                                Map<String, Object> sc = new LinkedHashMap<>();
+                                sc.put("pc", pc.toString());
+                                sc.put("symbol", skippedSym);
+                                sc.put("resumedAt", fall.toString());
+                                skippedCalls.add(sc);
+                            }
+                            steps++;
+                            continue;
+                        }
+                    }
+                }
 
                 boolean ok;
                 try {
@@ -281,6 +329,14 @@ public class EmulateFunctionTool implements McpTool {
                         result.put("controlledPc", true);
                         result.put("controlledBy", controlled);
                     }
+                }
+            }
+
+            if (skipCalls) {
+                result.put("skippedCalls", skippedCalls);
+                result.put("skippedCallCount", skippedCalls.size());
+                if (skippedCalls.size() >= MAX_SKIPPED_CALLS) {
+                    result.put("skippedCallsTruncated", true);
                 }
             }
 
@@ -419,6 +475,65 @@ public class EmulateFunctionTool implements McpTool {
             bucket.add(mw);
         }
         return out;
+    }
+
+    /**
+     * If {@code instr} is a CALL whose (statically resolvable) target cannot be
+     * emulated, return a short symbol/address label for it so the step loop can
+     * skip over it. Returns null when the instruction is not a call, the target is
+     * unknown (e.g. an indirect call we can't resolve statically), or the target is
+     * an ordinary in-program function that the emulator can execute.
+     */
+    private static String resolveSkippableCall(Program program, Instruction instr) {
+        if (instr == null) return null;
+        FlowType ft = instr.getFlowType();
+        if (ft == null || !ft.isCall()) return null;
+
+        Address[] flows = instr.getFlows();
+        if (flows == null || flows.length == 0) return null; // indirect/unknown — let it run
+
+        for (Address target : flows) {
+            if (isUnemulatableTarget(program, target)) {
+                return symbolLabelFor(program, target);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A target is un-emulatable when it resolves to an external/imported function,
+     * a thunk to an external function, an EXTERNAL memory block, or any address
+     * without initialized bytes for the emulator to decode.
+     */
+    private static boolean isUnemulatableTarget(Program program, Address target) {
+        if (target == null) return false;
+        Function f = program.getFunctionManager().getFunctionAt(target);
+        if (f != null) {
+            if (f.isExternal()) return true;
+            if (f.isThunk()) {
+                Function thunked = f.getThunkedFunction(true);
+                if (thunked != null && thunked.isExternal()) return true;
+            }
+        }
+        MemoryBlock block = program.getMemory().getBlock(target);
+        if (block == null) return true;
+        if ("EXTERNAL".equalsIgnoreCase(block.getName())) return true;
+        if (!block.isInitialized()) return true;
+        return false;
+    }
+
+    private static String symbolLabelFor(Program program, Address target) {
+        Function f = program.getFunctionManager().getFunctionAt(target);
+        if (f != null) {
+            if (f.isThunk()) {
+                Function thunked = f.getThunkedFunction(true);
+                if (thunked != null) return thunked.getName();
+            }
+            return f.getName();
+        }
+        Symbol[] syms = program.getSymbolTable().getSymbols(target);
+        if (syms != null && syms.length > 0) return syms[0].getName();
+        return target.toString();
     }
 
     /**

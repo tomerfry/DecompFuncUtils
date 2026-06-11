@@ -131,22 +131,27 @@ public class TaintBackwardTool implements McpTool {
                 + func.getName() + ". Known variables: " + String.join(", ", availableNames));
         }
 
-        // Run taint analysis
+        // Run taint analysis. The analyzer owns a private DecompInterface, so it
+        // must be disposed even if analysis throws — otherwise every forward/backward
+        // call leaks a decompiler process and its cache.
         StringTaintLog logPanel = new StringTaintLog(tool);
         InterproceduralTaintAnalyzer analyzer = new InterproceduralTaintAnalyzer(program, logPanel);
-        analyzer.setMaxDepth(maxDepth);
-        analyzer.setDecompileTimeout(decompileTimeout);
-        analyzer.analyze(highFunc, targetVarnode, forward, monitor);
-
-        // Build result
         List<Map<String, Object>> paths = new ArrayList<>();
-        for (TaintPath path : analyzer.getFoundPaths()) {
-            Map<String, Object> p = new LinkedHashMap<>();
-            p.put("chain", path.functionChain);
-            p.put("sink", path.sinkName);
-            p.put("sinkFunction", path.sinkFunction);
-            p.put("taintLevel", path.finalTaint);
-            paths.add(p);
+        try {
+            analyzer.setMaxDepth(maxDepth);
+            analyzer.setDecompileTimeout(decompileTimeout);
+            analyzer.analyze(highFunc, targetVarnode, forward, monitor);
+
+            for (TaintPath path : analyzer.getFoundPaths()) {
+                Map<String, Object> p = new LinkedHashMap<>();
+                p.put("chain", path.functionChain);
+                p.put("sink", path.sinkName);
+                p.put("sinkFunction", path.sinkFunction);
+                p.put("taintLevel", path.finalTaint);
+                paths.add(p);
+            }
+        } finally {
+            analyzer.dispose();
         }
 
         Map<String, Object> result = new LinkedHashMap<>();

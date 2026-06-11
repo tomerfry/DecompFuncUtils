@@ -7,6 +7,7 @@ import decompfuncutils.TaintQuery;
 import decompfuncutils.mcp.McpTool;
 import decompfuncutils.mcp.McpUtil;
 import decompfuncutils.mcp.StringTaintLog;
+import ghidra.app.decompiler.ClangTokenGroup;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.framework.plugintool.PluginTool;
@@ -94,13 +95,18 @@ public class TaintQueryTool implements McpTool {
                 if (monitor.isCancelled()) break;
                 functionsScanned++;
 
-                // Decompile to get HighFunction
+                // Decompile once to get both the HighFunction and the C markup the
+                // matcher needs. Reusing results.getCCodeMarkup() avoids a second
+                // decompile pass per function (matchInFunction would otherwise spin
+                // up a fresh DecompInterface and re-decompile just for the markup).
                 DecompileResults results = decomp.decompileFunction(func, decompileTimeout, monitor);
                 if (!results.decompileCompleted()) continue;
                 HighFunction highFunc = results.getHighFunction();
                 if (highFunc == null) continue;
+                ClangTokenGroup markup = results.getCCodeMarkup();
+                if (markup == null) continue;
 
-                List<QueryMatch> queryMatches = matcher.matchInFunction(query, highFunc);
+                List<QueryMatch> queryMatches = matcher.matchInFunctionWithMarkup(query, highFunc, markup, true);
                 for (QueryMatch match : queryMatches) {
                     Map<String, Object> m = new LinkedHashMap<>();
                     m.put("function", func.getName());
