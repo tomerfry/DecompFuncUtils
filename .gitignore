@@ -3,3 +3,6 @@ build/*
 dist/*
 bin/*
 .claude/worktrees/
+
+# headless test scratch (logs, throwaway projects)
+tests/_*

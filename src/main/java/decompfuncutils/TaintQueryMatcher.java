@@ -30,13 +30,22 @@ import java.util.*;
 public class TaintQueryMatcher {
     
     private final Program program;
-    private final TaintLogPanel logPanel;
+    private final TaintLog logPanel;
     private final TaintMatrixConverter converter;
     private final GpuTaintEngine engine;
     
     // Alias tracking for current function being analyzed
     private AliasTracker aliasTracker;
-    
+
+    // Per-function statement index (rebuilt for each function searched). The C
+    // markup tree is walked once into DFS order so getStatementsAfter() is an O(1)
+    // sublist view instead of an O(N) re-walk + fresh allocation on every call —
+    // the dominant cost when a pattern's first element matches many times in a
+    // large function.
+    private List<ClangStatement> orderedStatements;
+    private IdentityHashMap<ClangStatement, Integer> statementIndex;
+    private IdentityHashMap<ClangTokenGroup, Integer> groupStmtEnd;
+
     // Results
     private List<QueryMatch> matches = new ArrayList<>();
     
@@ -61,7 +70,7 @@ public class TaintQueryMatcher {
         }
     }
     
-    public TaintQueryMatcher(Program program, TaintLogPanel logPanel) {
+    public TaintQueryMatcher(Program program, TaintLog logPanel) {
         this.program = program;
         this.logPanel = logPanel;
         this.converter = new TaintMatrixConverter();
@@ -102,8 +111,9 @@ public class TaintQueryMatcher {
             logPanel.logWarning("Could not get C code markup for " + func.getName());
             return matches;
         }
-        
-        // Search for pattern matches
+
+        // Index statements once, then search for pattern matches
+        buildStatementIndex(root);
         searchInTokens(query, root, highFunc, taintCtx, new ArrayList<>());
         
         logPanel.logInfo("Found " + matches.size() + " match(es) in " + func.getName());
@@ -251,10 +261,11 @@ public class TaintQueryMatcher {
         
         // Create taint context
         TaintContextImpl taintCtx = new TaintContextImpl(taintData, highFunc, engine);
-        
-        // Search for pattern matches
+
+        // Index statements once, then search for pattern matches
+        buildStatementIndex(root);
         searchInTokens(query, root, highFunc, taintCtx, new ArrayList<>());
-        
+
         return matches;
     }
     
@@ -1098,18 +1109,59 @@ public class TaintQueryMatcher {
     }
     
     /**
-     * Get all statements after a given statement in the function
+     * Walk the C-markup tree once into DFS pre-order, recording each statement's
+     * position and, for every group, the index one past the last statement in its
+     * subtree. Because a DFS visits a subtree contiguously, "the statements after
+     * {@code start} within its parent block" is then just the half-open index range
+     * (indexOf(start)+1 .. parentSubtreeEnd) — an O(1) sublist view.
+     */
+    private void buildStatementIndex(ClangNode root) {
+        orderedStatements = new ArrayList<>();
+        statementIndex = new IdentityHashMap<>();
+        groupStmtEnd = new IdentityHashMap<>();
+        indexNode(root);
+    }
+
+    private void indexNode(ClangNode node) {
+        if (node instanceof ClangStatement stmt) {
+            statementIndex.put(stmt, orderedStatements.size());
+            orderedStatements.add(stmt);
+        }
+        // ClangStatement also extends ClangTokenGroup, so this runs for statements
+        // too — matching the dual handling in collectStatementsRecursive().
+        if (node instanceof ClangTokenGroup group) {
+            for (int i = 0; i < group.numChildren(); i++) {
+                indexNode(group.Child(i));
+            }
+            groupStmtEnd.put(group, orderedStatements.size());
+        }
+    }
+
+    /**
+     * Get all statements after a given statement within its enclosing block.
+     * Returns an O(1) view backed by the precomputed index; falls back to a tree
+     * walk only if the statement was not indexed.
      */
     private List<ClangStatement> getStatementsAfter(ClangStatement start, HighFunction highFunc) {
+        if (statementIndex != null && groupStmtEnd != null) {
+            Integer idx = statementIndex.get(start);
+            ClangNode parentNode = start.Parent();
+            if (idx != null && parentNode instanceof ClangTokenGroup parent) {
+                Integer end = groupStmtEnd.get(parent);
+                if (end != null) {
+                    int size = orderedStatements.size();
+                    int from = Math.min(idx + 1, size);
+                    int to = Math.min(Math.max(end, from), size);
+                    return orderedStatements.subList(from, to);
+                }
+            }
+        }
+
+        // Fallback: original tree walk (index unavailable for this statement).
         List<ClangStatement> result = new ArrayList<>();
-        
-        // Get all statements in the function
         ClangNode parentNode = start.Parent();
         if (!(parentNode instanceof ClangTokenGroup parent)) return result;
-        
-        boolean found = false;
         collectStatementsRecursive(parent, start, result, new boolean[]{false});
-        
         return result;
     }
     
@@ -2188,66 +2240,134 @@ public class TaintQueryMatcher {
                 if (calleeReachesTaintSource(def)) return true;
             }
 
-            // Pass-through / derived ops — recurse into inputs.
-            switch (op) {
-                case PcodeOp.COPY:
-                case PcodeOp.CAST:
-                case PcodeOp.INT_ZEXT:
-                case PcodeOp.INT_SEXT:
-                case PcodeOp.INT_2COMP:
-                case PcodeOp.INT_NEGATE:
-                case PcodeOp.SUBPIECE:
-                case PcodeOp.PIECE:
-                case PcodeOp.PTRSUB:
-                case PcodeOp.PTRADD:
-                case PcodeOp.INT_ADD:
-                case PcodeOp.INT_SUB:
-                case PcodeOp.INT_MULT:
-                case PcodeOp.INT_DIV:
-                case PcodeOp.INT_AND:
-                case PcodeOp.INT_OR:
-                case PcodeOp.INT_XOR:
-                case PcodeOp.INT_LEFT:
-                case PcodeOp.INT_RIGHT:
-                case PcodeOp.INT_SRIGHT:
-                case PcodeOp.LOAD:
-                case PcodeOp.MULTIEQUAL:
-                case PcodeOp.INDIRECT:
-                    for (int i = 0; i < def.getNumInputs(); i++) {
-                        if (reachesInterproceduralSource(def.getInput(i), visited, depth + 1)) {
-                            return true;
-                        }
-                    }
-                    return false;
-                default:
-                    return false;
+            if (!isTaintPassThroughOp(op)) return false;
+            for (int i = 0; i < def.getNumInputs(); i++) {
+                if (reachesInterproceduralSource(def.getInput(i), visited, depth + 1)) {
+                    return true;
+                }
             }
+            return false;
         }
 
         private boolean calleeReachesTaintSource(PcodeOp callOp) {
+            Function callee = resolveCallee(callOp);
+            return callee != null && TaintQueryMatcher.this.functionTouchesTaintSource(callee);
+        }
+
+        /**
+         * Source-specific taint: does {@code var} carry data that originates from a
+         * call to the named source (e.g. read / recv / fgets) rather than from any
+         * source? Mirrors {@link #isTainted} but restricts the seed set to that one
+         * source. Falls back to plain isTainted() when no source name is given.
+         */
+        @Override
+        public boolean isTaintedBySource(Object var, String sourceName) {
+            if (sourceName == null || sourceName.isEmpty()) return isTainted(var);
+            if (!(var instanceof Varnode vn)) return false;
+
+            // Intra-procedural: seed only from varnodes produced by the named source
+            // (its return value and any buffer it fills), then check matrix
+            // reachability to vn.
+            Set<Varnode> origins = sourceOriginVarnodes(sourceName);
+            if (origins.contains(vn)) return true;
+            Integer varId = data.varnodeToId.get(vn);
+            if (varId != null) {
+                for (Varnode origin : origins) {
+                    Integer originId = data.varnodeToId.get(origin);
+                    if (originId == null) continue;
+                    float[] taintVector = getTaintFromSource(originId);
+                    if (taintVector[varId] > 0.1f) return true;
+                }
+            }
+
+            // Inter-procedural fallback: vn derives from a call whose callee
+            // (transitively) reaches the NAMED source specifically.
+            return reachesNamedSource(vn, sourceName, new HashSet<>(), 0);
+        }
+
+        /**
+         * Varnodes that hold data coming directly out of a call to {@code sourceName}
+         * within this function: the call's return value plus, for buffer-filling
+         * sources (read/recv/fread/...), the pointer argument it writes into.
+         */
+        private Set<Varnode> sourceOriginVarnodes(String sourceName) {
+            Set<Varnode> origins = new HashSet<>();
+            int bufIdx = bufferArgIndex(sourceName);
+            Iterator<PcodeOpAST> ops = highFunc.getPcodeOps();
+            while (ops.hasNext()) {
+                PcodeOpAST op = ops.next();
+                int opc = op.getOpcode();
+                if (opc != PcodeOp.CALL && opc != PcodeOp.CALLIND && opc != PcodeOp.CALLOTHER) continue;
+                String callee = calleeName(op.getInput(0));
+                if (callee == null || !TaintMatrixConverter.nameMatches(callee, sourceName)) continue;
+
+                Varnode out = op.getOutput();
+                if (out != null) origins.add(out);
+                if (bufIdx >= 0 && bufIdx + 1 < op.getNumInputs()) {
+                    Varnode buf = op.getInput(bufIdx + 1);
+                    if (buf != null) origins.add(buf);
+                }
+            }
+            return origins;
+        }
+
+        private boolean reachesNamedSource(Varnode vn, String sourceName, Set<Object> visited, int depth) {
+            if (vn == null || depth > INTERPROC_DEPTH_LIMIT) return false;
+            if (!visited.add(vn)) return false;
+
+            PcodeOp def = vn.getDef();
+            if (def == null) return false;
+            int op = def.getOpcode();
+
+            if (op == PcodeOp.CALL || op == PcodeOp.CALLIND || op == PcodeOp.CALLOTHER) {
+                Function callee = resolveCallee(def);
+                if (callee != null
+                        && TaintQueryMatcher.this.functionTouchesNamedSource(callee, sourceName)) {
+                    return true;
+                }
+            }
+
+            if (!isTaintPassThroughOp(op)) return false;
+            for (int i = 0; i < def.getNumInputs(); i++) {
+                if (reachesNamedSource(def.getInput(i), sourceName, visited, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** Resolve a call op's target to its (thunk-resolved) callee function, or null. */
+        private Function resolveCallee(PcodeOp callOp) {
             Varnode target = callOp.getInput(0);
-            if (target == null || !target.isAddress()) return false;
+            if (target == null || !target.isAddress()) return null;
             Function callee;
             try {
                 callee = highFunc.getFunction().getProgram()
                     .getFunctionManager().getFunctionAt(target.getAddress());
             } catch (Exception e) {
-                return false;
+                return null;
             }
-            if (callee == null) return false;
-
-            // Resolve through one thunk hop to catch PLT entries.
+            if (callee == null) return null;
             if (callee.isThunk() && callee.getThunkedFunction(true) != null) {
                 callee = callee.getThunkedFunction(true);
             }
-
-            return TaintQueryMatcher.this.functionTouchesTaintSource(callee);
+            return callee;
         }
 
-        @Override
-        public boolean isTaintedBySource(Object var, String sourceName) {
-            // For specific source checking - would need more sophisticated tracking
-            return isTainted(var);
+        private String calleeName(Varnode target) {
+            if (target == null || !target.isAddress()) return null;
+            Function f;
+            try {
+                f = highFunc.getFunction().getProgram()
+                    .getFunctionManager().getFunctionAt(target.getAddress());
+            } catch (Exception e) {
+                return null;
+            }
+            if (f == null) return null;
+            if (f.isThunk() && f.getThunkedFunction(true) != null) {
+                f = f.getThunkedFunction(true);
+            }
+            return f.getName();
         }
         
         @Override
@@ -2477,6 +2597,102 @@ public class TaintQueryMatcher {
             }
         }
         return false;
+    }
+
+    // Source-specific variant of sourceTouchCache, keyed by "entry|sourceName" so
+    // tainted($v, "read") and tainted($v, "recv") cache independently.
+    private final Map<String, Boolean> namedSourceTouchCache = new HashMap<>();
+
+    private boolean functionTouchesNamedSource(Function callee, String sourceName) {
+        if (callee == null || sourceName == null) return false;
+        String key = callee.getEntryPoint() + "|" + sourceName;
+        Boolean cached = namedSourceTouchCache.get(key);
+        if (cached != null) return cached;
+
+        // Pre-seed to false so mutual recursion terminates.
+        namedSourceTouchCache.put(key, Boolean.FALSE);
+        boolean result = functionTouchesNamedSource(callee, sourceName, new HashSet<>(), 0);
+        namedSourceTouchCache.put(key, result);
+        return result;
+    }
+
+    private boolean functionTouchesNamedSource(Function callee, String sourceName,
+                                               Set<Address> visited, int depth) {
+        if (callee == null) return false;
+        if (depth > SOURCE_TOUCH_DEPTH_LIMIT) return false;
+        if (!visited.add(callee.getEntryPoint())) return false;
+
+        if (TaintMatrixConverter.nameMatches(callee.getName(), sourceName)) return true;
+        if (callee.isThunk() && callee.getThunkedFunction(true) != null) {
+            Function thunked = callee.getThunkedFunction(true);
+            if (TaintMatrixConverter.nameMatches(thunked.getName(), sourceName)) return true;
+        }
+        if (callee.isExternal()) {
+            // External whose name didn't match: nothing further to inspect.
+            return false;
+        }
+
+        for (Function child : callee.getCalledFunctions(ghidra.util.task.TaskMonitor.DUMMY)) {
+            String childKey = child.getEntryPoint() + "|" + sourceName;
+            Boolean cached = namedSourceTouchCache.get(childKey);
+            if (Boolean.TRUE.equals(cached)) return true;
+            if (cached == null && functionTouchesNamedSource(child, sourceName, visited, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Opcodes through which taint flows unchanged from inputs to output. */
+    private static boolean isTaintPassThroughOp(int op) {
+        switch (op) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.INT_2COMP:
+            case PcodeOp.INT_NEGATE:
+            case PcodeOp.SUBPIECE:
+            case PcodeOp.PIECE:
+            case PcodeOp.PTRSUB:
+            case PcodeOp.PTRADD:
+            case PcodeOp.INT_ADD:
+            case PcodeOp.INT_SUB:
+            case PcodeOp.INT_MULT:
+            case PcodeOp.INT_DIV:
+            case PcodeOp.INT_AND:
+            case PcodeOp.INT_OR:
+            case PcodeOp.INT_XOR:
+            case PcodeOp.INT_LEFT:
+            case PcodeOp.INT_RIGHT:
+            case PcodeOp.INT_SRIGHT:
+            case PcodeOp.LOAD:
+            case PcodeOp.MULTIEQUAL:
+            case PcodeOp.INDIRECT:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Zero-based argument index of the buffer a known source fills, or -1. For these
+     * sources the tainted data lands in a pointer argument, not the return value
+     * (read(fd,buf,n) → buf), so source-specific taint must seed from that arg too.
+     */
+    private static int bufferArgIndex(String sourceName) {
+        if (TaintMatrixConverter.nameMatches(sourceName, "read")
+                || TaintMatrixConverter.nameMatches(sourceName, "pread")
+                || TaintMatrixConverter.nameMatches(sourceName, "recv")
+                || TaintMatrixConverter.nameMatches(sourceName, "recvfrom")) {
+            return 1;
+        }
+        if (TaintMatrixConverter.nameMatches(sourceName, "fread")
+                || TaintMatrixConverter.nameMatches(sourceName, "fgets")
+                || TaintMatrixConverter.nameMatches(sourceName, "gets")) {
+            return 0;
+        }
+        return -1;
     }
 
     public List<QueryMatch> getMatches() {

@@ -18,7 +18,7 @@ public class InterproceduralTaintAnalyzer {
     private final DecompInterface decompiler;
     private final TaintMatrixConverter converter;
     private final GpuTaintEngine engine;
-    private final TaintLogPanel logPanel;
+    private final TaintLog logPanel;
     
     private int maxDepth = 3;
     private int maxIterations = 30;
@@ -62,7 +62,7 @@ public class InterproceduralTaintAnalyzer {
         public List<Float> argTaintLevels = new ArrayList<>();
     }
     
-    public InterproceduralTaintAnalyzer(Program program, TaintLogPanel logPanel) {
+    public InterproceduralTaintAnalyzer(Program program, TaintLog logPanel) {
         this.program = program;
         this.logPanel = logPanel;
         this.converter = new TaintMatrixConverter();

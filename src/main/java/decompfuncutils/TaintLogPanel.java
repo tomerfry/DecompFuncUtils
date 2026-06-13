@@ -15,7 +15,7 @@ import java.awt.*;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 
-public class TaintLogPanel extends ComponentProviderAdapter {
+public class TaintLogPanel extends ComponentProviderAdapter implements TaintLog {
     
     private JTextPane logPane;
     private StyledDocument doc;

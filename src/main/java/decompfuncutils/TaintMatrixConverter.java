@@ -235,6 +235,20 @@ public class TaintMatrixConverter {
         String normalized = normalizeFuncName(funcName);
         return normalized != null && TAINT_SOURCES.contains(normalized);
     }
+
+    /**
+     * Wrapper-aware name comparison used for source-specific taint queries
+     * (e.g. tainted($buf, "read")). Matches a candidate call name against a target
+     * after stripping the same wrapper prefixes/suffixes isTaintSource() ignores, so
+     * "__read_chk", "read@plt" and "read" all match the target "read".
+     */
+    static boolean nameMatches(String candidate, String target) {
+        if (candidate == null || target == null) return false;
+        if (candidate.equals(target)) return true;
+        String nc = normalizeFuncName(candidate);
+        String nt = normalizeFuncName(target);
+        return nc != null && nc.equals(nt);
+    }
     
     /**
      * Convert a HighFunction to CSR sparse matrix

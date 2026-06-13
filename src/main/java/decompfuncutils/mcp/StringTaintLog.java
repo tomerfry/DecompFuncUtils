@@ -1,19 +1,23 @@
 package decompfuncutils.mcp;
 
-import decompfuncutils.TaintLogPanel;
+import decompfuncutils.TaintLog;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
 
 /**
- * Headless adapter for TaintLogPanel that collects log output into a StringBuilder
- * instead of rendering to a Swing panel. Used by MCP taint tools.
+ * Headless {@link TaintLog} that collects log output into a StringBuilder instead
+ * of rendering to a Swing panel. Used by the MCP taint tools and headless tests.
+ *
+ * Implements TaintLog directly (rather than extending the Swing TaintLogPanel) so
+ * it can be constructed without a PluginTool / display — the constructor's tool
+ * argument is accepted for call-site compatibility but unused.
  */
-public class StringTaintLog extends TaintLogPanel {
+public class StringTaintLog implements TaintLog {
 
     private final StringBuilder log = new StringBuilder();
 
     public StringTaintLog(PluginTool tool) {
-        super(tool, "MCP-Taint-Log");
+        // tool is intentionally unused; kept for source compatibility with callers.
     }
 
     @Override
