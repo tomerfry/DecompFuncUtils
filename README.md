@@ -86,6 +86,52 @@ The built extension will be in `dist/`.
 
 ---
 
+## Running Multiple Claude Sessions in Parallel
+
+You can drive several binaries at once, one Claude Code session per Ghidra
+instance, with no cross-talk. Each Ghidra instance runs its own MCP server on
+its own port; each Claude session is routed to exactly one of them.
+
+**How it works**
+
+- When the MCP server starts, it grabs the first free port in `13100–13149`
+  and advertises itself in `~/.ghidra-mcp/server-<pid>.json` (port, project, and
+  the loaded binary name). Stale files from crashed instances are pruned on start.
+- The committed `.mcp.json` reads `${GHIDRA_MCP_URL:-http://localhost:13100/sse}`,
+  so the `GHIDRA_MCP_URL` set in a terminal decides which Ghidra that Claude
+  session talks to. Unset, it falls back to the default port (single-session use).
+
+**Workflow**
+
+1. Open each binary in its own Ghidra instance and start its MCP server
+   (`Tools → MCP Server → Start`, or enable *MCP Auto Start* in the options).
+2. In a terminal, launch Claude bound to a specific instance. PowerShell:
+
+   ```powershell
+   ./tools/ghidra-claude.ps1 -Binary libfoo.so   # route to the instance with libfoo.so open
+   ./tools/ghidra-claude.ps1 -List               # list every live server first
+   ./tools/ghidra-claude.ps1 -Port 13101         # pin an exact port
+   ```
+
+   Or Bash (Linux/macOS/Git Bash — needs `curl` and either `jq` or `python`):
+
+   ```bash
+   ./tools/ghidra-claude.sh --binary libfoo.so
+   ./tools/ghidra-claude.sh --list
+   ./tools/ghidra-claude.sh --port 13101
+   ```
+
+   The launcher exports `GHIDRA_MCP_URL` and starts `claude` in the same shell.
+   Repeat in another terminal for another binary — the sessions never share state.
+
+Because each session targets a separate Ghidra process (separate JVM and project
+database), edits, analysis, and decompilation in one can't damage or override
+another. Working two sessions on the *same* binary is not recommended — the
+database is protected from corruption, but the sessions will logically overwrite
+each other's renames/structs.
+
+---
+
 ## Requirements
 
 - **Ghidra** 11.0 or later

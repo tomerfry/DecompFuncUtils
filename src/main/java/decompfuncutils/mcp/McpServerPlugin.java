@@ -3,6 +3,7 @@ package decompfuncutils.mcp;
 import decompfuncutils.mcp.tools.*;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.plugin.ProgramPlugin;
+import ghidra.app.services.ProgramManager;
 import ghidra.framework.plugintool.*;
 import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.model.listing.Program;
@@ -21,6 +22,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Stream;
 
 //@formatter:off
 @PluginInfo(
@@ -42,11 +46,15 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
     private static final String DEFAULT_AUTH_TOKEN = "";
     private static final boolean DEFAULT_AUTO_START = false;
 
+    /** Shared directory where every running MCP server advertises its port for client discovery. */
+    private static final Path PORT_DIR = Paths.get(System.getProperty("user.home"), ".ghidra-mcp");
+
     private McpHttpTransport transport;
     private McpToolRegistry toolRegistry;
     private McpProtocolHandler protocolHandler;
     private DecompInterfacePool decompPool;
     private Path portFile;
+    private int runningPort = -1;
 
     private int port = DEFAULT_PORT;
     private String authToken = DEFAULT_AUTH_TOKEN;
@@ -195,6 +203,10 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
             return;
         }
 
+        // Clear out advertisements left behind by Ghidra instances that crashed
+        // without running their shutdown hook, so discovery only sees live servers.
+        pruneStalePortFiles();
+
         // Try configured port first, then scan up to 50 ports for a free one.
         // This allows multiple CodeBrowser instances to coexist.
         int actualPort = port;
@@ -203,6 +215,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
             transport = new McpHttpTransport(actualPort, authToken, protocolHandler);
             try {
                 transport.start();
+                runningPort = actualPort;
                 Msg.info(this, "MCP server started on http://127.0.0.1:" + actualPort +
                     " with " + toolRegistry.size() + " tools");
                 if (actualPort != port) {
@@ -231,6 +244,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
             transport = null;
             Msg.info(this, "MCP server stopped");
         }
+        runningPort = -1;
         if (decompPool != null) {
             decompPool.disposeAll();
         }
@@ -239,16 +253,40 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
 
     private void writePortFile(int actualPort) {
         try {
-            Path portDir = Paths.get(System.getProperty("user.home"), ".ghidra-mcp");
-            Files.createDirectories(portDir);
+            Files.createDirectories(PORT_DIR);
 
             long pid = ProcessHandle.current().pid();
-            portFile = portDir.resolve("server-" + pid + ".json");
+            portFile = PORT_DIR.resolve("server-" + pid + ".json");
 
             String projectName = tool.getProject() != null ? tool.getProject().getName() : "unknown";
+
+            // Advertise the loaded binary so a launcher can route a session to the
+            // Ghidra instance holding a particular target.
+            Program active = getCurrentProgram();
+            String activeName = active != null ? active.getName() : null;
+            List<String> openNames = new ArrayList<>();
+            ProgramManager pm = tool.getService(ProgramManager.class);
+            if (pm != null) {
+                for (Program p : pm.getAllOpenPrograms()) {
+                    openNames.add(p.getName());
+                }
+            } else if (activeName != null) {
+                openNames.add(activeName);
+            }
+
+            StringBuilder programsArr = new StringBuilder("[");
+            for (int i = 0; i < openNames.size(); i++) {
+                if (i > 0) programsArr.append(", ");
+                programsArr.append('"').append(jsonEscape(openNames.get(i))).append('"');
+            }
+            programsArr.append(']');
+
             String json = String.format(
-                "{\"port\": %d, \"pid\": %d, \"started\": \"%s\", \"project\": \"%s\", \"url\": \"http://127.0.0.1:%d/sse\"}",
-                actualPort, pid, Instant.now().toString(), projectName, actualPort
+                "{\"port\": %d, \"pid\": %d, \"started\": \"%s\", \"project\": \"%s\", " +
+                "\"program\": %s, \"programs\": %s, \"url\": \"http://127.0.0.1:%d/sse\"}",
+                actualPort, pid, Instant.now().toString(), jsonEscape(projectName),
+                activeName != null ? "\"" + jsonEscape(activeName) + "\"" : "null",
+                programsArr, actualPort
             );
             Files.writeString(portFile, json);
             portFile.toFile().deleteOnExit();
@@ -256,6 +294,55 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         } catch (Exception e) {
             Msg.warn(this, "Failed to write port file: " + e.getMessage());
         }
+    }
+
+    /** Re-advertise the loaded binary after the active program changes, if the server is up. */
+    private void refreshPortFile() {
+        if (transport != null && transport.isRunning() && runningPort > 0) {
+            writePortFile(runningPort);
+        }
+    }
+
+    /**
+     * Delete discovery files for Ghidra processes that are no longer alive. The normal
+     * {@code deleteOnExit} hook does not run on a crash/kill, so stale files accumulate
+     * and would otherwise mislead a client into connecting to a dead port.
+     */
+    private void pruneStalePortFiles() {
+        if (!Files.isDirectory(PORT_DIR)) {
+            return;
+        }
+        long selfPid = ProcessHandle.current().pid();
+        try (Stream<Path> files = Files.list(PORT_DIR)) {
+            files.filter(p -> {
+                String fn = p.getFileName().toString();
+                return fn.startsWith("server-") && fn.endsWith(".json");
+            }).forEach(p -> {
+                String fn = p.getFileName().toString();
+                String pidStr = fn.substring("server-".length(), fn.length() - ".json".length());
+                try {
+                    long pid = Long.parseLong(pidStr);
+                    if (pid == selfPid) {
+                        return; // never prune our own
+                    }
+                    if (ProcessHandle.of(pid).isEmpty()) {
+                        Files.deleteIfExists(p);
+                        Msg.info(this, "Pruned stale MCP discovery file: " + fn);
+                    }
+                } catch (NumberFormatException nfe) {
+                    // unrecognised name — leave it alone
+                } catch (Exception e) {
+                    Msg.debug(this, "Could not prune " + fn + ": " + e.getMessage());
+                }
+            });
+        } catch (IOException e) {
+            Msg.debug(this, "Failed to scan MCP discovery dir: " + e.getMessage());
+        }
+    }
+
+    private static String jsonEscape(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     private void deletePortFile() {
@@ -275,6 +362,9 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         if (autoStart && (transport == null || !transport.isRunning())) {
             startServer();
         }
+        // Keep the discovery file's advertised binary in sync so a launcher can
+        // route by target even after the user opens/switches programs.
+        refreshPortFile();
     }
 
     @Override
@@ -283,6 +373,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         if (decompPool != null && program != null) {
             decompPool.invalidate(program);
         }
+        refreshPortFile();
     }
 
     @Override
