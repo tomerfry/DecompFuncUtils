@@ -2,7 +2,7 @@
   "mcpServers": {
     "ghidra": {
       "type": "sse",
-      "url": "${GHIDRA_MCP_URL:-http://localhost:13100/sse}"
+      "url": "${GHIDRA_MCP_URL:-http://127.0.0.1:13100/sse}"
     }
   }
 }

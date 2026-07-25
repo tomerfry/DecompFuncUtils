@@ -1,0 +1,17 @@
+# Codex MCP configuration for this repository.
+#
+# Codex speaks MCP Streamable HTTP (its rmcp client has no legacy SSE transport),
+# so it must point at the Ghidra server's /mcp endpoint. Pointing it at /sse
+# fails before initialize: Codex POSTs the handshake and /sse only answers GET.
+#
+# Claude Code uses the legacy /sse endpoint instead - see .mcp.json. Both are
+# served on the same port by the same Ghidra instance.
+#
+# TOML has no environment-variable interpolation, so the port below is literal.
+# To target a different Ghidra instance (ports 13100-13149), either:
+#   tools/ghidra-codex.ps1 -Binary libfoo.so        # discovers and overrides
+#   codex -c mcp_servers.ghidra.url="http://127.0.0.1:13102/mcp"
+# Run tools/mcp-handshake-probe.ps1 to check a server before launching.
+
+[mcp_servers.ghidra]
+url = "http://127.0.0.1:13101/mcp"

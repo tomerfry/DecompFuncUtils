@@ -86,49 +86,144 @@ The built extension will be in `dist/`.
 
 ---
 
-## Running Multiple Claude Sessions in Parallel
+## MCP Server (AI Agent Integration)
 
-You can drive several binaries at once, one Claude Code session per Ghidra
-instance, with no cross-talk. Each Ghidra instance runs its own MCP server on
-its own port; each Claude session is routed to exactly one of them.
+The plugin exposes Ghidra to AI agents over MCP. One Ghidra instance serves
+**both** MCP transports on the same port, because different clients speak
+different ones:
 
-**How it works**
+| Endpoint | Transport | Used by |
+|---|---|---|
+| `POST /mcp` | Streamable HTTP (spec 2025-03-26+) | Codex, most modern clients |
+| `GET /sse` + `POST /message` | Legacy HTTP+SSE (spec 2024-11-05) | Claude Code (`"type": "sse"`) |
+| `GET /discovery` | Plain JSON status (not MCP) | launchers, health checks |
 
-- When the MCP server starts, it grabs the first free port in `13100–13149`
-  and advertises itself in `~/.ghidra-mcp/server-<pid>.json` (port, project, and
-  the loaded binary name). Stale files from crashed instances are pruned on start.
-- The committed `.mcp.json` reads `${GHIDRA_MCP_URL:-http://localhost:13100/sse}`,
-  so the `GHIDRA_MCP_URL` set in a terminal decides which Ghidra that Claude
-  session talks to. Unset, it falls back to the default port (single-session use).
+`initialize` negotiates the protocol revision: the server echoes the client's
+requested version when it is one of `2024-11-05`, `2025-03-26`, `2025-06-18`,
+and otherwise answers with the newest it supports.
 
-**Workflow**
+### How Codex connects
+
+Codex's MCP client (rmcp) supports **stdio and Streamable HTTP only — there is no
+legacy SSE transport**. Pointing Codex at `/sse` fails before `initialize`: it
+POSTs the handshake and `/sse` answers `GET` only, so the request is rejected
+with `405 Method Not Allowed`. Codex must therefore use `/mcp`.
+
+The committed `.codex/config.toml` does this:
+
+```toml
+[mcp_servers.ghidra]
+url = "http://127.0.0.1:13101/mcp"
+```
+
+Two caveats worth knowing:
+
+- Codex reads a project's `.codex/config.toml` **only for trusted projects**.
+  If `codex mcp list` doesn't show `ghidra`, accept Codex's "trust this folder?"
+  prompt, or register it globally with
+  `codex mcp add ghidra --url http://127.0.0.1:13100/mcp`.
+- TOML has no environment-variable interpolation, so that port is literal. It is
+  pinned to the instance that was live when it was written, and a restarted
+  Ghidra may claim a different port — check with `./tools/ghidra-claude.ps1 -List`
+  and either edit the file or retarget per session with the launcher below or
+  `codex -c mcp_servers.ghidra.url="http://127.0.0.1:13102/mcp"`.
+
+The first time an agent calls a Ghidra tool, Codex asks you to approve it — that
+approval prompt is normal and unrelated to the transport. (In `codex exec`,
+which cannot prompt, MCP tool calls are auto-cancelled.)
+
+### How Claude Code connects
+
+Claude Code uses the legacy SSE transport via the committed `.mcp.json`:
+
+```json
+{ "mcpServers": { "ghidra": { "type": "sse",
+  "url": "${GHIDRA_MCP_URL:-http://127.0.0.1:13100/sse}" } } }
+```
+
+Unlike Codex's config, this one *does* interpolate, so `GHIDRA_MCP_URL` chooses
+the instance. Note that `/sse` is a long-lived stream: once open it stays open,
+sending a `: keepalive` comment every 30s. **That is the healthy steady state,
+not a hang** — responses to your `POST /message` calls arrive as `event: message`
+frames on that stream.
+
+### Selecting a port (13100–13149)
+
+When the MCP server starts it takes the first free port beginning at the
+configured one (default `13100`, under *Edit → Tool Options → MCP Server*), so a
+second Ghidra lands on `13101`, a third on `13102`, and so on. Each instance
+advertises itself in `~/.ghidra-mcp/server-<pid>.json` with its port, project,
+and loaded binaries; stale files from crashed instances are pruned on start.
+
+```powershell
+./tools/ghidra-claude.ps1 -List                      # every live server + its binaries
+curl http://127.0.0.1:13101/discovery                # one server's status
+```
+
+### Running multiple sessions in parallel
+
+You can drive several binaries at once, one agent session per Ghidra instance,
+with no cross-talk.
 
 1. Open each binary in its own Ghidra instance and start its MCP server
    (`Tools → MCP Server → Start`, or enable *MCP Auto Start* in the options).
-2. In a terminal, launch Claude bound to a specific instance. PowerShell:
+2. In a terminal, launch the agent bound to a specific instance. PowerShell:
 
    ```powershell
-   ./tools/ghidra-claude.ps1 -Binary libfoo.so   # route to the instance with libfoo.so open
-   ./tools/ghidra-claude.ps1 -List               # list every live server first
-   ./tools/ghidra-claude.ps1 -Port 13101         # pin an exact port
+   ./tools/ghidra-claude.ps1 -Binary libfoo.so                 # Claude -> instance with libfoo.so
+   ./tools/ghidra-claude.ps1 -Client codex -Binary libfoo.so   # Codex  -> same instance
+   ./tools/ghidra-claude.ps1 -Port 13101                       # pin an exact port
+   ./tools/ghidra-claude.ps1 -List                             # just list the live servers
    ```
 
    Or Bash (Linux/macOS/Git Bash — needs `curl` and either `jq` or `python`):
 
    ```bash
    ./tools/ghidra-claude.sh --binary libfoo.so
-   ./tools/ghidra-claude.sh --list
+   ./tools/ghidra-claude.sh --client codex --binary libfoo.so
    ./tools/ghidra-claude.sh --port 13101
+   ./tools/ghidra-claude.sh --list
    ```
 
-   The launcher exports `GHIDRA_MCP_URL` and starts `claude` in the same shell.
-   Repeat in another terminal for another binary — the sessions never share state.
+   For Claude the launcher exports `GHIDRA_MCP_URL`; for Codex it passes
+   `-c mcp_servers.ghidra.url=.../mcp`. Either way the agent starts in the same
+   shell, bound to one instance. Repeat in another terminal for another binary.
 
 Because each session targets a separate Ghidra process (separate JVM and project
 database), edits, analysis, and decompilation in one can't damage or override
 another. Working two sessions on the *same* binary is not recommended — the
 database is protected from corruption, but the sessions will logically overwrite
 each other's renames/structs.
+
+### Troubleshooting: "server reachable but handshake fails"
+
+Run the probe — it performs the real handshake on both transports and reports
+each step:
+
+```powershell
+./tools/mcp-handshake-probe.ps1 -Port 13101      # both transports
+./tools/mcp-handshake-probe.ps1 -Transport http  # just Codex's path
+```
+
+It resolves the target from `-Port`, `-Url`, `$env:GHIDRA_MCP_URL`, or the single
+live server in `~/.ghidra-mcp`, and exits non-zero if any step fails. Common
+outcomes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `POST /mcp` → 404 or 405, `/sse` fine | Ghidra is running an older build with no `/mcp` endpoint | Close Ghidra, install the current extension, restart. The endpoint is created at server start, so restarting *just* the MCP server is not enough. |
+| `POST /sse` → 405 | A Streamable HTTP client was pointed at the legacy endpoint | Use the `/mcp` URL for that client. |
+| `/discovery` unreachable | Server not started, or wrong port | `Tools → MCP Server → Start`; confirm the port with `-List`. |
+| Client reports a timeout on `GET /sse` | The stream is *supposed* to stay open | Not a failure. Check for a real error on the `POST /message` side instead. |
+| Handshake fine, tool call denied | Client-side approval prompt (Codex) | Approve the tool; in `codex exec` MCP calls are auto-cancelled. |
+| Tools list, but calls fail with "No program is currently open" | Server is up before a binary is loaded | Open a program, or call `ghidra_open_program` first. |
+
+Regression tests for both transports (in-process, against a real headless
+Ghidra) live in `tests/`:
+
+```powershell
+./tests/run_headless_test.ps1 -Script McpTransportHeadlessTest.java
+```
 
 ---
 

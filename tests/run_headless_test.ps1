@@ -14,7 +14,10 @@
 [CmdletBinding()]
 param(
     [string]$GhidraInstall = $(if ($env:GHIDRA_INSTALL_DIR) { $env:GHIDRA_INSTALL_DIR } else { "C:\Users\User\Ghidra" }),
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Post-script to run: TaintHeadlessTest.java (default, taint/emulator regression)
+    # or McpTransportHeadlessTest.java (MCP transport handshake test).
+    [string]$Script = 'TaintHeadlessTest.java'
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,17 +37,20 @@ if (-not $SkipBuild) {
 $zip = Get-ChildItem (Join-Path $repo "dist\*DecompFuncUtils.zip") | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $zip) { Write-Error "No built extension zip in dist/"; exit 2 }
 
-# 3) Resolve the per-user Extensions dir for this Ghidra version.
+# 3) Resolve an isolated settings dir for this run.
+#    Installing into %APPDATA%\ghidra fails while a GUI Ghidra holds the jar open
+#    ("being used by another process"), so the test gets its own settings tree via
+#    XDG_CONFIG_HOME (launch.properties precedence rule 2). A running Ghidra — and
+#    its live MCP server — is left completely untouched.
 $ver = (Get-Content (Join-Path $GhidraInstall "Ghidra\application.properties") |
         Select-String '^application.version=(.+)$').Matches.Groups[1].Value.Trim()
-$userGhidra = Join-Path $env:APPDATA "ghidra"
-$extDir = Get-ChildItem $userGhidra -Directory -Filter "ghidra_${ver}_*" -ErrorAction SilentlyContinue |
-          ForEach-Object { Join-Path $_.FullName "Extensions" } | Where-Object { Test-Path (Split-Path $_ -Parent) } |
-          Select-Object -First 1
-if (-not $extDir) { $extDir = Join-Path $userGhidra "ghidra_${ver}_DEV\Extensions" }
+$settingsRoot = Join-Path $env:TEMP "dfu_ghidra_settings"
+$extDir = Join-Path $settingsRoot "ghidra\ghidra_${ver}_DEV\Extensions"
 New-Item -ItemType Directory -Force $extDir | Out-Null
 
 # 4) Install fresh build as the single DecompFuncUtils module.
+#    A copy under <install>\Ghidra\Extensions would collide with this one
+#    ("Multiple modules collided"), so make sure that location stays empty.
 Remove-Item -Recurse -Force (Join-Path $GhidraInstall "Ghidra\Extensions\DecompFuncUtils") -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force (Join-Path $extDir "DecompFuncUtils") -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -65,13 +71,21 @@ Write-Host "==> Running headless test..." -ForegroundColor Cyan
 # and abort before we read the result. Relax it just for this native call.
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-& $hl $proj T -import $bin -scriptPath $sp -postScript TaintHeadlessTest.java -deleteProject *>&1 |
-    Out-File -FilePath $log -Encoding utf8
+$prevXdg = $env:XDG_CONFIG_HOME
+$env:XDG_CONFIG_HOME = $settingsRoot
+try {
+    & $hl $proj T -import $bin -scriptPath $sp -postScript $Script -deleteProject *>&1 |
+        Out-File -FilePath $log -Encoding utf8
+}
+finally {
+    if ($null -eq $prevXdg) { Remove-Item Env:\XDG_CONFIG_HOME -ErrorAction SilentlyContinue }
+    else { $env:XDG_CONFIG_HOME = $prevXdg }
+}
 $ErrorActionPreference = $prevEAP
 
 # 6) Report.
 $lines = Get-Content $log | Where-Object { $_ -match 'CHECK |HEADLESS_TEST_SUMMARY|HEADLESS_TEST_RESULT|INFO with_call' }
-$lines | ForEach-Object { ($_ -replace '^INFO\s+TaintHeadlessTest\.java>\s*', '') -replace '\s*\(GhidraScript\)\s*$', '' } |
+$lines | ForEach-Object { ($_ -replace '^INFO\s+\S+\.java>\s*', '') -replace '\s*\(GhidraScript\)\s*$', '' } |
     ForEach-Object {
         if ($_ -match ': FAIL')      { Write-Host $_ -ForegroundColor Red }
         elseif ($_ -match ': PASS')  { Write-Host $_ -ForegroundColor Green }

@@ -283,10 +283,11 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
 
             String json = String.format(
                 "{\"port\": %d, \"pid\": %d, \"started\": \"%s\", \"project\": \"%s\", " +
-                "\"program\": %s, \"programs\": %s, \"url\": \"http://127.0.0.1:%d/sse\"}",
+                "\"program\": %s, \"programs\": %s, \"url\": \"http://127.0.0.1:%d/sse\", " +
+                "\"mcpUrl\": \"http://127.0.0.1:%d/mcp\"}",
                 actualPort, pid, Instant.now().toString(), jsonEscape(projectName),
                 activeName != null ? "\"" + jsonEscape(activeName) + "\"" : "null",
-                programsArr, actualPort
+                programsArr, actualPort, actualPort
             );
             Files.writeString(portFile, json);
             portFile.toFile().deleteOnExit();

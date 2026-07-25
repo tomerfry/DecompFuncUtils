@@ -33,7 +33,12 @@ public class McpProtocolHandler {
         "ghidra_screenshot"
     );
 
-    private static final String PROTOCOL_VERSION = "2024-11-05";
+    // Protocol revisions this server can speak. The feature surface (tools with
+    // text/image content) is identical across all three, so we echo whichever
+    // the client asked for; unknown versions get our latest.
+    private static final Set<String> SUPPORTED_PROTOCOL_VERSIONS =
+        Set.of("2024-11-05", "2025-03-26", "2025-06-18");
+    private static final String LATEST_PROTOCOL_VERSION = "2025-06-18";
     private static final String SERVER_NAME = "ghidra-mcp";
     private static final String SERVER_VERSION = "1.0.0";
 
@@ -173,8 +178,16 @@ public class McpProtocolHandler {
     // ---- initialize ----
 
     private Object handleInitialize(JsonObject params) {
+        String requested = null;
+        if (params != null && params.has("protocolVersion")
+                && params.get("protocolVersion").isJsonPrimitive()) {
+            requested = params.get("protocolVersion").getAsString();
+        }
+        String negotiated = (requested != null && SUPPORTED_PROTOCOL_VERSIONS.contains(requested))
+            ? requested : LATEST_PROTOCOL_VERSION;
+
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("protocolVersion", PROTOCOL_VERSION);
+        result.put("protocolVersion", negotiated);
 
         Map<String, Object> capabilities = new LinkedHashMap<>();
         Map<String, Object> toolsCap = new LinkedHashMap<>();
@@ -395,26 +408,25 @@ public class McpProtocolHandler {
 
     // ---- JSON-RPC response helpers ----
 
+    // The request's id element is inserted verbatim: round-tripping it through
+    // gson.fromJson(Object.class) would turn integer ids into doubles ("id":1.0),
+    // which strictly-typed clients (e.g. Codex's rmcp) reject.
     private String successResponse(JsonElement id, Object result) {
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("jsonrpc", "2.0");
-        response.put("id", gson.fromJson(id, Object.class));
-        response.put("result", result);
+        JsonObject response = new JsonObject();
+        response.addProperty("jsonrpc", "2.0");
+        response.add("id", id == null ? JsonNull.INSTANCE : id);
+        response.add("result", gson.toJsonTree(result));
         return gson.toJson(response);
     }
 
     private String errorResponse(JsonElement id, int code, String message) {
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("jsonrpc", "2.0");
-        if (id != null) {
-            response.put("id", gson.fromJson(id, Object.class));
-        } else {
-            response.put("id", null);
-        }
-        Map<String, Object> error = new LinkedHashMap<>();
-        error.put("code", code);
-        error.put("message", message);
-        response.put("error", error);
+        JsonObject response = new JsonObject();
+        response.addProperty("jsonrpc", "2.0");
+        response.add("id", id == null ? JsonNull.INSTANCE : id);
+        JsonObject error = new JsonObject();
+        error.addProperty("code", code);
+        error.addProperty("message", message);
+        response.add("error", error);
         return gson.toJson(response);
     }
 

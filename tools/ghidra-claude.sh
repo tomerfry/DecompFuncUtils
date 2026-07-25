@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 #
-# ghidra-claude.sh — route a Claude Code session to a specific Ghidra MCP server
-# so multiple sessions can run in parallel against different binaries without
-# colliding. Bash port of ghidra-claude.ps1.
+# ghidra-claude.sh — route a Claude Code or Codex session to a specific Ghidra MCP
+# server so multiple sessions can run in parallel against different binaries
+# without colliding. Bash port of ghidra-claude.ps1.
 #
 # Each running Ghidra instance (with the DecompFuncUtils MCP server started)
 # advertises itself in ~/.ghidra-mcp/server-<pid>.json. This launcher discovers
 # the live servers, picks one (by loaded binary name, by port, or interactively),
-# exports GHIDRA_MCP_URL for it, and execs `claude`. The project's .mcp.json reads
-# ${GHIDRA_MCP_URL:-...}, so the chosen server is the only one this session sees.
+# and execs the agent bound to it.
+#
+#   claude (default) — exports GHIDRA_MCP_URL with the legacy SSE URL; the
+#                      project's .mcp.json reads ${GHIDRA_MCP_URL:-...}.
+#   codex            — execs `codex -c mcp_servers.ghidra.url=.../mcp`, since
+#                      Codex speaks only Streamable HTTP and TOML cannot read
+#                      environment variables.
 #
 # Usage:
-#   ./tools/ghidra-claude.sh --binary libfoo.so [-- claude args...]
+#   ./tools/ghidra-claude.sh --binary libfoo.so [-- agent args...]
+#   ./tools/ghidra-claude.sh --client codex --binary libfoo.so
 #   ./tools/ghidra-claude.sh --port 13101
 #   ./tools/ghidra-claude.sh --list
 #
@@ -25,8 +31,9 @@ PORT_DIR="${HOME}/.ghidra-mcp"
 
 BINARY=""
 PORT=""
+CLIENT="claude"
 DO_LIST=0
-declare -a CLAUDE_ARGS=()
+declare -a AGENT_ARGS=()
 
 usage() {
     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
@@ -38,12 +45,18 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --binary|-b) BINARY="${2:-}"; shift 2 ;;
         --port|-p)   PORT="${2:-}";   shift 2 ;;
+        --client|-c) CLIENT="${2:-}"; shift 2 ;;
         --list|-l)   DO_LIST=1;       shift ;;
         --help|-h)   usage 0 ;;
-        --)          shift; CLAUDE_ARGS+=("$@"); break ;;
-        *)           CLAUDE_ARGS+=("$1"); shift ;;
+        --)          shift; AGENT_ARGS+=("$@"); break ;;
+        *)           AGENT_ARGS+=("$1"); shift ;;
     esac
 done
+
+if [[ "$CLIENT" != "claude" && "$CLIENT" != "codex" ]]; then
+    echo "error: --client must be 'claude' or 'codex' (got '$CLIENT')." >&2
+    exit 2
+fi
 
 # ---- JSON parser detection (jq preferred, else python) ----
 JSON_TOOL=""
@@ -159,6 +172,15 @@ fi
 # ---- select a server -> CHOSEN (index) ----
 CHOSEN=-1
 
+# An already-set GHIDRA_MCP_URL is an explicit routing choice; honour it so the
+# same variable selects the instance for both agents.
+if [[ -z "$PORT" && -z "$BINARY" && -n "${GHIDRA_MCP_URL:-}" ]]; then
+    if [[ "$GHIDRA_MCP_URL" =~ :([0-9]+) ]]; then
+        PORT="${BASH_REMATCH[1]}"
+        echo "Using port $PORT from GHIDRA_MCP_URL"
+    fi
+fi
+
 if [[ -n "$PORT" ]]; then
     for ((i = 0; i < COUNT; i++)); do
         [[ "${S_PORT[$i]}" == "$PORT" ]] && CHOSEN=$i && break
@@ -203,9 +225,17 @@ if [[ "${S_SESS[$CHOSEN]}" -gt 0 ]] 2>/dev/null; then
     echo "warning: port ${S_PORT[$CHOSEN]} already has ${S_SESS[$CHOSEN]} active session(s); launching anyway will share that Ghidra instance." >&2
 fi
 
-export GHIDRA_MCP_URL="http://127.0.0.1:${S_PORT[$CHOSEN]}/sse"
-echo "Routing this Claude session to Ghidra on port ${S_PORT[$CHOSEN]} (programs: $(fmt_programs "$CHOSEN"))"
-echo "GHIDRA_MCP_URL = ${GHIDRA_MCP_URL}"
+echo "Routing this ${CLIENT} session to Ghidra on port ${S_PORT[$CHOSEN]} (programs: $(fmt_programs "$CHOSEN"))"
 
-# Hand off to Claude Code in this same shell so it inherits GHIDRA_MCP_URL.
-exec claude "${CLAUDE_ARGS[@]}"
+if [[ "$CLIENT" == "codex" ]]; then
+    # Codex speaks Streamable HTTP only; -c overrides .codex/config.toml's url.
+    MCP_URL="http://127.0.0.1:${S_PORT[$CHOSEN]}/mcp"
+    echo "mcp_servers.ghidra.url = ${MCP_URL}"
+    exec codex -c "mcp_servers.ghidra.url=\"${MCP_URL}\"" "${AGENT_ARGS[@]}"
+fi
+
+# Claude Code reads ${GHIDRA_MCP_URL:-...} from .mcp.json; hand off in this same
+# shell so the child process inherits it.
+export GHIDRA_MCP_URL="http://127.0.0.1:${S_PORT[$CHOSEN]}/sse"
+echo "GHIDRA_MCP_URL = ${GHIDRA_MCP_URL}"
+exec claude "${AGENT_ARGS[@]}"

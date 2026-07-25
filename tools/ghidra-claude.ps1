@@ -1,16 +1,26 @@
 <#
 .SYNOPSIS
-    Route a Claude Code session to a specific Ghidra MCP server so multiple
-    sessions can run in parallel against different binaries without colliding.
+    Route a Claude Code or Codex session to a specific Ghidra MCP server so
+    multiple sessions can run in parallel against different binaries without
+    colliding.
 
 .DESCRIPTION
     Each running Ghidra instance (with the DecompFuncUtils MCP server started)
     advertises itself in ~/.ghidra-mcp/server-<pid>.json. This launcher discovers
     the live servers, picks one (by loaded binary name, by port, or interactively),
-    exports GHIDRA_MCP_URL for it, and launches `claude`.
+    and launches the agent bound to it.
 
-    The project's .mcp.json reads ${GHIDRA_MCP_URL:-...}, so the chosen server is
-    the only one this Claude session can talk to.
+    Claude Code: GHIDRA_MCP_URL is exported with the chosen server's legacy SSE
+    URL. The project's .mcp.json reads ${GHIDRA_MCP_URL:-...}, so that server is
+    the only one the session can talk to.
+
+    Codex: launched with -c mcp_servers.ghidra.url set to the chosen server's
+    Streamable HTTP (/mcp) URL, overriding .codex/config.toml. Codex has no legacy
+    SSE transport, and TOML cannot read environment variables, so the override is
+    passed on the command line.
+
+.PARAMETER Client
+    Which agent to launch: claude (default) or codex.
 
 .PARAMETER Binary
     Substring of the loaded program/binary name to match (case-insensitive).
@@ -18,6 +28,7 @@
 
 .PARAMETER Port
     Connect to the server on this exact port (skips discovery matching).
+    Defaults to the port in $env:GHIDRA_MCP_URL when that is set.
 
 .PARAMETER List
     Print the discovered live servers and exit (no launch).
@@ -27,19 +38,27 @@
     Launch Claude bound to the Ghidra instance that has libfoo.so open.
 
 .EXAMPLE
+    ./tools/ghidra-claude.ps1 -Client codex -Binary libfoo.so
+    Same, but launch Codex against that instance's /mcp endpoint.
+
+.EXAMPLE
     ./tools/ghidra-claude.ps1 -List
     Show every live Ghidra MCP server and its loaded binary.
 
 .NOTES
-    Any extra arguments after the named parameters are forwarded to `claude`.
+    Any extra arguments after the named parameters are forwarded to the agent.
+    Use tools/mcp-handshake-probe.ps1 to diagnose a server that is reachable
+    but fails to hand shake.
 #>
 [CmdletBinding()]
 param(
+    [ValidateSet('claude', 'codex')]
+    [string]$Client = 'claude',
     [string]$Binary,
     [int]$Port,
     [switch]$List,
     [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$ClaudeArgs
+    [string[]]$AgentArgs
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,6 +138,13 @@ if (-not $servers) {
 # ---- Select a server ----
 $chosen = $null
 
+# An already-set GHIDRA_MCP_URL is an explicit routing choice; honour it so the
+# same variable selects the instance for both agents.
+if (-not $Port -and -not $Binary -and $env:GHIDRA_MCP_URL -match ':(\d+)') {
+    $Port = [int]$Matches[1]
+    Write-Host "Using port $Port from GHIDRA_MCP_URL" -ForegroundColor DarkGray
+}
+
 if ($Port) {
     $chosen = $servers | Where-Object { $_.Port -eq $Port } | Select-Object -First 1
     if (-not $chosen) { Write-Error "No live MCP server on port $Port."; return }
@@ -163,10 +189,19 @@ if ($chosen.ActiveSessions -gt 0) {
         $chosen.Port, $chosen.ActiveSessions)
 }
 
-$env:GHIDRA_MCP_URL = "http://127.0.0.1:$($chosen.Port)/sse"
-Write-Host ("Routing this Claude session to Ghidra on port {0} (programs: {1})" -f `
-    $chosen.Port, (Format-Programs $chosen)) -ForegroundColor Green
-Write-Host ("GHIDRA_MCP_URL = {0}" -f $env:GHIDRA_MCP_URL) -ForegroundColor DarkGray
+Write-Host ("Routing this {0} session to Ghidra on port {1} (programs: {2})" -f `
+    $Client, $chosen.Port, (Format-Programs $chosen)) -ForegroundColor Green
 
-# Hand off to Claude Code in this same shell so it inherits GHIDRA_MCP_URL.
-& claude @ClaudeArgs
+if ($Client -eq 'codex') {
+    # Codex speaks Streamable HTTP only; -c overrides .codex/config.toml's url.
+    $mcpUrl = "http://127.0.0.1:$($chosen.Port)/mcp"
+    Write-Host ("mcp_servers.ghidra.url = {0}" -f $mcpUrl) -ForegroundColor DarkGray
+    & codex -c "mcp_servers.ghidra.url=`"$mcpUrl`"" @AgentArgs
+}
+else {
+    # Claude Code reads ${GHIDRA_MCP_URL:-...} from .mcp.json; hand off in this
+    # same shell so the child process inherits it.
+    $env:GHIDRA_MCP_URL = "http://127.0.0.1:$($chosen.Port)/sse"
+    Write-Host ("GHIDRA_MCP_URL = {0}" -f $env:GHIDRA_MCP_URL) -ForegroundColor DarkGray
+    & claude @AgentArgs
+}

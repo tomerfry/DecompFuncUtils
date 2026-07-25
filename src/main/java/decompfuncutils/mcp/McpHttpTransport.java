@@ -1,5 +1,8 @@
 package decompfuncutils.mcp;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
@@ -10,15 +13,25 @@ import java.io.*;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.*;
 
 /**
- * HTTP+SSE transport for MCP protocol.
+ * HTTP transport for the MCP protocol. Both supported MCP transports are
+ * served on the same port:
  *
- * Exposes two endpoints:
- *   GET  /sse     — SSE event stream (long-lived connection)
- *   POST /message — JSON-RPC 2.0 requests from the client
+ * Legacy HTTP+SSE (2024-11-05) — used by Claude Code's "sse" client:
+ *   GET  /sse     — SSE event stream (long-lived connection; staying open is
+ *                   normal, not a hang). First event advertises the /message URL.
+ *   POST /message — JSON-RPC 2.0 requests; always answered 202, responses are
+ *                   pushed over the SSE stream.
+ *
+ * Streamable HTTP (2025-03-26+) — used by Codex and other modern clients:
+ *   POST /mcp     — JSON-RPC 2.0 request in, JSON response body out (200).
+ *                   Notifications are answered 202. The initialize response
+ *                   carries an Mcp-Session-Id header the client echoes back.
+ *   DELETE /mcp   — explicit session termination.
  */
 public class McpHttpTransport {
 
@@ -31,6 +44,9 @@ public class McpHttpTransport {
 
     // Active SSE connections: sessionId -> output stream
     private final ConcurrentHashMap<String, SseConnection> sseConnections = new ConcurrentHashMap<>();
+
+    // Sessions minted by the Streamable HTTP endpoint (no persistent connection)
+    private final Set<String> streamableSessions = ConcurrentHashMap.newKeySet();
 
     // Scheduled executor for keepalive pings
     private ScheduledExecutorService keepaliveExecutor;
@@ -51,6 +67,7 @@ public class McpHttpTransport {
 
         server.createContext("/sse", new SseHandler());
         server.createContext("/message", new MessageHandler());
+        server.createContext("/mcp", new StreamableHttpHandler());
         server.createContext("/discovery", new DiscoveryHandler());
 
         server.start();
@@ -76,6 +93,11 @@ public class McpHttpTransport {
             protocolHandler.removeSession(entry.getKey());
         }
         sseConnections.clear();
+
+        for (String sid : streamableSessions) {
+            protocolHandler.removeSession(sid);
+        }
+        streamableSessions.clear();
 
         if (server != null) {
             server.stop(1);
@@ -254,6 +276,100 @@ public class McpHttpTransport {
         }
     }
 
+    // ---- Streamable HTTP Handler ----
+
+    /**
+     * Modern MCP Streamable HTTP endpoint (spec rev 2025-03-26 and later).
+     * Unlike the legacy pair above, the JSON-RPC response is returned directly
+     * in the POST response body — no SSE channel is required.
+     */
+    private class StreamableHttpHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String method = exchange.getRequestMethod();
+
+            if ("OPTIONS".equals(method)) {
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Headers",
+                    "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version");
+                exchange.sendResponseHeaders(204, -1);
+                return;
+            }
+            if (!checkAuth(exchange)) {
+                sendError(exchange, 401, "Unauthorized");
+                return;
+            }
+
+            String sessionId = exchange.getRequestHeaders().getFirst("Mcp-Session-Id");
+
+            if ("DELETE".equals(method)) {
+                if (sessionId != null) {
+                    streamableSessions.remove(sessionId);
+                    protocolHandler.removeSession(sessionId);
+                    Msg.info(this, "Streamable HTTP session terminated: " + sessionId);
+                }
+                exchange.sendResponseHeaders(204, -1);
+                return;
+            }
+            if (!"POST".equals(method)) {
+                // The spec allows GET to open a server-initiated stream; we don't
+                // offer one, and 405 is the mandated reply in that case.
+                exchange.getResponseHeaders().set("Allow", "POST, DELETE, OPTIONS");
+                sendError(exchange, 405, "Method Not Allowed");
+                return;
+            }
+
+            String requestBody;
+            try (InputStream is = exchange.getRequestBody()) {
+                requestBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+            }
+
+            boolean isInitialize = false;
+            boolean isNotification = false;
+            try {
+                JsonElement parsed = JsonParser.parseString(requestBody);
+                if (parsed.isJsonObject()) {
+                    JsonObject obj = parsed.getAsJsonObject();
+                    isInitialize = obj.has("method")
+                        && "initialize".equals(obj.get("method").getAsString());
+                    isNotification = !obj.has("id") || obj.get("id").isJsonNull();
+                }
+            } catch (Exception ignored) {
+                // Malformed JSON falls through; the protocol handler answers with
+                // a JSON-RPC parse error, which we still deliver as 200.
+            }
+
+            if (isInitialize) {
+                // Mint a fresh session; the client echoes it in Mcp-Session-Id.
+                sessionId = UUID.randomUUID().toString();
+                streamableSessions.add(sessionId);
+                exchange.getResponseHeaders().set("Mcp-Session-Id", sessionId);
+                Msg.info(this, "Streamable HTTP client connected: " + sessionId);
+            } else if (sessionId != null && !streamableSessions.contains(sessionId)) {
+                // Unknown/expired session (e.g. server restarted). 404 tells the
+                // client to re-initialize rather than retry forever.
+                sendError(exchange, 404, "Unknown Mcp-Session-Id");
+                return;
+            }
+
+            String response = protocolHandler.handleRequest(requestBody, sessionId);
+
+            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+            if (response == null || isNotification) {
+                // Notification: accepted, nothing to return.
+                exchange.sendResponseHeaders(202, -1);
+                exchange.close();
+                return;
+            }
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.getResponseBody().close();
+        }
+    }
+
     // ---- Discovery Handler ----
 
     private class DiscoveryHandler implements HttpHandler {
@@ -263,9 +379,13 @@ public class McpHttpTransport {
                 sendError(exchange, 405, "Method Not Allowed");
                 return;
             }
+            // activeSessions counts live SSE connections only (keepalive-pruned);
+            // streamable sessions have no connection to probe, so a client that
+            // exits without DELETE would otherwise inflate the count forever.
             String json = String.format(
-                "{\"port\": %d, \"activeSessions\": %d, \"sseUrl\": \"http://127.0.0.1:%d/sse\"}",
-                port, sseConnections.size(), port
+                "{\"port\": %d, \"activeSessions\": %d, \"streamableSessions\": %d, " +
+                "\"sseUrl\": \"http://127.0.0.1:%d/sse\", \"mcpUrl\": \"http://127.0.0.1:%d/mcp\"}",
+                port, sseConnections.size(), streamableSessions.size(), port, port
             );
             byte[] body = json.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json");
