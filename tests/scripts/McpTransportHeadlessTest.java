@@ -18,6 +18,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -51,11 +52,14 @@ public class McpTransportHeadlessTest extends GhidraScript {
         registry.register(new ListFunctionsTool());
         McpProtocolHandler handler = new McpProtocolHandler(
             registry, () -> currentProgram, () -> null);
+        // Window identity is what tells sibling servers of one Ghidra apart.
+        handler.setInstructionsSupplier(() -> "attached to window 'HeadlessWindow'");
 
         McpHttpTransport transport = null;
         int port = -1;
         for (int p = 13140; p < 13150 && transport == null; p++) {
             McpHttpTransport t = new McpHttpTransport(p, null, handler);
+            t.setDiscoveryInfoSupplier(() -> Map.of("window", "HeadlessWindow"));
             try {
                 t.start();
                 transport = t;
@@ -74,6 +78,7 @@ public class McpTransportHeadlessTest extends GhidraScript {
         String base = "http://127.0.0.1:" + port;
         HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
         try {
+            runDiscoveryChecks(http, base, port);
             runStreamableChecks(http, base);
             runLegacySseChecks(http, base);
         } finally {
@@ -82,6 +87,26 @@ public class McpTransportHeadlessTest extends GhidraScript {
 
         println("HEADLESS_TEST_SUMMARY passed=" + passed + " failed=" + failed);
         println("HEADLESS_TEST_RESULT " + (failed == 0 ? "PASS" : "FAIL"));
+    }
+
+    // ---- /discovery (window routing) ----
+
+    /**
+     * Launchers route a session to one window out of several served by one Ghidra
+     * process, so /discovery must carry the window identity alongside the port.
+     */
+    private void runDiscoveryChecks(HttpClient http, String base, int port) throws Exception {
+        HttpResponse<String> disc = http.send(
+            HttpRequest.newBuilder(URI.create(base + "/discovery")).timeout(TIMEOUT).GET().build(),
+            HttpResponse.BodyHandlers.ofString());
+        boolean ok = false;
+        if (disc.statusCode() == 200) {
+            JsonObject body = JsonParser.parseString(disc.body()).getAsJsonObject();
+            ok = body.has("window")
+                && "HeadlessWindow".equals(body.get("window").getAsString())
+                && body.get("port").getAsInt() == port;
+        }
+        check("discovery_reports_window", ok, "status=" + disc.statusCode() + " body=" + disc.body());
     }
 
     // ---- Streamable HTTP (/mcp) ----
@@ -103,6 +128,11 @@ public class McpTransportHeadlessTest extends GhidraScript {
         check("http_initialize_result", initResult != null
             && "2025-03-26".equals(initResult.get("protocolVersion").getAsString())
             && "ghidra-mcp".equals(initResult.getAsJsonObject("serverInfo").get("name").getAsString()),
+            "body=" + init.body());
+        // Clients learn which window they landed in from initialize.
+        check("http_initialize_instructions", initResult != null
+            && initResult.has("instructions")
+            && initResult.get("instructions").getAsString().contains("HeadlessWindow"),
             "body=" + init.body());
         // Integer ids must round-trip untouched — "id":1.0 breaks typed clients.
         check("http_id_integer_fidelity",

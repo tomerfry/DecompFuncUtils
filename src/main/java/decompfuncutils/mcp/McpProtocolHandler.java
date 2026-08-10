@@ -30,7 +30,9 @@ public class McpProtocolHandler {
         "ghidra_list_open_programs",
         "ghidra_open_program",
         "ghidra_switch_program",
-        "ghidra_screenshot"
+        "ghidra_screenshot",
+        "ghidra_list_windows",
+        "ghidra_open_in_new_window"
     );
 
     // Protocol revisions this server can speak. The feature surface (tools with
@@ -46,6 +48,10 @@ public class McpProtocolHandler {
     private final McpToolRegistry toolRegistry;
     private final Supplier<Program> programSupplier;
     private final Supplier<PluginTool> toolSupplier;
+
+    // Optional orientation text returned by initialize — tells the client which
+    // Ghidra window it is attached to when several are served from one process.
+    private volatile Supplier<String> instructionsSupplier;
 
     // Per-session active program tracking: sessionId -> program name
     private final ConcurrentHashMap<String, String> sessionPrograms = new ConcurrentHashMap<>();
@@ -65,6 +71,11 @@ public class McpProtocolHandler {
         this.toolRegistry = toolRegistry;
         this.programSupplier = programSupplier;
         this.toolSupplier = toolSupplier;
+    }
+
+    /** Set the {@code instructions} text handed to clients on initialize. */
+    public void setInstructionsSupplier(Supplier<String> supplier) {
+        this.instructionsSupplier = supplier;
     }
 
     /**
@@ -199,6 +210,18 @@ public class McpProtocolHandler {
         serverInfo.put("name", SERVER_NAME);
         serverInfo.put("version", SERVER_VERSION);
         result.put("serverInfo", serverInfo);
+
+        Supplier<String> supplier = instructionsSupplier;
+        if (supplier != null) {
+            try {
+                String instructions = supplier.get();
+                if (instructions != null && !instructions.isEmpty()) {
+                    result.put("instructions", instructions);
+                }
+            } catch (Exception e) {
+                Msg.debug(this, "Instructions supplier failed: " + e.getMessage());
+            }
+        }
 
         return result;
     }

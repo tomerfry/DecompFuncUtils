@@ -1,5 +1,6 @@
 package decompfuncutils.mcp;
 
+import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -12,10 +13,12 @@ import ghidra.util.Msg;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
 
 /**
  * HTTP transport for the MCP protocol. Both supported MCP transports are
@@ -37,10 +40,16 @@ public class McpHttpTransport {
 
     // Uses Ghidra's Msg for logging
 
+    private static final Gson GSON = new Gson();
+
     private final int port;
     private final String authToken; // null = no auth
     private final McpProtocolHandler protocolHandler;
     private HttpServer server;
+
+    // Optional owner-supplied facts (which tool window, which programs) merged into
+    // /discovery so a probe can tell sibling servers of one Ghidra process apart.
+    private volatile Supplier<Map<String, Object>> discoveryInfoSupplier;
 
     // Active SSE connections: sessionId -> output stream
     private final ConcurrentHashMap<String, SseConnection> sseConnections = new ConcurrentHashMap<>();
@@ -55,6 +64,11 @@ public class McpHttpTransport {
         this.port = port;
         this.authToken = authToken;
         this.protocolHandler = protocolHandler;
+    }
+
+    /** Supply extra identity fields for the {@code /discovery} response. */
+    public void setDiscoveryInfoSupplier(Supplier<Map<String, Object>> supplier) {
+        this.discoveryInfoSupplier = supplier;
     }
 
     public void start() throws IOException {
@@ -382,12 +396,25 @@ public class McpHttpTransport {
             // activeSessions counts live SSE connections only (keepalive-pruned);
             // streamable sessions have no connection to probe, so a client that
             // exits without DELETE would otherwise inflate the count forever.
-            String json = String.format(
-                "{\"port\": %d, \"activeSessions\": %d, \"streamableSessions\": %d, " +
-                "\"sseUrl\": \"http://127.0.0.1:%d/sse\", \"mcpUrl\": \"http://127.0.0.1:%d/mcp\"}",
-                port, sseConnections.size(), streamableSessions.size(), port, port
-            );
-            byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            Map<String, Object> info = new LinkedHashMap<>();
+            Supplier<Map<String, Object>> supplier = discoveryInfoSupplier;
+            if (supplier != null) {
+                try {
+                    Map<String, Object> extra = supplier.get();
+                    if (extra != null) {
+                        info.putAll(extra);
+                    }
+                } catch (Exception e) {
+                    Msg.debug(this, "Discovery info supplier failed: " + e.getMessage());
+                }
+            }
+            info.put("port", port);
+            info.put("activeSessions", sseConnections.size());
+            info.put("streamableSessions", streamableSessions.size());
+            info.put("sseUrl", "http://127.0.0.1:" + port + "/sse");
+            info.put("mcpUrl", "http://127.0.0.1:" + port + "/mcp");
+
+            byte[] body = GSON.toJson(info).getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json");
             exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
             exchange.sendResponseHeaders(200, body.length);

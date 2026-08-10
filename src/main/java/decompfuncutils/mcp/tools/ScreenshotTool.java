@@ -3,7 +3,6 @@ package decompfuncutils.mcp.tools;
 import decompfuncutils.mcp.McpImageContent;
 import decompfuncutils.mcp.McpTool;
 import docking.ComponentProvider;
-import docking.DockingWindowManager;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
 
@@ -99,10 +98,13 @@ public class ScreenshotTool implements McpTool {
             }
             case "active":
             case "focused": {
-                DockingWindowManager dwm = DockingWindowManager.getActiveInstance();
-                ComponentProvider provider = dwm != null ? dwm.getActiveComponentProvider() : null;
+                // This session's own window, not DockingWindowManager.getActiveInstance():
+                // that static tracks whichever window the operator last clicked, so with
+                // several tool windows open it would hand back another session's panel.
+                ComponentProvider provider = tool.getActiveComponentProvider();
                 if (provider == null) {
-                    throw new RuntimeException("No panel is currently focused; specify an explicit target.");
+                    throw new RuntimeException("No panel is focused in " + tool.getName() +
+                        "; specify an explicit target such as 'decompiler', 'listing' or 'window'.");
                 }
                 component = bringUp(tool, provider);
                 label = "Active panel: " + provider.getName();
@@ -133,7 +135,9 @@ public class ScreenshotTool implements McpTool {
         }
         String base64 = Base64.getEncoder().encodeToString(baos.toByteArray());
 
-        String caption = label + " — " + image.getWidth() + "x" + image.getHeight() + " px";
+        // Name the window in the caption: several may be open, one per agent session.
+        String caption = "[" + tool.getName() + "] " + label
+            + " — " + image.getWidth() + "x" + image.getHeight() + " px";
         return new McpImageContent(base64, "image/png", caption);
     }
 
