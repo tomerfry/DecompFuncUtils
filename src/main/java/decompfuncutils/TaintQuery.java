@@ -269,6 +269,23 @@ public class TaintQuery {
         }
     }
     
+    /** Restricts a captured call name to an explicitly modeled API. */
+    public static class FunctionIsConstraint extends Constraint {
+        public String varName;
+        public String functionName;
+
+        @Override
+        public boolean evaluate(Map<String, Object> bindings, TaintContext taintCtx) {
+            Object value = bindings.get(varName);
+            return value instanceof String name && TaintMatrixConverter.nameMatches(name, functionName);
+        }
+
+        @Override
+        public String toString() {
+            return "function_is(" + varName + ", \"" + functionName + "\")";
+        }
+    }
+
     public static class FlowsToConstraint extends Constraint {
         public String srcVar;
         public String dstVar;

@@ -65,9 +65,16 @@ is left untouched. For the same collision reason the throwaway Ghidra project is
 created under `$env:TEMP`, never inside the repo (the repo itself is a module
 directory and would be double-counted).
 
-Test cases deliberately use data flow the engine models: structural call patterns, **direct**
-dereferences (`*p`, not `p[n]`), and taint that propagates through call **return values**
-(e.g. `getenv`). Taint that only reaches a variable by a write through a pointer argument
-(`read(fd, &len, 8)`) is not tracked by the reachability engine and is intentionally avoided.
+Accuracy regressions pair unsafe cases with safe lookalikes: environment-derived
+numeric copy lengths versus fixed copies, tainted formats versus literal formats
+with tainted data arguments, fortified printf argument positions, real wrapper
+returns versus unrelated returns, and direct input-buffer sources versus later
+reads or different buffers. Lifetime tests cover repeated harmless calls,
+mutually exclusive frees, reallocation, and `free(NULL)`. The fixture uses
+`-fno-builtin` so Clang preserves the API calls under test.
+
+The buffer model recognizes direct pointer arguments; arbitrary loads from
+input-filled scalar storage, memory overwrites, and interprocedural pointer
+writes remain outside this regression coverage.
 
 Additional regressions cover 64-node reachability chains in both engines, MCP query presets, one-function pagination without omissions or duplicates, coverage metadata, and invalid query arguments. Test runs use unique temporary settings and project directories; the runner stops immediately on a failed build.

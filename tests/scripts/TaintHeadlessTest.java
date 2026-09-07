@@ -57,6 +57,8 @@ public class TaintHeadlessTest extends GhidraScript {
                 "PATTERN p { printf($fmt); } WHERE tainted($fmt, \"read\")", decomp);
             check("source_specific_read_excludes_fmt", !byRead.contains("fmt"), "hits=" + byRead);
 
+            testBuiltinAccuracy(decomp);
+
             // --- Emulation: pure arithmetic (a+3)*2-1, a=10 -> 25 (0x19) ---
             Function add3 = func("add3");
             if (add3 != null) {
@@ -92,6 +94,49 @@ public class TaintHeadlessTest extends GhidraScript {
 
         println("HEADLESS_TEST_SUMMARY passed=" + passed + " failed=" + failed);
         println(failed == 0 ? "HEADLESS_TEST_RESULT PASS" : "HEADLESS_TEST_RESULT FAIL");
+    }
+
+    private void testBuiltinAccuracy(DecompInterface decomp) throws Exception {
+        for (String name : TaintQueryParser.getBuiltinPatternNames()) {
+            new TaintQueryParser().parse(name);
+        }
+        check("all_builtins_parse", true, "catalog parsed");
+        Map<String, List<String>> positives = Map.of(
+            "memcpy_overflow", List.of("cp", "numeric_cp"),
+            "format_string", List.of("fmt", "checked_format", "wrapped_format", "read_format"),
+            "snprintf_format", List.of("bounded_bad_format"),
+            "double_free", List.of("df"),
+            "double_free_like", List.of("df"),
+            "use_after_free_as_arg", List.of("freed_argument"));
+        Map<String, List<String>> negatives = Map.of(
+            "memcpy_overflow", List.of("safe_cp", "fixed_input_copy", "safe_crt_copy"),
+            "format_string", List.of("safe_format", "safe_checked_format", "safe_wrapped_format", "read_after_format", "read_other_buffer"),
+            "sprintf_overflow", List.of("safe_sprintf_destination"),
+            "double_free", List.of("branch_free", "reallocated_free", "null_free"),
+            "double_free_like", List.of("repeated_use", "branch_free", "reallocated_free", "null_free"),
+            "use_after_free_as_arg", List.of("df", "repeated_use"));
+        Set<String> names = new TreeSet<>(positives.keySet());
+        names.addAll(negatives.keySet());
+        for (String name : names) {
+            Set<String> hits = runQuery(name, decomp);
+            for (String function : positives.getOrDefault(name, List.of())) {
+                check(name + "_detects_" + function, hits.contains(function), "hits=" + hits);
+            }
+            for (String function : negatives.getOrDefault(name, List.of())) {
+                check(name + "_excludes_" + function, !hits.contains(function), "hits=" + hits);
+            }
+        }
+        Set<String> named = runQuery(
+            "printf($fmt) WHERE tainted($fmt, \"getenv\")", decomp);
+        check("named_source_tracks_wrapper_return", named.contains("wrapped_format"), "hits=" + named);
+        check("named_source_rejects_unrelated_return", !named.contains("safe_wrapped_format"), "hits=" + named);
+        Set<String> read = runQuery("printf($fmt) WHERE tainted($fmt, \"read\")", decomp);
+        check("read_source_buffer_reaches_format", read.contains("read_format"), "hits=" + read);
+        check("read_source_respects_order", !read.contains("read_after_format"), "hits=" + read);
+        check("read_source_distinguishes_buffers", !read.contains("read_other_buffer"), "hits=" + read);
+        Set<String> literals = runQuery("memcpy($dst, $src, 16)", decomp);
+        check("literal_argument_matches", literals.contains("safe_cp"), "hits=" + literals);
+        check("literal_argument_rejects_other_value", !literals.contains("fixed_input_copy"), "hits=" + literals);
     }
 
     private void testReachability() {

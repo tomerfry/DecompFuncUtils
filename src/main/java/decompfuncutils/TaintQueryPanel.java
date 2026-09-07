@@ -73,7 +73,7 @@ public class TaintQueryPanel extends ComponentProviderAdapter {
         
         builtinSelector = new JComboBox<>();
         builtinSelector.addItem("-- Select Pattern --");
-        for (String name : TaintQueryParser.getBuiltinPatternNames()) {
+        for (String name : TaintQueryParser.getRecommendedPatterns().keySet()) {
             builtinSelector.addItem(name);
         }
         builtinSelector.addActionListener(e -> loadBuiltinPattern());

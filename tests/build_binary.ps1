@@ -3,6 +3,6 @@
 # rerun this if you change test_vuln.c.
 $ErrorActionPreference = "Stop"
 $dir = $PSScriptRoot
-& clang -target x86_64-linux-gnu -c -O0 -g -fno-stack-protector `
+& clang -target x86_64-linux-gnu -c -O0 -g -fno-stack-protector -fno-builtin `
     (Join-Path $dir "test_vuln.c") -o (Join-Path $dir "test_vuln.o")
 Write-Host "Built test_vuln.o"

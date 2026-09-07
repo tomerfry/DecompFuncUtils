@@ -54,3 +54,44 @@ int with_call(int a) {
     printf("x");                /* external call; skipCalls steps over it */
     return a + 1;
 }
+
+/* Accuracy regressions: unsafe cases paired with lookalikes. */
+extern int puts(const char *);
+extern int sprintf(char *, const char *, ...);
+extern int snprintf(char *, unsigned long, const char *, ...);
+extern int __printf_chk(int, const char *, ...);
+extern long strtol(const char *, char **, int);
+extern int memcpy_s(void *, unsigned long, const void *, unsigned long);
+
+void numeric_cp(char *dst, char *src) {
+    unsigned long n = (unsigned long)strtol(getenv("N"), (char **)0, 10);
+    memcpy(dst, src, n);
+}
+void fixed_input_copy(char *dst) { memcpy(dst, getenv("X"), 4); }
+void safe_format(void) { printf("%s", getenv("X")); }
+void checked_format(void) { __printf_chk(1, getenv("X")); }
+void safe_checked_format(void) { __printf_chk(1, "%s", getenv("X")); }
+void bounded_bad_format(char *dst) { snprintf(dst, 64, getenv("X")); }
+void safe_sprintf_destination(void) { sprintf(getenv("OUT"), "%s", "ok"); }
+char *source_wrapper(void) { return getenv("X"); }
+char *unrelated_wrapper(void) { puts(getenv("X")); return "%s"; }
+void wrapped_format(void) { printf(source_wrapper()); }
+void safe_wrapped_format(void) { printf(unrelated_wrapper(), "ok"); }
+void repeated_use(void) { char *p = getenv("X"); puts(p); puts(p); }
+void freed_argument(void) { char *p = malloc(64); free(p); puts(p); }
+void branch_free(int cond) {
+    char *p = malloc(64);
+    if (cond) { free(p); puts("left"); }
+    else { puts("right"); free(p); }
+}
+void reallocated_free(void) {
+    char *p = malloc(64); free(p); p = malloc(32); free(p);
+}
+void null_free(void) { free((void *)0); free((void *)0); }
+void safe_crt_copy(char *dst, char *src) {
+    memcpy_s(dst, 64, src, (unsigned long)strtol(getenv("N"), (char **)0, 10));
+}
+extern long read(int, void *, unsigned long);
+void read_format(void) { char buf[64]; read(0, buf, 63); buf[63] = 0; printf(buf); }
+void read_after_format(void) { char buf[64] = "%s"; printf(buf, "ok"); read(0, buf, 63); }
+void read_other_buffer(void) { char buf[64]; char fmt[8] = "%s"; read(0, buf, 63); printf(fmt, buf); }

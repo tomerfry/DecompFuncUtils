@@ -25,12 +25,12 @@ public class TaintQueryParser {
         BUILTIN_PATTERNS.put("sprintf_overflow",
             "PATTERN sprintf_overflow {\n" +
             "    sprintf($dst, $fmt, ...);\n" +
-            "} WHERE tainted($fmt) OR tainted($dst)");
+            "} WHERE tainted($fmt)");
         
         BUILTIN_PATTERNS.put("memcpy_overflow",
             "PATTERN memcpy_overflow {\n" +
             "    memcpy($dst, $src, $len);\n" +
-            "} WHERE tainted($len) OR tainted($src)");
+            "} WHERE tainted($len)");
         
         BUILTIN_PATTERNS.put("gets_usage",
             "PATTERN gets_usage {\n" +
@@ -62,7 +62,7 @@ public class TaintQueryParser {
         BUILTIN_PATTERNS.put("exec_injection",
             "PATTERN exec_injection {\n" +
             "    execve($path, $argv, $envp);\n" +
-            "} WHERE tainted($path) OR tainted($argv)");
+            "} WHERE tainted($path)");
         
         // Use-after-free (with negative check - no reassignment between free and use)
         BUILTIN_PATTERNS.put("use_after_free",
@@ -96,36 +96,30 @@ public class TaintQueryParser {
             "    free($ptr);\n" +
             "}");
 
-        // D1: UAF where the freed pointer is passed to another function instead of
-        // being dereferenced directly. Covers strlen(p) / puts(p) / fclose(p) /
-        // printf("%s", p) / any_wrapper(p) patterns — the same bug class as *$ptr
-        // but far more common in real code.
+        // Only modeled memory-access APIs qualify; arbitrary calls may merely
+        // compare/log a pointer or accept ownership without dereferencing it.
         BUILTIN_PATTERNS.put("use_after_free_as_arg",
             "PATTERN use_after_free_as_arg {\n" +
             "    free($ptr);\n" +
             "    ... not:$ptr=_;\n" +
             "    $usefn($ptr);\n" +
-            "}");
+            "} WHERE (function_is($usefn, \"strlen\") OR function_is($usefn, \"puts\") OR function_is($usefn, \"strcpy\") OR function_is($usefn, \"memcpy\") OR function_is($usefn, \"memset\")) AND NOT is_constant($ptr)");
 
-        // D1 variant: freed pointer passed as the 2nd argument (memcpy(dst,p,n),
-        // fprintf(stream,p,...), etc.). Kept as a separate pattern so each
-        // built-in is predictable about which slot it matches.
+        // Source-buffer argument of known copy/concatenation APIs.
         BUILTIN_PATTERNS.put("use_after_free_as_arg2",
             "PATTERN use_after_free_as_arg2 {\n" +
             "    free($ptr);\n" +
             "    ... not:$ptr=_;\n" +
             "    $usefn(_, $ptr);\n" +
-            "}");
+            "} WHERE (function_is($usefn, \"memcpy\") OR function_is($usefn, \"memmove\") OR function_is($usefn, \"strcpy\") OR function_is($usefn, \"strcat\")) AND NOT is_constant($ptr)");
 
-        // D2: double-free through a free-like wrapper (my_free / xfree / g_free /
-        // close / fclose etc.). The function name is bound on the first call and
-        // must match on the second, so we don't falsely pair free(p) with close(p).
+        // Repeated calls must be known heap deallocators, not arbitrary APIs.
         BUILTIN_PATTERNS.put("double_free_like",
             "PATTERN double_free_like {\n" +
             "    $freefn($ptr);\n" +
             "    ... not:$ptr=_;\n" +
             "    $freefn($ptr);\n" +
-            "}");
+            "} WHERE (function_is($freefn, \"free\") OR function_is($freefn, \"g_free\") OR function_is($freefn, \"cfree\")) AND NOT is_constant($ptr)");
         
         // Integer overflow
         BUILTIN_PATTERNS.put("int_overflow_malloc",
@@ -230,6 +224,20 @@ public class TaintQueryParser {
             "}");
     }
     
+    static {
+        BUILTIN_PATTERNS.put("tainted_copy_length", BUILTIN_PATTERNS.get("memcpy_overflow"));
+        BUILTIN_PATTERNS.put("tainted_format", BUILTIN_PATTERNS.get("format_string"));
+        BUILTIN_PATTERNS.put("memmove_overflow",
+            "PATTERN memmove_overflow { memmove($dst, $src, $len); } WHERE tainted($len)");
+        BUILTIN_PATTERNS.put("fprintf_format",
+            "PATTERN fprintf_format { fprintf($stream, $fmt, ...); } WHERE tainted($fmt)");
+        BUILTIN_PATTERNS.put("snprintf_format",
+            "PATTERN snprintf_format { snprintf($dst, $size, $fmt, ...); } WHERE tainted($fmt)");
+        for (String name : List.of("use_after_free", "double_free", "use_after_free_tight")) {
+            BUILTIN_PATTERNS.put(name, BUILTIN_PATTERNS.get(name) + " WHERE NOT is_constant($ptr)");
+        }
+    }
+
     /**
      * Parse a query string
      */
@@ -394,6 +402,11 @@ public class TaintQueryParser {
      * Parse quick pattern (just a function call or expression)
      */
     private TaintQuery parseQuickPattern(String text) throws ParseException {
+        int where = findOperator(text, "WHERE");
+        if (where >= 0) {
+            return parseFullPattern("PATTERN quick_pattern { " + text.substring(0, where).trim()
+                + "; } " + text.substring(where));
+        }
         List<TaintQuery.PatternElement> elements = parsePatternBody(text);
         Set<String> boundVars = new HashSet<>();
         collectBoundVariables(elements, boundVars);
@@ -707,6 +720,15 @@ public class TaintQueryParser {
      */
     private TaintQuery.Constraint parseConstraintFunction(String text) throws ParseException {
         text = text.trim();
+
+        Matcher functionMatcher = Pattern.compile(
+            "function_is\\s*\\(\\s*(\\$\\w+)\\s*,\\s*\"([^\"]+)\"\\s*\\)").matcher(text);
+        if (functionMatcher.matches()) {
+            TaintQuery.FunctionIsConstraint constraint = new TaintQuery.FunctionIsConstraint();
+            constraint.varName = functionMatcher.group(1);
+            constraint.functionName = functionMatcher.group(2);
+            return constraint;
+        }
         
         // tainted($var) or tainted($var, "source")
         Pattern taintedPattern = Pattern.compile("tainted\\s*\\(\\s*(\\$\\w+)(?:\\s*,\\s*\"([^\"]+)\")?\\s*\\)");
@@ -855,6 +877,21 @@ public class TaintQueryParser {
      */
     public static Set<String> getBuiltinPatternNames() {
         return BUILTIN_PATTERNS.keySet();
+    }
+
+    /** Default catalog omits exploratory templates that lack bug-specific evidence.
+     * Legacy names remain parseable for saved queries. */
+    public static Map<String, String> getRecommendedPatterns() {
+        Map<String, String> patterns = new LinkedHashMap<>();
+        for (String name : List.of("tainted_copy_length", "tainted_format", "strcpy_overflow",
+                "sprintf_overflow", "memcpy_overflow", "memmove_overflow", "gets_usage",
+                "format_string", "fprintf_format", "snprintf_format", "syslog_format",
+                "command_injection", "popen_injection", "use_after_free", "double_free",
+                "use_after_free_as_arg", "use_after_free_as_arg2", "double_free_like",
+                "sql_injection")) {
+            patterns.put(name, BUILTIN_PATTERNS.get(name));
+        }
+        return Collections.unmodifiableMap(patterns);
     }
     
     /**

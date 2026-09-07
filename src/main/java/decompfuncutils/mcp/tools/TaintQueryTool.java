@@ -19,11 +19,7 @@ import java.util.*;
 
 public class TaintQueryTool implements McpTool {
 
-    private static final Map<String, String> PRESETS = Map.of(
-        "tainted_copy_length", "PATTERN copy_length { memcpy($dst, $src, $len); } WHERE tainted($len)",
-        "tainted_format", "PATTERN format { printf($fmt); } WHERE tainted($fmt)",
-        "use_after_free", "PATTERN uaf { free($ptr); ...; *$ptr; }",
-        "double_free", "PATTERN df { free($ptr); ...; free($ptr); }");
+    private static final Map<String, String> PRESETS = TaintQueryParser.getRecommendedPatterns();
 
     @Override public String name() { return "ghidra_taint_query"; }
 
@@ -31,8 +27,8 @@ public class TaintQueryTool implements McpTool {
     public String description() {
         return "Execute a taint query using the built-in DSL to find vulnerability patterns. " +
                "Syntax: PATTERN name { <C-like pattern> } WHERE <constraints>. " +
-               "Constraints: tainted($var), flows_to($src, $dst), is_constant($var), calls($func), etc. " +
-               "Provide query OR preset. Presets: tainted_copy_length, tainted_format, use_after_free, double_free. " +
+               "Constraints: tainted($var), flows_to($src, $dst), is_constant($var), function_is($func, \"free\"), etc. " +
+               "Provide query OR preset. Presets share the UI built-in catalog, including tainted_copy_length, tainted_format, use_after_free, double_free. " +
                "Use startAfter from nextStartAfter to resume bounded scans. Results are heuristic candidates, not confirmed vulnerabilities.";
     }
 
@@ -171,8 +167,11 @@ public class TaintQueryTool implements McpTool {
             result.put("truncated", truncated);
             result.put("nextStartAfter", truncated ? lastAddress : null);
             result.put("complete", !truncated && failures.isEmpty() && !monitor.isCancelled());
+            result.put("confidenceMeaning", "Structural match score, not a probability of exploitability.");
             result.put("limitations", List.of("Heuristic pattern and taint matching; findings require manual validation.",
-                "Pointer writes, aliases, indirect calls and interprocedural source reachability are approximate.",
+                "Direct input buffers are modeled; arbitrary pointer writes, overwrites and aliases remain approximate.",
+                "CFG reachability does not prove branch feasibility, missing sanitization or insufficient destination capacity.",
+                "Wrapper return-source analysis is bounded to three nested callees; unknown call returns remain conservative.",
                 "complete describes scan coverage for this scope, not proof that the program is safe."));
             result.put("decompileTimeout", decompileTimeout == Integer.MAX_VALUE ? "disabled" : decompileTimeout);
             result.put("cancelled", monitor.isCancelled());

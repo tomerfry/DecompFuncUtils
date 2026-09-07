@@ -110,9 +110,29 @@ Call `ghidra_taint_query` with a preset to start without writing the pattern DSL
 {"preset":"tainted_copy_length","maxFunctions":100}
 ```
 
-Available presets are `tainted_copy_length` (tainted `memcpy` length),
-`tainted_format` (tainted `printf` format), `use_after_free` (direct dereference
-following `free`), and `double_free`. These report candidates for investigation.
+The UI and MCP share a curated preset catalog: tainted copy lengths (`memcpy`,
+`memmove`), format strings (`printf`, `fprintf`, `sprintf`, `snprintf`, `syslog`),
+unbounded string copies/input, shell commands, SQL execution, and memory lifetime
+patterns. `tainted_copy_length` and `tainted_format` remain supported aliases.
+
+Copy-length queries require tainted **lengths**; a fixed-size copy of input data
+alone is not reported. Format queries inspect the format argument, including
+shifted arguments in fortified libc calls. Lifetime presets exclude constant
+pointers, require CFG reachability between matched statements, and restrict
+free-like or dereferencing calls to explicitly modeled APIs. Secure CRT `_s`
+functions are not matched as ordinary libc functions with different signatures.
+Wrapper returns require returned-value source evidence; merely calling an input
+API inside a wrapper is insufficient. Direct buffer fills (`read`, `recv`,
+`fread`, `fgets`, etc.) are matched to the same buffer at a later use.
+
+These are investigation candidates, not proof of overflow or exploitability:
+destination capacity, intervening buffer overwrites, sanitization, and branch
+predicate feasibility are not fully modeled. Legacy exploratory templates
+(including hardcoded comparisons, unchecked allocation, and binary-specific
+C++ examples) remain available by name through `query`, but are omitted from the
+default selector and MCP presets. Use `ghidra_find_integer_truncation` for
+allocation/copy width mismatches.
+
 Provide either `preset` or `query`, never both. To focus on one function:
 
 ```json
