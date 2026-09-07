@@ -5,10 +5,12 @@
     colliding.
 
 .DESCRIPTION
-    Each running Ghidra instance (with the DecompFuncUtils MCP server started)
-    advertises itself in ~/.ghidra-mcp/server-<pid>.json. This launcher discovers
-    the live servers, picks one (by loaded binary name, by port, or interactively),
-    and launches the agent bound to it.
+    Every MCP-serving Ghidra tool window advertises itself in
+    ~/.ghidra-mcp/server-<pid>-<port>.json. One Ghidra process can host several
+    windows (CodeBrowser, CodeBrowser(2), ...), each with its own active program
+    and its own port — so several entries may share a pid. This launcher discovers
+    the live servers, picks one (by loaded binary name, by window name, by port, or
+    interactively), and launches the agent bound to it.
 
     Claude Code: GHIDRA_MCP_URL is exported with the chosen server's legacy SSE
     URL. The project's .mcp.json reads ${GHIDRA_MCP_URL:-...}, so that server is
@@ -24,7 +26,11 @@
 
 .PARAMETER Binary
     Substring of the loaded program/binary name to match (case-insensitive).
-    Routes to the single Ghidra instance holding a matching target.
+    Routes to the single window holding a matching target.
+
+.PARAMETER Window
+    Substring of the Ghidra tool window name to match, e.g. 'CodeBrowser(2)'.
+    Use this to pick between windows of the same Ghidra process.
 
 .PARAMETER Port
     Connect to the server on this exact port (skips discovery matching).
@@ -35,15 +41,19 @@
 
 .EXAMPLE
     ./tools/ghidra-claude.ps1 -Binary libfoo.so
-    Launch Claude bound to the Ghidra instance that has libfoo.so open.
+    Launch Claude bound to the window that has libfoo.so open.
 
 .EXAMPLE
     ./tools/ghidra-claude.ps1 -Client codex -Binary libfoo.so
-    Same, but launch Codex against that instance's /mcp endpoint.
+    Same, but launch Codex against that window's /mcp endpoint.
+
+.EXAMPLE
+    ./tools/ghidra-claude.ps1 -Window 'CodeBrowser(2)'
+    Bind to the second tool window of a Ghidra process.
 
 .EXAMPLE
     ./tools/ghidra-claude.ps1 -List
-    Show every live Ghidra MCP server and its loaded binary.
+    Show every live Ghidra MCP window, its port and its loaded binaries.
 
 .NOTES
     Any extra arguments after the named parameters are forwarded to the agent.
@@ -55,6 +65,7 @@ param(
     [ValidateSet('claude', 'codex')]
     [string]$Client = 'claude',
     [string]$Binary,
+    [string]$Window,
     [int]$Port,
     [switch]$List,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -83,20 +94,26 @@ function Get-LiveServers {
             continue
         }
         # Confirm the HTTP server actually answers (and pick up live session count).
-        $sessions = $null
+        # /discovery also re-reports window/programs, which is fresher than the file.
+        $disc = $null
         try {
             $disc = Invoke-RestMethod -Uri "http://127.0.0.1:$($info.port)/discovery" -TimeoutSec 2
-            $sessions = $disc.activeSessions
         } catch {
             continue  # process alive but server not listening yet / wrong port
         }
+
+        $window = if ($disc.window) { $disc.window } elseif ($info.window) { $info.window } else { '?' }
+        $program = if ($disc.program) { $disc.program } else { $info.program }
+        $programs = if ($disc.programs) { $disc.programs } else { $info.programs }
+
         $servers += [pscustomobject]@{
             Port           = [int]$info.port
             Pid            = [int]$info.pid
             Project        = $info.project
-            Program        = $info.program
-            Programs       = $info.programs
-            ActiveSessions = $sessions
+            Window         = $window
+            Program        = $program
+            Programs       = $programs
+            ActiveSessions = $disc.activeSessions
             Url            = $info.url
         }
     }
@@ -118,14 +135,19 @@ if ($List) {
         return
     }
     Write-Host ''
-    Write-Host 'Live Ghidra MCP servers:'
+    Write-Host 'Live Ghidra MCP windows:'
     $i = 1
     foreach ($s in $servers) {
-        $busy = if ($s.ActiveSessions -gt 0) { "  [in use: $($s.ActiveSessions) session(s)]" } else { '' }
-        Write-Host ("  [{0}] port {1}  pid {2}  project '{3}'  programs: {4}{5}" -f `
-            $i, $s.Port, $s.Pid, $s.Project, (Format-Programs $s), $busy)
+        $busy = if ($s.ActiveSessions -gt 0) { "  [in use: $($s.ActiveSessions) session(s)]" } else { '  [idle]' }
+        Write-Host ("  [{0}] port {1}  {2}  pid {3}  project '{4}'  programs: {5}{6}" -f `
+            $i, $s.Port, $s.Window, $s.Pid, $s.Project, (Format-Programs $s), $busy)
         $i++
     }
+    $procCount = @($servers | Select-Object -ExpandProperty Pid -Unique).Count
+    Write-Host ''
+    Write-Host ("{0} window(s) across {1} Ghidra process(es). Each window is one agent lane." -f `
+        @($servers).Count, $procCount) -ForegroundColor DarkGray
+    Write-Host 'Add a lane from inside Ghidra: Tools -> MCP Server -> New MCP Window.' -ForegroundColor DarkGray
     Write-Host ''
     return
 }
@@ -140,7 +162,7 @@ $chosen = $null
 
 # An already-set GHIDRA_MCP_URL is an explicit routing choice; honour it so the
 # same variable selects the instance for both agents.
-if (-not $Port -and -not $Binary -and $env:GHIDRA_MCP_URL -match ':(\d+)') {
+if (-not $Port -and -not $Binary -and -not $Window -and $env:GHIDRA_MCP_URL -match ':(\d+)') {
     $Port = [int]$Matches[1]
     Write-Host "Using port $Port from GHIDRA_MCP_URL" -ForegroundColor DarkGray
 }
@@ -149,17 +171,27 @@ if ($Port) {
     $chosen = $servers | Where-Object { $_.Port -eq $Port } | Select-Object -First 1
     if (-not $chosen) { Write-Error "No live MCP server on port $Port."; return }
 }
-elseif ($Binary) {
-    $matched = $servers | Where-Object {
-        ($_.Program -and $_.Program -like "*$Binary*") -or
-        ($_.Programs -and ($_.Programs | Where-Object { $_ -like "*$Binary*" }))
+elseif ($Binary -or $Window) {
+    $matched = $servers
+    if ($Binary) {
+        $matched = $matched | Where-Object {
+            ($_.Program -and $_.Program -like "*$Binary*") -or
+            ($_.Programs -and ($_.Programs | Where-Object { $_ -like "*$Binary*" }))
+        }
     }
+    if ($Window) {
+        $matched = $matched | Where-Object { $_.Window -and $_.Window -like "*$Window*" }
+    }
+    $what = "a window matching '*$Window*'"
+    if ($Binary -and $Window) { $what = "binary '*$Binary*' in window '*$Window*'" }
+    elseif ($Binary)          { $what = "a binary matching '*$Binary*'" }
     if (-not $matched) {
-        Write-Error "No live Ghidra instance has a binary matching '*$Binary*'. Use -List to see what's open."
+        Write-Error "No live Ghidra MCP window has $what. Use -List to see what's open."
         return
     }
     if (@($matched).Count -gt 1) {
-        Write-Error "Multiple instances match '*$Binary*'. Narrow the name or use -Port. (-List to see them.)"
+        $hits = ($matched | ForEach-Object { "$($_.Window) (port $($_.Port))" }) -join ', '
+        Write-Error ("Multiple windows have {0}: {1}. Narrow with -Window or -Port." -f $what, $hits)
         return
     }
     $chosen = @($matched)[0]
@@ -168,13 +200,14 @@ elseif (@($servers).Count -eq 1) {
     $chosen = $servers[0]
 }
 else {
-    # Interactive pick. Prefer flagging idle servers, but let the user choose.
+    # Interactive pick. Prefer flagging idle windows, but let the user choose.
     Write-Host ''
-    Write-Host 'Multiple Ghidra MCP servers are running. Choose one:'
+    Write-Host 'Multiple Ghidra MCP windows are open. Choose one:'
     for ($i = 0; $i -lt $servers.Count; $i++) {
         $s = $servers[$i]
         $busy = if ($s.ActiveSessions -gt 0) { "  [in use: $($s.ActiveSessions)]" } else { '  [idle]' }
-        Write-Host ("  [{0}] port {1}  '{2}'  {3}{4}" -f ($i + 1), $s.Port, $s.Project, (Format-Programs $s), $busy)
+        Write-Host ("  [{0}] port {1}  {2}  '{3}'  {4}{5}" -f `
+            ($i + 1), $s.Port, $s.Window, $s.Project, (Format-Programs $s), $busy)
     }
     $sel = Read-Host 'Enter number'
     $idx = 0
@@ -185,12 +218,12 @@ else {
 }
 
 if ($chosen.ActiveSessions -gt 0) {
-    Write-Warning ("Port {0} already has {1} active session(s). Launching anyway will share that Ghidra instance." -f `
-        $chosen.Port, $chosen.ActiveSessions)
+    Write-Warning ("Port {0} ({1}) already has {2} active session(s). Launching anyway will share that window." -f `
+        $chosen.Port, $chosen.Window, $chosen.ActiveSessions)
 }
 
-Write-Host ("Routing this {0} session to Ghidra on port {1} (programs: {2})" -f `
-    $Client, $chosen.Port, (Format-Programs $chosen)) -ForegroundColor Green
+Write-Host ("Routing this {0} session to {1} on port {2} (programs: {3})" -f `
+    $Client, $chosen.Window, $chosen.Port, (Format-Programs $chosen)) -ForegroundColor Green
 
 if ($Client -eq 'codex') {
     # Codex speaks Streamable HTTP only; -c overrides .codex/config.toml's url.

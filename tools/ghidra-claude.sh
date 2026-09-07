@@ -4,10 +4,12 @@
 # server so multiple sessions can run in parallel against different binaries
 # without colliding. Bash port of ghidra-claude.ps1.
 #
-# Each running Ghidra instance (with the DecompFuncUtils MCP server started)
-# advertises itself in ~/.ghidra-mcp/server-<pid>.json. This launcher discovers
-# the live servers, picks one (by loaded binary name, by port, or interactively),
-# and execs the agent bound to it.
+# Every MCP-serving Ghidra tool window advertises itself in
+# ~/.ghidra-mcp/server-<pid>-<port>.json. One Ghidra process can host several
+# windows (CodeBrowser, CodeBrowser(2), ...), each with its own active program and
+# port, so several entries may share a pid. This launcher discovers the live
+# servers, picks one (by loaded binary name, by window name, by port, or
+# interactively), and execs the agent bound to it.
 #
 #   claude (default) — exports GHIDRA_MCP_URL with the legacy SSE URL; the
 #                      project's .mcp.json reads ${GHIDRA_MCP_URL:-...}.
@@ -18,6 +20,7 @@
 # Usage:
 #   ./tools/ghidra-claude.sh --binary libfoo.so [-- agent args...]
 #   ./tools/ghidra-claude.sh --client codex --binary libfoo.so
+#   ./tools/ghidra-claude.sh --window 'CodeBrowser(2)'
 #   ./tools/ghidra-claude.sh --port 13101
 #   ./tools/ghidra-claude.sh --list
 #
@@ -30,13 +33,14 @@ set -euo pipefail
 PORT_DIR="${HOME}/.ghidra-mcp"
 
 BINARY=""
+WINDOW=""
 PORT=""
 CLIENT="claude"
 DO_LIST=0
 declare -a AGENT_ARGS=()
 
 usage() {
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -44,6 +48,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --binary|-b) BINARY="${2:-}"; shift 2 ;;
+        --window|-w) WINDOW="${2:-}"; shift 2 ;;
         --port|-p)   PORT="${2:-}";   shift 2 ;;
         --client|-c) CLIENT="${2:-}"; shift 2 ;;
         --list|-l)   DO_LIST=1;       shift ;;
@@ -71,12 +76,13 @@ else
     exit 2
 fi
 
-# Emit a TAB-separated line: port \t pid \t project \t program \t programs(| joined)
+# Emit a TAB-separated line:
+#   port \t pid \t project \t program \t programs(| joined) \t window
 parse_file() {
     local f="$1"
     if [[ "$JSON_TOOL" == "jq" ]]; then
         jq -r '[(.port|tostring), (.pid|tostring), (.project // ""), (.program // ""),
-                ((.programs // []) | join("|"))] | @tsv' "$f" 2>/dev/null
+                ((.programs // []) | join("|")), (.window // "?")] | @tsv' "$f" 2>/dev/null
     else
         "$JSON_TOOL" - "$f" <<'PYEOF' 2>/dev/null
 import json, sys
@@ -86,7 +92,8 @@ except Exception:
     sys.exit(1)
 progs = d.get("programs") or []
 fields = [str(d.get("port", "")), str(d.get("pid", "")),
-          d.get("project") or "", d.get("program") or "", "|".join(progs)]
+          d.get("project") or "", d.get("program") or "", "|".join(progs),
+          d.get("window") or "?"]
 print("\t".join(fields))
 PYEOF
     fi
@@ -110,15 +117,17 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 # ---- discovery: collect live servers into parallel arrays ----
-declare -a S_PORT S_PID S_PROJ S_PROG S_PROGS S_SESS
+# Assigned empty, not merely declared: under `set -u` bash treats a declared-but-unset
+# array as unbound, so ${#S_PORT[@]} would abort the "no live servers" path.
+declare -a S_PORT=() S_PID=() S_PROJ=() S_PROG=() S_PROGS=() S_SESS=() S_WIN=()
 discover() {
     [[ -d "$PORT_DIR" ]] || return 0
-    local f line port pid proj prog progs sess
+    local f line port pid proj prog progs win sess
     for f in "$PORT_DIR"/server-*.json; do
         [[ -e "$f" ]] || continue
         line=$(parse_file "$f") || { continue; }
         [[ -n "$line" ]] || continue
-        IFS=$'\t' read -r port pid proj prog progs <<<"$line"
+        IFS=$'\t' read -r port pid proj prog progs win <<<"$line"
         [[ -n "$port" ]] || continue
         if ! sess=$(probe_sessions "$port"); then
             # Server not answering — stale advertisement, remove it.
@@ -127,6 +136,7 @@ discover() {
         fi
         S_PORT+=("$port"); S_PID+=("$pid"); S_PROJ+=("$proj")
         S_PROG+=("$prog"); S_PROGS+=("$progs"); S_SESS+=("$sess")
+        S_WIN+=("${win:-?}")
     done
 }
 
@@ -153,13 +163,17 @@ if [[ "$DO_LIST" -eq 1 ]]; then
         exit 0
     fi
     echo
-    echo "Live Ghidra MCP servers:"
+    echo "Live Ghidra MCP windows:"
     for ((i = 0; i < COUNT; i++)); do
-        busy=""
+        busy="  [idle]"
         [[ "${S_SESS[$i]}" -gt 0 ]] 2>/dev/null && busy="  [in use: ${S_SESS[$i]} session(s)]"
-        printf "  [%d] port %s  pid %s  project '%s'  programs: %s%s\n" \
-            "$((i + 1))" "${S_PORT[$i]}" "${S_PID[$i]}" "${S_PROJ[$i]}" "$(fmt_programs "$i")" "$busy"
+        printf "  [%d] port %s  %s  pid %s  project '%s'  programs: %s%s\n" \
+            "$((i + 1))" "${S_PORT[$i]}" "${S_WIN[$i]}" "${S_PID[$i]}" "${S_PROJ[$i]}" \
+            "$(fmt_programs "$i")" "$busy"
     done
+    echo
+    echo "Each window is one agent lane. Add one from inside Ghidra:"
+    echo "  Tools -> MCP Server -> New MCP Window"
     echo
     exit 0
 fi
@@ -174,7 +188,7 @@ CHOSEN=-1
 
 # An already-set GHIDRA_MCP_URL is an explicit routing choice; honour it so the
 # same variable selects the instance for both agents.
-if [[ -z "$PORT" && -z "$BINARY" && -n "${GHIDRA_MCP_URL:-}" ]]; then
+if [[ -z "$PORT" && -z "$BINARY" && -z "$WINDOW" && -n "${GHIDRA_MCP_URL:-}" ]]; then
     if [[ "$GHIDRA_MCP_URL" =~ :([0-9]+) ]]; then
         PORT="${BASH_REMATCH[1]}"
         echo "Using port $PORT from GHIDRA_MCP_URL"
@@ -186,19 +200,35 @@ if [[ -n "$PORT" ]]; then
         [[ "${S_PORT[$i]}" == "$PORT" ]] && CHOSEN=$i && break
     done
     [[ "$CHOSEN" -lt 0 ]] && { echo "error: no live MCP server on port $PORT." >&2; exit 1; }
-elif [[ -n "$BINARY" ]]; then
-    needle=$(echo "$BINARY" | tr '[:upper:]' '[:lower:]')
+elif [[ -n "$BINARY" || -n "$WINDOW" ]]; then
+    bneedle=$(echo "$BINARY" | tr '[:upper:]' '[:lower:]')
+    wneedle=$(echo "$WINDOW" | tr '[:upper:]' '[:lower:]')
     declare -a HITS=()
     for ((i = 0; i < COUNT; i++)); do
-        hay=$(echo "${S_PROG[$i]} ${S_PROGS[$i]}" | tr '[:upper:]' '[:lower:]')
-        [[ "$hay" == *"$needle"* ]] && HITS+=("$i")
+        if [[ -n "$BINARY" ]]; then
+            hay=$(echo "${S_PROG[$i]} ${S_PROGS[$i]}" | tr '[:upper:]' '[:lower:]')
+            [[ "$hay" == *"$bneedle"* ]] || continue
+        fi
+        if [[ -n "$WINDOW" ]]; then
+            whay=$(echo "${S_WIN[$i]}" | tr '[:upper:]' '[:lower:]')
+            [[ "$whay" == *"$wneedle"* ]] || continue
+        fi
+        HITS+=("$i")
     done
+    WHAT="a window matching '*${WINDOW}*'"
+    if [[ -n "$BINARY" && -n "$WINDOW" ]]; then
+        WHAT="binary '*${BINARY}*' in window '*${WINDOW}*'"
+    elif [[ -n "$BINARY" ]]; then
+        WHAT="a binary matching '*${BINARY}*'"
+    fi
     if [[ ${#HITS[@]} -eq 0 ]]; then
-        echo "error: no live Ghidra instance has a binary matching '*${BINARY}*'. Use --list to see what's open." >&2
+        echo "error: no live Ghidra MCP window has ${WHAT}. Use --list to see what's open." >&2
         exit 1
     fi
     if [[ ${#HITS[@]} -gt 1 ]]; then
-        echo "error: multiple instances match '*${BINARY}*'. Narrow the name or use --port. (--list to see them.)" >&2
+        hits=""
+        for i in "${HITS[@]}"; do hits+="${S_WIN[$i]} (port ${S_PORT[$i]}), "; done
+        echo "error: multiple windows have ${WHAT}: ${hits%, }. Narrow with --window or --port." >&2
         exit 1
     fi
     CHOSEN=${HITS[0]}
@@ -206,12 +236,12 @@ elif [[ "$COUNT" -eq 1 ]]; then
     CHOSEN=0
 else
     echo
-    echo "Multiple Ghidra MCP servers are running. Choose one:"
+    echo "Multiple Ghidra MCP windows are open. Choose one:"
     for ((i = 0; i < COUNT; i++)); do
         state="  [idle]"
         [[ "${S_SESS[$i]}" -gt 0 ]] 2>/dev/null && state="  [in use: ${S_SESS[$i]}]"
-        printf "  [%d] port %s  '%s'  %s%s\n" \
-            "$((i + 1))" "${S_PORT[$i]}" "${S_PROJ[$i]}" "$(fmt_programs "$i")" "$state"
+        printf "  [%d] port %s  %s  '%s'  %s%s\n" \
+            "$((i + 1))" "${S_PORT[$i]}" "${S_WIN[$i]}" "${S_PROJ[$i]}" "$(fmt_programs "$i")" "$state"
     done
     read -r -p "Enter number: " sel
     if ! [[ "$sel" =~ ^[0-9]+$ ]] || [[ "$sel" -lt 1 ]] || [[ "$sel" -gt "$COUNT" ]]; then
@@ -222,10 +252,10 @@ else
 fi
 
 if [[ "${S_SESS[$CHOSEN]}" -gt 0 ]] 2>/dev/null; then
-    echo "warning: port ${S_PORT[$CHOSEN]} already has ${S_SESS[$CHOSEN]} active session(s); launching anyway will share that Ghidra instance." >&2
+    echo "warning: port ${S_PORT[$CHOSEN]} (${S_WIN[$CHOSEN]}) already has ${S_SESS[$CHOSEN]} active session(s); launching anyway will share that window." >&2
 fi
 
-echo "Routing this ${CLIENT} session to Ghidra on port ${S_PORT[$CHOSEN]} (programs: $(fmt_programs "$CHOSEN"))"
+echo "Routing this ${CLIENT} session to ${S_WIN[$CHOSEN]} on port ${S_PORT[$CHOSEN]} (programs: $(fmt_programs "$CHOSEN"))"
 
 if [[ "$CLIENT" == "codex" ]]; then
     # Codex speaks Streamable HTTP only; -c overrides .codex/config.toml's url.

@@ -88,8 +88,8 @@ The built extension will be in `dist/`.
 
 ## MCP Server (AI Agent Integration)
 
-The plugin exposes Ghidra to AI agents over MCP. One Ghidra instance serves
-**both** MCP transports on the same port, because different clients speak
+The plugin exposes Ghidra to AI agents over MCP. Each Ghidra tool window serves
+**both** MCP transports on its own port, because different clients speak
 different ones:
 
 | Endpoint | Transport | Used by |
@@ -160,7 +160,7 @@ Two caveats worth knowing:
   prompt, or register it globally with
   `codex mcp add ghidra --url http://127.0.0.1:13100/mcp`.
 - TOML has no environment-variable interpolation, so that port is literal. It is
-  pinned to the instance that was live when it was written, and a restarted
+  pinned to the window that was live when it was written, and a restarted
   Ghidra may claim a different port — check with `./tools/ghidra-claude.ps1 -List`
   and either edit the file or retarget per session with the launcher below or
   `codex -c mcp_servers.ghidra.url="http://127.0.0.1:13102/mcp"`.
@@ -179,44 +179,66 @@ Claude Code uses the legacy SSE transport via the committed `.mcp.json`:
 ```
 
 Unlike Codex's config, this one *does* interpolate, so `GHIDRA_MCP_URL` chooses
-the instance. Note that `/sse` is a long-lived stream: once open it stays open,
+the window. Note that `/sse` is a long-lived stream: once open it stays open,
 sending a `: keepalive` comment every 30s. **That is the healthy steady state,
 not a hang** — responses to your `POST /message` calls arrive as `event: message`
 frames on that stream.
 
-### Selecting a port (13100–13149)
+### One server per tool window (13100–13149)
 
-When the MCP server starts it takes the first free port beginning at the
-configured one (default `13100`, under *Edit → Tool Options → MCP Server*), so a
-second Ghidra lands on `13101`, a third on `13102`, and so on. Each instance
-advertises itself in `~/.ghidra-mcp/server-<pid>.json` with its port, project,
-and loaded binaries; stale files from crashed instances are pruned on start.
+The unit of parallelism is the **Ghidra tool window**, not the Ghidra process.
+Each window that carries the plugin runs its own MCP server on its own port and
+serves *that window's* active program — so `CodeBrowser` and `CodeBrowser(2)` in
+one Ghidra are two independent lanes for two agent sessions. This matters because
+a Ghidra project is locked to a single process: several windows are the only way
+to work on several binaries of the same project at once.
+
+When a server starts it takes the first free port beginning at the configured one
+(default `13100`, under *Edit → Tool Options → MCP Server*), so the second window
+lands on `13101`, the third on `13102`, and so on — across windows and across
+processes alike. Each window advertises itself in
+`~/.ghidra-mcp/server-<pid>-<port>.json` with its port, window name, project, and
+loaded binaries; several files share a pid when one Ghidra hosts several windows.
+Stale files (dead process, or a window that closed hard) are pruned on start.
+
+*MCP Auto Start* is on by default, so a newly opened window claims a port by
+itself — provided the plugin is part of the tool config you launch it from
+(configure it once via *File → Configure*, then *File → Save Tool*).
 
 ```powershell
-./tools/ghidra-claude.ps1 -List                      # every live server + its binaries
-curl http://127.0.0.1:13101/discovery                # one server's status
+./tools/ghidra-claude.ps1 -List                      # every live window + port + binaries
+curl http://127.0.0.1:13101/discovery                # one window's status
 ```
 
 ### Running multiple sessions in parallel
 
-You can drive several binaries at once, one agent session per Ghidra instance,
-with no cross-talk.
+You can drive several binaries at once with no cross-talk, one agent session per
+window.
 
-1. Open each binary in its own Ghidra instance and start its MCP server
-   (`Tools → MCP Server → Start`, or enable *MCP Auto Start* in the options).
-2. In a terminal, launch the agent bound to a specific instance. PowerShell:
+1. Add a lane. Any of:
+   - **From Ghidra:** `Tools → MCP Server → New MCP Window` — opens another window
+     on the current program, starts its server, and tells you its port.
+   - **From an agent:** `ghidra_open_in_new_window` with a program name — opens
+     that binary in a fresh window and returns the new port plus the attach
+     command. `ghidra_list_windows` shows every lane and which one you are in.
+   - **By hand:** open a second CodeBrowser from the project window
+     (`Tools → Run Tool`, or double-click a second binary) — with auto-start it
+     claims the next port on its own.
+2. In a terminal, launch the agent bound to a specific window. PowerShell:
 
    ```powershell
-   ./tools/ghidra-claude.ps1 -Binary libfoo.so                 # Claude -> instance with libfoo.so
-   ./tools/ghidra-claude.ps1 -Client codex -Binary libfoo.so   # Codex  -> same instance
+   ./tools/ghidra-claude.ps1 -Binary libfoo.so                 # Claude -> window with libfoo.so
+   ./tools/ghidra-claude.ps1 -Window 'CodeBrowser(2)'          # pick a window by name
+   ./tools/ghidra-claude.ps1 -Client codex -Binary libfoo.so   # Codex  -> same window
    ./tools/ghidra-claude.ps1 -Port 13101                       # pin an exact port
-   ./tools/ghidra-claude.ps1 -List                             # just list the live servers
+   ./tools/ghidra-claude.ps1 -List                             # just list the live windows
    ```
 
    Or Bash (Linux/macOS/Git Bash — needs `curl` and either `jq` or `python`):
 
    ```bash
    ./tools/ghidra-claude.sh --binary libfoo.so
+   ./tools/ghidra-claude.sh --window 'CodeBrowser(2)'
    ./tools/ghidra-claude.sh --client codex --binary libfoo.so
    ./tools/ghidra-claude.sh --port 13101
    ./tools/ghidra-claude.sh --list
@@ -224,13 +246,21 @@ with no cross-talk.
 
    For Claude the launcher exports `GHIDRA_MCP_URL`; for Codex it passes
    `-c mcp_servers.ghidra.url=.../mcp`. Either way the agent starts in the same
-   shell, bound to one instance. Repeat in another terminal for another binary.
+   shell, bound to one window. Repeat in another terminal for another binary.
 
-Because each session targets a separate Ghidra process (separate JVM and project
-database), edits, analysis, and decompilation in one can't damage or override
-another. Working two sessions on the *same* binary is not recommended — the
-database is protected from corruption, but the sessions will logically overwrite
-each other's renames/structs.
+Each session gets its own port, its own window and that window's active program;
+the `initialize` response tells the agent which window it landed in. Separate
+Ghidra *processes* additionally isolate the JVM and the project database, so use
+those for unrelated projects. Two sessions on the *same* program — whether via
+two windows or two processes — is still not recommended: the database is
+protected from corruption (EDT-serialized, per-call transactions), but the
+sessions will logically overwrite each other's renames and structs. Pass
+`closeHere: true` to `ghidra_open_in_new_window` to hand a program over to the
+new lane instead of holding it in both.
+
+Costs of sharing one process: all windows share one Swing event thread, so a long
+mutating call in one window makes the others' GUI wait its turn, and a JVM crash
+takes every lane with it.
 
 ### Troubleshooting: "server reachable but handshake fails"
 

@@ -82,8 +82,12 @@ function Resolve-BaseUrl {
         }
         if (@($live).Count -eq 1) { return "http://127.0.0.1:$($live[0].port)" }
         if (@($live).Count -gt 1) {
-            Write-Host 'Multiple live Ghidra MCP servers; pass -Port to choose one:' -ForegroundColor Yellow
-            $live | ForEach-Object { Write-Host ("  port {0}  pid {1}  project '{2}'" -f $_.port, $_.pid, $_.project) }
+            # Several entries can share a pid: one MCP server per Ghidra tool window.
+            Write-Host 'Multiple live Ghidra MCP windows; pass -Port to choose one:' -ForegroundColor Yellow
+            $live | ForEach-Object {
+                Write-Host ("  port {0}  {1}  pid {2}  project '{3}'" -f `
+                    $_.port, $(if ($_.window) { $_.window } else { '?' }), $_.pid, $_.project)
+            }
             return $null
         }
     }
@@ -99,7 +103,8 @@ Write-Host "MCP handshake probe -> $base" -ForegroundColor Cyan
 # Reachability first, so a dead port is not reported as a protocol failure.
 try {
     $disc = Invoke-RestMethod -Uri "$base/discovery" -TimeoutSec 5
-    Write-Host ("  server up: port {0}, {1} SSE session(s)" -f $disc.port, $disc.activeSessions) -ForegroundColor DarkGray
+    $win = if ($disc.window) { " window '$($disc.window)'," } else { '' }
+    Write-Host ("  server up: port {0},{1} {2} SSE session(s)" -f $disc.port, $win, $disc.activeSessions) -ForegroundColor DarkGray
 } catch {
     Write-Host "  [FAIL] server not reachable at $base/discovery - is the MCP server started in Ghidra?" -ForegroundColor Red
     Write-Host '         (Ghidra: Tools -> MCP Server -> Start)' -ForegroundColor DarkGray

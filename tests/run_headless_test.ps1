@@ -37,8 +37,9 @@ if (-not $SkipBuild) {
     finally { Pop-Location }
 }
 
-# 2) Locate freshest dist zip.
-$zip = Get-ChildItem (Join-Path $repo "dist\*DecompFuncUtils.zip") | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+# 2) Locate freshest dist zip. The module name follows the checkout directory, so a
+#    worktree builds e.g. DecompFuncUtils.improve.zip — match either.
+$zip = Get-ChildItem (Join-Path $repo "dist\*DecompFuncUtils*.zip") | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $zip) { Write-Error "No built extension zip in dist/"; exit 2 }
 
 # 3) Resolve an isolated settings dir for this run.
@@ -56,7 +57,8 @@ New-Item -ItemType Directory -Force $extDir | Out-Null
 # 4) Install fresh build as the single DecompFuncUtils module.
 #    A copy under <install>\Ghidra\Extensions would collide with this one
 #    ("Multiple modules collided"), so require a clean installation.
-if (Test-Path -LiteralPath (Join-Path $GhidraInstall "Ghidra\Extensions\DecompFuncUtils")) {
+$module = [System.IO.Path]::GetFileNameWithoutExtension($zip.Name) -replace '^ghidra_.+?_\d{8}_', ''
+if (Test-Path -LiteralPath (Join-Path $GhidraInstall "Ghidra\Extensions\$module")) {
     throw "An extension exists in the Ghidra installation. Use a clean Ghidra installation for isolated tests."
 }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
