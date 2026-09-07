@@ -355,15 +355,15 @@ public class GpuTaintEngine {
     }
     
     /**
-     * Compute transitive closure using iterative squaring
-     * More efficient for finding all reachable nodes
+     * Compute transitive closure using iterative propagation
+     * Follows paths until convergence or the longest simple path bound
      * 
      * M* = I + M + M² + M³ + ... = (I + M)^n for sufficient n
      */
     public void computeTransitiveClosure(int numNodes, int[] rowPtr, int[] colInd, 
                                          float[] values, float[] taintVector) {
-        // For transitive closure, we need log2(numNodes) iterations of squaring
-        int iterations = (int) Math.ceil(Math.log(numNodes) / Math.log(2)) + 1;
+        // Matrix-vector propagation advances one edge per iteration, not squaring.
+        int iterations = Math.max(0, numNodes - 1);
         runTaintPropagation(numNodes, rowPtr[numNodes], rowPtr, colInd, values, 
                            taintVector, iterations);
     }

@@ -56,7 +56,7 @@ To check a *running* Ghidra's MCP server rather than a headless one, use
 
 Ghidra loads the plugin as an **installed extension module**. The runner installs the
 freshly built zip into an isolated settings tree under `$env:TEMP` (via
-`XDG_CONFIG_HOME`) and removes any copy under `<install>/Ghidra/Extensions` — two
+`XDG_CONFIG_HOME`) and refuses to run if a copy exists under `<install>/Ghidra/Extensions` — two
 directories declaring the same module name make Ghidra abort with *"Multiple modules
 collided: DecompFuncUtils"*. The isolated tree also means tests run fine while a GUI
 Ghidra is open: installing into `%APPDATA%\ghidra` would fail because the running
@@ -69,3 +69,5 @@ Test cases deliberately use data flow the engine models: structural call pattern
 dereferences (`*p`, not `p[n]`), and taint that propagates through call **return values**
 (e.g. `getenv`). Taint that only reaches a variable by a write through a pointer argument
 (`read(fd, &len, 8)`) is not tracked by the reachability engine and is intentionally avoided.
+
+Additional regressions cover 64-node reachability chains in both engines, MCP query presets, one-function pagination without omissions or duplicates, coverage metadata, and invalid query arguments. Test runs use unique temporary settings and project directories; the runner stops immediately on a failed build.

@@ -7,7 +7,7 @@
   Requires a Ghidra install (GHIDRA_INSTALL_DIR env var, or the -GhidraInstall param).
   The extension is loaded by Ghidra as an installed module, so this script installs the
   freshly built zip into the per-user Extensions dir for the matching Ghidra version and
-  removes any copy under <install>/Ghidra/Extensions (two copies of the same module name
+  refuses to run with a copy under <install>/Ghidra/Extensions (two copies of the same module name
   make Ghidra abort with "Multiple modules collided"). The Ghidra project is created in
   $env:TEMP so it is never scanned as a module.
 #>
@@ -29,7 +29,11 @@ if (-not (Test-Path $hl)) { Write-Error "analyzeHeadless not found at $hl (set G
 if (-not $SkipBuild) {
     Write-Host "==> Building extension..." -ForegroundColor Cyan
     Push-Location $repo
-    try { $env:GHIDRA_INSTALL_DIR = $GhidraInstall; & gradle --offline buildExtension -q }
+    try {
+        $env:GHIDRA_INSTALL_DIR = $GhidraInstall
+        & gradle --offline buildExtension -q
+        if ($LASTEXITCODE -ne 0) { throw "Extension build failed" }
+    }
     finally { Pop-Location }
 }
 
@@ -44,22 +48,23 @@ if (-not $zip) { Write-Error "No built extension zip in dist/"; exit 2 }
 #    its live MCP server — is left completely untouched.
 $ver = (Get-Content (Join-Path $GhidraInstall "Ghidra\application.properties") |
         Select-String '^application.version=(.+)$').Matches.Groups[1].Value.Trim()
-$settingsRoot = Join-Path $env:TEMP "dfu_ghidra_settings"
+$runId = [guid]::NewGuid().ToString("N")
+$settingsRoot = Join-Path $env:TEMP "dfu_ghidra_settings_$runId"
 $extDir = Join-Path $settingsRoot "ghidra\ghidra_${ver}_DEV\Extensions"
 New-Item -ItemType Directory -Force $extDir | Out-Null
 
 # 4) Install fresh build as the single DecompFuncUtils module.
 #    A copy under <install>\Ghidra\Extensions would collide with this one
-#    ("Multiple modules collided"), so make sure that location stays empty.
-Remove-Item -Recurse -Force (Join-Path $GhidraInstall "Ghidra\Extensions\DecompFuncUtils") -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force (Join-Path $extDir "DecompFuncUtils") -ErrorAction SilentlyContinue
+#    ("Multiple modules collided"), so require a clean installation.
+if (Test-Path -LiteralPath (Join-Path $GhidraInstall "Ghidra\Extensions\DecompFuncUtils")) {
+    throw "An extension exists in the Ghidra installation. Use a clean Ghidra installation for isolated tests."
+}
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::ExtractToDirectory($zip.FullName, $extDir)
 Write-Host "==> Installed $($zip.Name) -> $extDir" -ForegroundColor Cyan
 
 # 5) Run the test headless (project in TEMP so the repo module isn't double-scanned).
-$proj = Join-Path $env:TEMP "dfu_ghidra_proj"
-if (Test-Path $proj) { Remove-Item -Recurse -Force $proj }
+$proj = Join-Path $env:TEMP "dfu_ghidra_proj_$runId"
 New-Item -ItemType Directory -Force $proj | Out-Null
 $bin = Join-Path $repo "tests\test_vuln.o"
 $sp  = Join-Path $repo "tests\scripts"

@@ -102,6 +102,43 @@ different ones:
 requested version when it is one of `2024-11-05`, `2025-03-26`, `2025-06-18`,
 and otherwise answers with the newest it supports.
 
+### Taint analysis through MCP
+
+Call `ghidra_taint_query` with a preset to start without writing the pattern DSL:
+
+```json
+{"preset":"tainted_copy_length","maxFunctions":100}
+```
+
+Available presets are `tainted_copy_length` (tainted `memcpy` length),
+`tainted_format` (tainted `printf` format), `use_after_free` (direct dereference
+following `free`), and `double_free`. These report candidates for investigation.
+Provide either `preset` or `query`, never both. To focus on one function:
+
+```json
+{"preset":"tainted_format","functionName":"fmt"}
+```
+
+For a custom source-specific query:
+
+```json
+{"query":"PATTERN p { printf($fmt); } WHERE tainted($fmt, \"getenv\")","maxFunctions":100}
+```
+
+For each page, inspect `functionsScanned` (attempted), `functionsAnalyzed`
+(successful), and `failures` (addresses and reasons). When `truncated` is true,
+pass `nextStartAfter` as `startAfter` with the same query and limit to continue.
+Keep the program unchanged while paging. Retry failed functions individually
+using `functionAddress`, optionally with a longer `decompileTimeout`.
+`complete` reports coverage of the requested scope/page remainder; an empty
+match list does not prove safety. Pointer writes, aliases, indirect calls, and
+interprocedural source reachability remain approximate.
+
+Use `ghidra_taint_forward` or `ghidra_taint_backward` with `functionName`,
+`variableName`, and `maxDepth` to investigate a candidate further. Query results
+include function and match addresses so you can decompile or navigate directly
+to the finding using the existing MCP tools.
+
 ### How Codex connects
 
 Codex's MCP client (rmcp) supports **stdio and Streamable HTTP only — there is no

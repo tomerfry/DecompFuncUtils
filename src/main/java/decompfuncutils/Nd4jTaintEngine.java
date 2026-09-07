@@ -299,13 +299,13 @@ public class Nd4jTaintEngine {
     }
     
     /**
-     * Compute Boolean transitive closure using repeated squaring
-     * More efficient for reachability analysis
+     * Compute Boolean transitive closure using iterative propagation
+     * Follows paths until convergence or the longest simple path bound
      */
     public void computeReachability(int numNodes, int[] rowPtr, int[] colInd,
                                    float[] taintVector) {
-        // For transitive closure, log2(n) iterations of squaring suffice
-        int iterations = (int) Math.ceil(Math.log(numNodes) / Math.log(2)) + 1;
+        // Matrix-vector propagation advances one edge per iteration, not squaring.
+        int iterations = Math.max(0, numNodes - 1);
         
         // Use binary values for reachability
         for (int i = 0; i < taintVector.length; i++) {

@@ -26,6 +26,8 @@ public class TaintHeadlessTest extends GhidraScript {
     public void run() throws Exception {
         println("HEADLESS_TEST_START prog=" + currentProgram.getName());
 
+        testReachability();
+        testQueryMcp();
         DecompInterface decomp = new DecompInterface();
         decomp.openProgram(currentProgram);
         try {
@@ -90,6 +92,59 @@ public class TaintHeadlessTest extends GhidraScript {
 
         println("HEADLESS_TEST_SUMMARY passed=" + passed + " failed=" + failed);
         println(failed == 0 ? "HEADLESS_TEST_RESULT PASS" : "HEADLESS_TEST_RESULT FAIL");
+    }
+
+    private void testReachability() {
+        int n = 64;
+        int[] rows = new int[n + 1];
+        int[] cols = new int[n - 1];
+        float[] weights = new float[n - 1];
+        Arrays.fill(weights, 1.0f);
+        for (int i = 1; i <= n; i++) rows[i] = i - 1;
+        for (int i = 0; i < n - 1; i++) cols[i] = i;
+        float[] seeds = new float[n];
+        seeds[0] = 1;
+        new decompfuncutils.Nd4jTaintEngine().computeReachability(n, rows, cols, seeds);
+        check("nd4j_reaches_end_of_long_chain", seeds[n - 1] == 1, "tail=" + seeds[n - 1]);
+        Arrays.fill(seeds, 0);
+        seeds[0] = 1;
+        new decompfuncutils.GpuTaintEngine().computeTransitiveClosure(n, rows, cols, weights, seeds);
+        check("gpu_reaches_end_of_long_chain", seeds[n - 1] == 1, "tail=" + seeds[n - 1]);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void testQueryMcp() throws Exception {
+        decompfuncutils.mcp.tools.TaintQueryTool queryTool = new decompfuncutils.mcp.tools.TaintQueryTool();
+        Map<String, Object> preset = (Map<String, Object>) queryTool.execute(
+            Map.of("preset", "tainted_format", "functionName", "fmt"), currentProgram, null);
+        check("mcp_preset_finds_format", ((Number) preset.get("matchCount")).intValue() > 0, preset.toString());
+        check("mcp_reports_complete_scope", Boolean.TRUE.equals(preset.get("complete")), preset.toString());
+        Set<String> cursors = new HashSet<>();
+        String cursor = null;
+        int scanned = 0;
+        do {
+            Map<String, Object> args = new HashMap<>();
+            args.put("preset", "double_free");
+            args.put("maxFunctions", 1);
+            if (cursor != null) args.put("startAfter", cursor);
+            Map<String, Object> page = (Map<String, Object>) queryTool.execute(args, currentProgram, null);
+            scanned += ((Number) page.get("functionsScanned")).intValue();
+            cursor = (String) page.get("nextStartAfter");
+            if (cursor != null && !cursors.add(cursor)) throw new AssertionError("Repeated cursor: " + cursor);
+        } while (cursor != null);
+        // getFunctionCount also includes external functions, unlike getFunctions(true).
+        int expected = 0;
+        FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
+        while (functions.hasNext()) { functions.next(); expected++; }
+        check("mcp_pages_cover_functions_once", scanned == expected, "scanned=" + scanned + " expected=" + expected);
+        for (Map<String, Object> bad : List.<Map<String, Object>>of(
+                Map.of("preset", "missing"), Map.of("preset", "double_free", "maxFunctions", 0),
+                Map.of("preset", "double_free", "query", "PATTERN p { free($p); }"))) {
+            boolean rejected = false;
+            try { queryTool.execute(bad, currentProgram, null); }
+            catch (IllegalArgumentException invalidArgument) { rejected = true; }
+            check("mcp_rejects_invalid_" + bad, rejected, bad.toString());
+        }
     }
 
     private Set<String> runQuery(String q, DecompInterface decomp) {

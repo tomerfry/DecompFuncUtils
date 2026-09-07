@@ -2546,7 +2546,7 @@ public class TaintQueryMatcher {
             taintVector[sourceId] = 1.0f;
             
             engine.runTaintPropagation(data.numNodes, data.numEdges,
-                data.rowPtr, data.colInd, data.values, taintVector, 30);
+                data.rowPtr, data.colInd, data.values, taintVector, Math.max(0, data.numNodes - 1));
             
             taintCache.put(sourceId, taintVector);
             return taintVector;
