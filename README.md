@@ -159,6 +159,69 @@ Use `ghidra_taint_forward` or `ghidra_taint_backward` with `functionName`,
 include function and match addresses so you can decompile or navigate directly
 to the finding using the existing MCP tools.
 
+### Symbolic branch analysis and emulation
+
+Use `ghidra_suggest_branch_flip` with a `branchAddress` to obtain concrete
+witnesses for a local decompiler predicate. Supported shapes are same-width
+integer comparisons against constants and masked equality/inequality.
+`trueFeasible` and `falseFeasible` describe that predicate alone; an empty
+witness list means that direction is impossible for the supported shape.
+Witnesses use unsigned hex bit patterns, including signed negative values.
+Width-changing casts, computed inputs, and masked inequalities return
+`supported: false`. Earlier path constraints are not solved.
+
+Use `ghidra_emulate_function` to verify candidates with seeded `registers`,
+`memory`, and `stackPointer`. Enable `recordBranches` and `symbolicBranches`
+to inspect the concrete path alongside decompiler expressions. `pcAtStop`
+reports the final execution address, including when `maxSteps` is exhausted;
+a breakpoint reached by the last allowed step takes precedence over the limit.
+`branchCount` and `skippedCallCount` count all observations even when their
+returned lists are truncated. Expression depth must be 1–64 and `maxSteps`
+must be positive (capped at 2,000,000).
+
+Re-emulate local branch witnesses to check reachability and machine-branch
+direction. Skipped external calls do not model callee side effects.
+
+### Bounded symbolic path exploration
+
+`ghidra_explore_paths` solves constraints across branches within one little-endian
+x86/x64 function using the bundled Z3 solver. Supply an instruction `entry`,
+`targetAddresses`, a concrete `stackPointer`, and named `symbolicInputs` in
+registers or memory. Optional `registers` and `memory` provide concrete seeds;
+`avoidAddresses` excludes paths reaching those instructions.
+
+```json
+{
+  "entry": "00101000",
+  "targetAddresses": ["00101030"],
+  "stackPointer": "0x800000",
+  "symbolicInputs": [{"name": "argument", "register": "EDI"}],
+  "maxStates": 128,
+  "timeoutMs": 10000
+}
+```
+
+Replace the example addresses and argument register with those from your program.
+For memory inputs, use `{"name":"buffer","address":"00700000","size":4}`
+and seed the pointer register through `registers`. Symbolic input bytes override
+concrete seeds. Ordinary unseeded registers start at zero; memory must come from
+explicit seeds or initialized program bytes. PC and SP cannot be symbolic inputs.
+Seed the return-address bytes at `stackPointer` if explored paths can execute
+a return instruction; reading an uninitialized stack stops that path as incomplete.
+
+The tool returns the first witness verified by Ghidra's concrete emulator, its
+branch trace, and `emulateArguments` for `ghidra_emulate_function`. Targets stop
+execution before the target instruction. `status: "found"` reports a verified
+witness; `"exhausted"` with `complete: true` means no target is reachable within
+the stated model and avoid scope. `"incomplete"` is not proof of unreachability.
+
+State, instruction, loop-visit, p-code operation, and solver/time limits bound the
+search. Calls, division, symbolic addresses, executable-memory writes, and other
+unsupported operations terminate affected paths with diagnostics. Only one
+exploration runs at a time; concurrent requests return `status: "busy"`.
+The extension bundles Z3 and its native loader dependencies; native loading
+failures are reported explicitly. Exploration does not modify the program.
+
 ### How Codex connects
 
 Codex's MCP client (rmcp) supports **stdio and Streamable HTTP only — there is no

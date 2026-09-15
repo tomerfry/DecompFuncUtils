@@ -126,13 +126,16 @@ public class EmulateFunctionTool implements McpTool {
 
         Address entry = McpUtil.parseAddress((String) arguments.get("entry"), program);
 
-        int maxSteps = Math.min(
-            ((Number) arguments.getOrDefault("maxSteps", DEFAULT_MAX_STEPS)).intValue(),
-            HARD_MAX_STEPS);
+        long requestedSteps = ((Number) arguments.getOrDefault("maxSteps", DEFAULT_MAX_STEPS)).longValue();
+        if (requestedSteps < 1) throw new IllegalArgumentException("maxSteps must be positive");
+        int maxSteps = (int) Math.min(requestedSteps, HARD_MAX_STEPS);
         boolean recordBranches = Boolean.TRUE.equals(arguments.get("recordBranches"));
         boolean symbolicBranches = Boolean.TRUE.equals(arguments.get("symbolicBranches")) && recordBranches;
         int symExprDepth = ((Number) arguments.getOrDefault(
             "symbolicExpressionDepth", DEFAULT_SYMBOLIC_EXPR_DEPTH)).intValue();
+        if (symExprDepth < 1 || symExprDepth > 64) {
+            throw new IllegalArgumentException("symbolicExpressionDepth must be between 1 and 64");
+        }
         boolean trackMemoryWrites = !Boolean.FALSE.equals(arguments.get("trackMemoryWrites"));
         boolean includeScratch = Boolean.TRUE.equals(arguments.get("includeScratch"));
         boolean skipCalls = Boolean.TRUE.equals(arguments.get("skipCalls"));
@@ -159,6 +162,9 @@ public class EmulateFunctionTool implements McpTool {
             Register spReg = (spRegOverride != null)
                 ? program.getLanguage().getRegister(spRegOverride)
                 : emu.getStackPointerRegister();
+            if (spRegOverride != null && spReg == null) {
+                throw new IllegalArgumentException("Unknown stack pointer register: " + spRegOverride);
+            }
             if (spValStr != null && !spValStr.isEmpty() && spReg != null) {
                 emu.writeRegister(spReg, parseBigInt(spValStr));
             }
@@ -213,6 +219,9 @@ public class EmulateFunctionTool implements McpTool {
             // --- Resolve optional skip-call return register/value ---
             Register skipRetReg = (skipCalls && skipRetRegName != null && !skipRetRegName.isEmpty())
                 ? program.getLanguage().getRegister(skipRetRegName) : null;
+            if (skipCalls && skipRetRegName != null && skipRetReg == null) {
+                throw new IllegalArgumentException("Unknown skip-call return register: " + skipRetRegName);
+            }
             BigInteger skipRetVal = (skipRetReg != null)
                 ? parseBigInt(skipRetValStr != null && !skipRetValStr.isEmpty() ? skipRetValStr : "0")
                 : null;
@@ -229,6 +238,8 @@ public class EmulateFunctionTool implements McpTool {
             String stopReason = "max_steps";
             String lastError = null;
             int steps = 0;
+            int skippedCallCount = 0;
+            int branchCount = 0;
             Address lastPc = entry;
             TaskMonitor monitor = TaskMonitor.DUMMY;
 
@@ -253,8 +264,9 @@ public class EmulateFunctionTool implements McpTool {
                         if (fall != null) {
                             emu.writeRegister(pcReg, fall.getOffset());
                             if (skipRetReg != null) {
-                                try { emu.writeRegister(skipRetReg, skipRetVal); } catch (Exception ignored) {}
+                                emu.writeRegister(skipRetReg, skipRetVal);
                             }
+                            skippedCallCount++;
                             if (skippedCalls.size() < MAX_SKIPPED_CALLS) {
                                 Map<String, Object> sc = new LinkedHashMap<>();
                                 sc.put("pc", pc.toString());
@@ -283,12 +295,20 @@ public class EmulateFunctionTool implements McpTool {
                 }
                 steps++;
 
-                if (instr != null
+                if (recordBranches && instr != null
                         && instr.getFlowType() != null
-                        && instr.getFlowType().isConditional()
-                        && branches.size() < MAX_BRANCH_TRACE) {
-                    recordBranch(branches, emu, pc, instr, symResolver);
+                        && instr.getFlowType().isConditional()) {
+                    branchCount++;
+                    if (branches.size() < MAX_BRANCH_TRACE) {
+                        recordBranch(branches, emu, pc, instr, symResolver);
+                    }
                 }
+            }
+
+            lastPc = emu.getExecutionAddress();
+            if ("max_steps".equals(stopReason) && stops.contains(lastPc)) {
+                stopReason = sentinel != null && lastPc.equals(sentinel)
+                    ? "return_sentinel" : "breakpoint";
             }
 
             // --- Build result ---
@@ -334,18 +354,19 @@ public class EmulateFunctionTool implements McpTool {
 
             if (skipCalls) {
                 result.put("skippedCalls", skippedCalls);
-                result.put("skippedCallCount", skippedCalls.size());
-                if (skippedCalls.size() >= MAX_SKIPPED_CALLS) {
+                result.put("skippedCallCount", skippedCallCount);
+                if (skippedCallCount > skippedCalls.size()) {
                     result.put("skippedCallsTruncated", true);
                 }
             }
 
             if (recordBranches) {
                 result.put("branchTrace", branches);
+                result.put("branchCount", branchCount);
                 result.put("branchTraceNote",
                     "Observations from ONE concrete run. Not a generalized path condition — " +
                     "different inputs can take different branches.");
-                if (branches.size() >= MAX_BRANCH_TRACE) {
+                if (branchCount > branches.size()) {
                     result.put("branchTraceTruncated", true);
                 }
             }

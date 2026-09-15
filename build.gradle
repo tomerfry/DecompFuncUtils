@@ -53,6 +53,7 @@ repositories {
 
 dependencies {
 	implementation 'com.google.code.gson:gson:2.11.0'
+	implementation 'tools.aqua:z3-turnkey:4.14.1'
 }
 
 // Exclude additional files from the built extension

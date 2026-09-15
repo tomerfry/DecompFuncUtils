@@ -250,6 +250,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
 
         // Emulation
         toolRegistry.register(new EmulateFunctionTool(decompPool));
+        toolRegistry.register(new ExplorePathsTool());
 
         // Constraint / symbolic-lite analysis
         toolRegistry.register(new PathConstraintsTool(decompPool));

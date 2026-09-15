@@ -12,6 +12,7 @@ MCP server's two HTTP transports.
 | `test_vuln.o` | Committed x86-64 Linux ELF object compiled from `test_vuln.c`. This is what the test imports. |
 | `scripts/TaintHeadlessTest.java` | GhidraScript post-script: runs taint queries + emulation and prints `CHECK <name>: PASS/FAIL`. |
 | `scripts/McpTransportHeadlessTest.java` | Starts the MCP server in-process and runs a full client handshake over both transports. |
+| `scripts/SymbolicHeadlessTest.java` | Exercises Z3 path constraints, symbolic memory, bounds, and concrete replay using deterministic x64 instruction fixtures. |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
 | `build_binary.ps1` | Recompile `test_vuln.o` (only needed if you edit `test_vuln.c`; requires clang). |
@@ -25,6 +26,8 @@ pwsh tests/run_headless_test.ps1
 pwsh tests/run_headless_test.ps1 -SkipBuild
 # MCP transport handshake test instead of the taint/emulator one:
 pwsh tests/run_headless_test.ps1 -Script McpTransportHeadlessTest.java
+# Symbolic exploration and bundled native Z3 loading:
+pwsh tests/run_headless_test.ps1 -Script SymbolicHeadlessTest.java
 ```
 
 To check a *running* Ghidra's MCP server rather than a headless one, use
@@ -32,6 +35,15 @@ To check a *running* Ghidra's MCP server rather than a headless one, use
 
 ## What is covered
 
+- **Symbolic exploration** (`SymbolicHeadlessTest`): witnesses satisfying multiple
+  branches, contradictory constraints, avoided addresses, symbolic memory,
+  exported emulator arguments, state/step/operation/loop limits, unsupported
+  calls and pointers, input validation, and bit-vector arithmetic boundaries.
+- **Branch witnesses**: exhaustive 8-bit input enumeration checks signed and
+  unsigned comparisons, boundaries, masks, and Boolean negation for both
+  witness validity and local feasibility.
+- **Emulation limits**: final PC accuracy, breakpoints reached on the final
+  allowed step, and invalid step limits/register names.
 - **Structural multi-element matching** (exercises the statement-index optimization):
   use-after-free (`free($p); ...; *$p`) and double-free.
 - **Taint constraint** `tainted($v)`: a tainted length into `memcpy` and a tainted

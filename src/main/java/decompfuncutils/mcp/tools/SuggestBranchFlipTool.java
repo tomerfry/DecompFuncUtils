@@ -73,6 +73,9 @@ public class SuggestBranchFlipTool implements McpTool {
 
         Address branchAddr = McpUtil.parseAddress((String) arguments.get("branchAddress"), program);
         int maxDepth = ((Number) arguments.getOrDefault("maxExpressionDepth", DEFAULT_EXPR_DEPTH)).intValue();
+        if (maxDepth < 1 || maxDepth > 64) {
+            throw new IllegalArgumentException("maxExpressionDepth must be between 1 and 64");
+        }
 
         Function func = program.getFunctionManager().getFunctionContaining(branchAddr);
         if (func == null) throw new IllegalArgumentException("No function contains " + branchAddr);
@@ -130,9 +133,12 @@ public class SuggestBranchFlipTool implements McpTool {
             }
             result.put("valuesMakingTrue", hexList(a.valuesForTrue()));
             result.put("valuesMakingFalse", hexList(a.valuesForFalse()));
+            result.put("trueFeasible", !a.valuesForTrue().isEmpty());
+            result.put("falseFeasible", !a.valuesForFalse().isEmpty());
             result.put("note",
-                "Branch taken when condition is non-zero (TRUE). Values are suggestions for the named " +
-                "input variable; write them into the corresponding register/memory before re-emulating.");
+                "Values satisfy the local decompiler predicate only; feasibility does not include earlier " +
+                "path constraints. Empty value lists mean that direction is impossible for this shape. " +
+                "Re-emulate to verify reachability and machine-branch direction.");
             return result;
         } finally {
             pool.release(program, decomp);
@@ -180,10 +186,36 @@ public class SuggestBranchFlipTool implements McpTool {
         }
 
         List<BigInteger> valuesForTrue() {
-            return negated ? falseValues() : trueValues();
+            return verified(negated ? falseValues() : trueValues(), !negated);
         }
         List<BigInteger> valuesForFalse() {
-            return negated ? trueValues() : falseValues();
+            return verified(negated ? trueValues() : falseValues(), negated);
+        }
+
+        // Evaluate witnesses at the operand width. In particular, c+1 can wrap
+        // back into the satisfying range and masked constants may be impossible.
+        private List<BigInteger> verified(List<BigInteger> candidates, boolean wanted) {
+            List<BigInteger> result = new ArrayList<>();
+            for (BigInteger candidate : candidates) {
+                BigInteger bits = candidate.mod(modulus());
+                BigInteger value = mask == null ? bits : bits.and(mask);
+                BigInteger rhs = constant;
+                if (signed) {
+                    if (value.testBit(leafSize * 8 - 1)) value = value.subtract(modulus());
+                    if (rhs.testBit(leafSize * 8 - 1)) rhs = rhs.subtract(modulus());
+                }
+                int order = value.compareTo(rhs);
+                boolean actual = switch (cmp) {
+                    case EQ -> order == 0;
+                    case NEQ -> order != 0;
+                    case ULT, SLT -> order < 0;
+                    case ULE, SLE -> order <= 0;
+                    case UGT, SGT -> order > 0;
+                    case UGE, SGE -> order >= 0;
+                };
+                if (actual == wanted && !result.contains(bits)) result.add(bits);
+            }
+            return result;
         }
 
         private List<BigInteger> trueValues() {
@@ -236,7 +268,9 @@ public class SuggestBranchFlipTool implements McpTool {
         // Peel BOOL_NEGATE
         Varnode c = cond;
         PcodeOp def = c.getDef();
+        Set<Varnode> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         while (def != null && def.getOpcode() == PcodeOp.BOOL_NEGATE) {
+            if (!seen.add(c)) return null;
             a.negated = !a.negated;
             c = def.getInput(0);
             def = c.getDef();
@@ -278,6 +312,10 @@ public class SuggestBranchFlipTool implements McpTool {
 
         // Peel transparent ops (COPY/CAST/ZEXT/SEXT) to find the named leaf
         Varnode leaf = peelTransparent(exprVn);
+        if (leaf == null || leaf.isConstant() || leaf.getSize() != constVn.getSize()) return null;
+        if (a.mask != null && a.cmp != Cmp.EQ && a.cmp != Cmp.NEQ) return null;
+        // A named computed value is not necessarily an independently seedable input.
+        if (leaf.getDef() != null && leaf.getDef().getOpcode() != PcodeOp.LOAD) return null;
 
         // Memory-load leaf: comparison like `*(base + offset) == c` — common for
         // struct-field dispatch (`r->magic == 'P'`, `buf[0] == 0xff`, etc.).
@@ -317,12 +355,17 @@ public class SuggestBranchFlipTool implements McpTool {
      * Returns null if the varnode isn't an offset-from-a-base expression.
      */
     private static BaseOffset baseOffsetOf(Varnode vn) {
+        return baseOffsetOf(vn, 0);
+    }
+
+    private static BaseOffset baseOffsetOf(Varnode vn, int depth) {
+        if (depth >= 64) return null;
         if (vn == null) return null;
         PcodeOp def = vn.getDef();
         if (def == null) return new BaseOffset(vn, 0L);
         int op = def.getOpcode();
         if (op == PcodeOp.COPY || op == PcodeOp.CAST) {
-            return baseOffsetOf(def.getInput(0));
+            return baseOffsetOf(def.getInput(0), depth + 1);
         }
         if (op == PcodeOp.PTRSUB || op == PcodeOp.PTRADD || op == PcodeOp.INT_ADD) {
             Varnode aIn = def.getInput(0);
@@ -367,11 +410,14 @@ public class SuggestBranchFlipTool implements McpTool {
     }
 
     private static Varnode peelTransparent(Varnode vn) {
+        Set<Varnode> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         while (vn.getDef() != null) {
+            if (!seen.add(vn)) return null;
             int op = vn.getDef().getOpcode();
-            if (op == PcodeOp.COPY || op == PcodeOp.CAST
-                    || op == PcodeOp.INT_ZEXT || op == PcodeOp.INT_SEXT) {
-                vn = vn.getDef().getInput(0);
+            if (op == PcodeOp.COPY || op == PcodeOp.CAST) {
+                Varnode input = vn.getDef().getInput(0);
+                if (input.getSize() != vn.getSize()) return null;
+                vn = input;
             } else break;
         }
         return vn;

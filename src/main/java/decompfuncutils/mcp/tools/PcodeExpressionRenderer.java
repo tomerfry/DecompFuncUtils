@@ -60,8 +60,11 @@ public final class PcodeExpressionRenderer {
             case PcodeOp.CAST:
                 return render(op.getInput(0), d, visiting);
             case PcodeOp.INT_ADD:
-            case PcodeOp.PTRADD:
                 return bin(op, " + ", d, visiting);
+            case PcodeOp.PTRADD:
+                return "(" + render(op.getInput(0), d, visiting) + " + "
+                    + render(op.getInput(1), d, visiting) + " * "
+                    + render(op.getInput(2), d, visiting) + ")";
             case PcodeOp.INT_SUB:
                 return bin(op, " - ", d, visiting);
             case PcodeOp.INT_MULT:

@@ -28,6 +28,7 @@ public class TaintHeadlessTest extends GhidraScript {
 
         testReachability();
         testQueryMcp();
+        testBranchWitnesses();
         DecompInterface decomp = new DecompInterface();
         decomp.openProgram(currentProgram);
         try {
@@ -62,6 +63,7 @@ public class TaintHeadlessTest extends GhidraScript {
             // --- Emulation: pure arithmetic (a+3)*2-1, a=10 -> 25 (0x19) ---
             Function add3 = func("add3");
             if (add3 != null) {
+                testEmulationLimits(add3);
                 Map<String, Object> r = emulate(add3,
                     Map.of("RDI", "10"), false);
                 String rax = reg(r, "RAX");
@@ -94,6 +96,117 @@ public class TaintHeadlessTest extends GhidraScript {
 
         println("HEADLESS_TEST_SUMMARY passed=" + passed + " failed=" + failed);
         println(failed == 0 ? "HEADLESS_TEST_RESULT PASS" : "HEADLESS_TEST_RESULT FAIL");
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void testBranchWitnesses() throws Exception {
+        Class<?> analysis = Class.forName("decompfuncutils.mcp.tools.SuggestBranchFlipTool$Analysis");
+        Class<? extends Enum> cmpClass = (Class<? extends Enum>) Class.forName(
+            "decompfuncutils.mcp.tools.SuggestBranchFlipTool$Cmp");
+        var ctor = analysis.getDeclaredConstructor();
+        ctor.setAccessible(true);
+        var trueMethod = analysis.getDeclaredMethod("valuesForTrue");
+        var falseMethod = analysis.getDeclaredMethod("valuesForFalse");
+        trueMethod.setAccessible(true);
+        falseMethod.setAccessible(true);
+        Map<String, java.lang.reflect.Field> fields = new HashMap<>();
+        for (var field : analysis.getDeclaredFields()) {
+            field.setAccessible(true);
+            fields.put(field.getName(), field);
+        }
+        int cases = 0;
+        for (String op : List.of("EQ", "NEQ", "ULT", "ULE", "UGT", "UGE", "SLT", "SLE", "SGT", "SGE")) {
+            for (int mask : (op.equals("EQ") || op.equals("NEQ") ? new int[]{-1, 0, 1, 85, 255} : new int[]{-1})) {
+                for (int constant = 0; constant < 256; constant++) {
+                    for (boolean negated : new boolean[]{false, true}) {
+                        Object a = ctor.newInstance();
+                        fields.get("leafSize").set(a, 1);
+                        fields.get("cmp").set(a, Enum.valueOf(cmpClass, op));
+                        fields.get("signed").set(a, op.startsWith("S"));
+                        fields.get("constant").set(a, java.math.BigInteger.valueOf(constant));
+                        fields.get("mask").set(a, mask < 0 ? null : java.math.BigInteger.valueOf(mask));
+                        fields.get("negated").set(a, negated);
+                        for (boolean wanted : new boolean[]{false, true}) {
+                            List<java.math.BigInteger> values = (List<java.math.BigInteger>)
+                                (wanted ? trueMethod : falseMethod).invoke(a);
+                            boolean possible = false;
+                            for (int x = 0; x < 256; x++) {
+                                if ((predicate(op, mask < 0 ? x : x & mask, constant) ^ negated) == wanted) {
+                                    possible = true;
+                                }
+                            }
+                            if (possible != !values.isEmpty()) throw new AssertionError("Missing/invalid feasibility: " + op + " c=" + constant + " mask=" + mask);
+                            for (var value : values) {
+                                int x = value.intValueExact();
+                                if (x < 0 || x > 255 || (predicate(op, mask < 0 ? x : x & mask, constant) ^ negated) != wanted) {
+                                    throw new AssertionError("Invalid witness: " + op + " c=" + constant + " value=" + value);
+                                }
+                            }
+                            cases++;
+                        }
+                    }
+                }
+            }
+        }
+        check("branch_witnesses_exhaustive_8bit", true, "cases=" + cases);
+        for (int size : new int[]{4, 8}) {
+            Object a = ctor.newInstance();
+            fields.get("leafSize").set(a, size);
+            fields.get("cmp").set(a, Enum.valueOf(cmpClass, "SLT"));
+            fields.get("signed").set(a, true);
+            fields.get("constant").set(a, java.math.BigInteger.ZERO);
+            List<java.math.BigInteger> values = (List<java.math.BigInteger>) trueMethod.invoke(a);
+            check("branch_signed_" + (size * 8) + "_unsigned_encoding",
+                values.equals(List.of(java.math.BigInteger.ONE.shiftLeft(size * 8 - 1))), values.toString());
+            fields.get("cmp").set(a, Enum.valueOf(cmpClass, "ULE"));
+            fields.get("signed").set(a, false);
+            fields.get("constant").set(a, java.math.BigInteger.ONE.shiftLeft(size * 8).subtract(java.math.BigInteger.ONE));
+            check("branch_unsigned_" + (size * 8) + "_max_no_false_witness",
+                ((List<?>) falseMethod.invoke(a)).isEmpty(), "unsigned <= max");
+        }
+    }
+
+    private boolean predicate(String op, int x, int c) {
+        if (op.startsWith("S")) { x = (byte) x; c = (byte) c; }
+        return switch (op) {
+            case "EQ" -> x == c;
+            case "NEQ" -> x != c;
+            case "ULT", "SLT" -> x < c;
+            case "ULE", "SLE" -> x <= c;
+            case "UGT", "SGT" -> x > c;
+            case "UGE", "SGE" -> x >= c;
+            default -> throw new AssertionError(op);
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private void testEmulationLimits(Function f) throws Exception {
+        Map<String, Object> args = new HashMap<>();
+        args.put("entry", f.getEntryPoint().toString());
+        args.put("stackPointer", "0x00200000");
+        args.put("maxSteps", 1);
+        EmulateFunctionTool emulator = new EmulateFunctionTool();
+        Map<String, Object> result = (Map<String, Object>) emulator.execute(args, currentProgram, null);
+        String pc = result.get("pcAtStop").toString();
+        check("emulate_limit_reports_current_pc", "max_steps".equals(result.get("stopReason"))
+            && currentProgram.getAddressFactory().getAddress(pc).getOffset() == loAddress(reg(result, "RIP")), result.toString());
+        args.put("stopAddresses", List.of(pc));
+        result = (Map<String, Object>) emulator.execute(args, currentProgram, null);
+        check("emulate_breakpoint_on_last_step", "breakpoint".equals(result.get("stopReason")), result.toString());
+        for (Map<String, Object> invalid : List.of(Map.<String, Object>of("maxSteps", 0),
+                Map.<String, Object>of("stackPointerRegister", "NOT_A_REGISTER"),
+                Map.<String, Object>of("skipCalls", true, "skipCallReturnRegister", "NOT_A_REGISTER"))) {
+            Map<String, Object> bad = new HashMap<>(args);
+            bad.putAll(invalid);
+            boolean rejected = false;
+            try { emulator.execute(bad, currentProgram, null); }
+            catch (IllegalArgumentException expected) { rejected = true; }
+            check("emulate_rejects_" + invalid.keySet(), rejected, invalid.toString());
+        }
+    }
+
+    private long loAddress(String hex) {
+        return Long.parseUnsignedLong(hex.substring(2), 16);
     }
 
     private void testBuiltinAccuracy(DecompInterface decomp) throws Exception {

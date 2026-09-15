@@ -5,6 +5,7 @@ import decompfuncutils.mcp.McpProtocolHandler;
 import decompfuncutils.mcp.McpToolRegistry;
 import decompfuncutils.mcp.tools.GetProgramInfoTool;
 import decompfuncutils.mcp.tools.ListFunctionsTool;
+import decompfuncutils.mcp.tools.ExplorePathsTool;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -50,6 +51,7 @@ public class McpTransportHeadlessTest extends GhidraScript {
         McpToolRegistry registry = new McpToolRegistry();
         registry.register(new GetProgramInfoTool());
         registry.register(new ListFunctionsTool());
+        registry.register(new ExplorePathsTool());
         McpProtocolHandler handler = new McpProtocolHandler(
             registry, () -> currentProgram, () -> null);
         // Window identity is what tells sibling servers of one Ghidra apart.
@@ -149,12 +151,17 @@ public class McpTransportHeadlessTest extends GhidraScript {
             post(base + "/mcp", "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}", sessionId),
             HttpResponse.BodyHandlers.ofString());
         boolean toolsOk = false;
+        boolean explorerOk = false;
         int toolCount = -1;
         if (toolsList.statusCode() == 200) {
             JsonArray tools = JsonParser.parseString(toolsList.body()).getAsJsonObject()
                 .getAsJsonObject("result").getAsJsonArray("tools");
             toolCount = tools.size();
             for (var t : tools) {
+                if ("ghidra_explore_paths".equals(t.getAsJsonObject().get("name").getAsString())) {
+                    explorerOk = t.getAsJsonObject().getAsJsonObject("inputSchema")
+                        .getAsJsonObject("properties").has("symbolicInputs");
+                }
                 if ("ghidra_get_program_info".equals(t.getAsJsonObject().get("name").getAsString())) {
                     toolsOk = true;
                 }
@@ -162,6 +169,7 @@ public class McpTransportHeadlessTest extends GhidraScript {
         }
         check("http_tools_list", toolsOk,
             "status=" + toolsList.statusCode() + " tools=" + toolCount);
+        check("http_explorer_schema", explorerOk, "symbolic explorer advertised with input schema");
 
         HttpResponse<String> call = http.send(
             post(base + "/mcp", "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\"," +
