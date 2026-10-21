@@ -40,8 +40,9 @@ public interface McpTool {
 
     /**
      * Whether this tool must execute on the Swing EDT.
-     * Tools that only read Program data and don't touch Swing services
-     * can return false to enable concurrent execution across agents.
+     * Tools that don't touch Swing services can return false. Read-only tools
+     * may execute concurrently; mutating tools remain serialized and transactional
+     * even when running on a worker thread (e.g. Ghidra scripts).
      * Default is true (safe fallback — EDT serialized).
      */
     default boolean requiresEdt() {

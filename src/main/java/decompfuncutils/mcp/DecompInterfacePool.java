@@ -1,6 +1,7 @@
 package decompfuncutils.mcp;
 
 import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileOptions;
 import ghidra.program.model.listing.Program;
 import ghidra.util.Msg;
 
@@ -33,6 +34,9 @@ public class DecompInterfacePool {
         }
 
         decomp = new DecompInterface();
+        // Native defaults differ from Ghidra's Java defaults: explicitly honor
+        // per-data constant/read-only annotations so literal arithmetic can fold.
+        decomp.setOptions(new DecompileOptions());
         decomp.openProgram(program);
         return decomp;
     }

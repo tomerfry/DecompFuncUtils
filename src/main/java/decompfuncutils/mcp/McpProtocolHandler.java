@@ -278,10 +278,10 @@ public class McpProtocolHandler {
                 "Use ghidra_open_program to import and open a binary first.");
         }
 
-        // Execute: off-EDT for thread-safe read-only tools, EDT for mutations and Swing-dependent tools
+        // Serialize mutations; honor their EDT requirement so scripts can use a worker thread.
         Object result;
         if (mcpTool.isMutating()) {
-            result = executeOnEdtWithTransaction(mcpTool, arguments, program, pluginTool);
+            result = executeWithTransaction(mcpTool, arguments, program, pluginTool);
         } else if (mcpTool.requiresEdt()) {
             result = executeOnEdt(mcpTool, arguments, program, pluginTool);
         } else {
@@ -395,7 +395,7 @@ public class McpProtocolHandler {
         }
     }
 
-    private Object executeOnEdtWithTransaction(McpTool tool, Map<String, Object> arguments,
+    private Object executeWithTransaction(McpTool tool, Map<String, Object> arguments,
                                                 Program program, PluginTool pluginTool) throws Exception {
         if (!edtSemaphore.tryAcquire(EDT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
             throw new McpError(-32603, "Server busy: another EDT operation is in progress. Try again shortly.");
@@ -405,20 +405,25 @@ public class McpProtocolHandler {
             AtomicReference<Exception> errorRef = new AtomicReference<>();
 
             TaskMonitor monitor = McpUtil.activeMonitor();
-            SwingUtilities.invokeAndWait(() -> {
+            Runnable mutation = () -> {
                 McpUtil.setActiveMonitor(monitor);
                 int txId = program.startTransaction("MCP: " + tool.name());
                 boolean success = false;
                 try {
+                    monitor.checkCancelled();
                     resultRef.set(tool.execute(arguments, program, pluginTool));
+                    monitor.checkCancelled();
                     success = true;
                 } catch (Exception e) {
                     errorRef.set(e);
                 } finally {
                     program.endTransaction(txId, success);
-                    McpUtil.setActiveMonitor(null);
+                    // A worker-thread mutation must preserve the request monitor.
+                    if (tool.requiresEdt()) McpUtil.setActiveMonitor(null);
                 }
-            });
+            };
+            if (tool.requiresEdt()) SwingUtilities.invokeAndWait(mutation);
+            else mutation.run();
 
             if (errorRef.get() != null) {
                 throw errorRef.get();

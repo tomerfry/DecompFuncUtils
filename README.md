@@ -88,6 +88,9 @@ The built extension will be in `dist/`.
 
 ## MCP Server (AI Agent Integration)
 
+For per-data constants, variable lifetime splitting, per-use union fields, and
+running scripts against the active program, see [MCP cleanup controls](docs/mcp-cleanup.md).
+
 The plugin exposes Ghidra to AI agents over MCP. Each Ghidra tool window serves
 **both** MCP transports on its own port, because different clients speak
 different ones:
