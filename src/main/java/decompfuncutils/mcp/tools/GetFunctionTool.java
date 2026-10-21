@@ -46,6 +46,7 @@ public class GetFunctionTool implements McpTool {
         result.put("callingConvention", func.getCallingConventionName());
         result.put("isThunk", func.isThunk());
         result.put("isExternal", func.isExternal());
+        result.put("noReturn", func.hasNoReturn());
         result.put("size", func.getBody().getNumAddresses());
 
         // Parameters
@@ -57,6 +58,7 @@ public class GetFunctionTool implements McpTool {
             p.put("size", param.getLength());
             p.put("storage", param.getVariableStorage().toString());
             p.put("ordinal", param.getOrdinal());
+            if (param.isStackVariable()) p.put("stackOffset", param.getStackOffset());
             params.add(p);
         }
         result.put("parameters", params);
@@ -72,6 +74,8 @@ public class GetFunctionTool implements McpTool {
             v.put("dataType", var.getDataType().getDisplayName());
             v.put("size", var.getLength());
             v.put("storage", var.getVariableStorage().toString());
+            v.put("firstUseOffset", var.getFirstUseOffset());
+            if (var.isStackVariable()) v.put("stackOffset", var.getStackOffset());
             locals.add(v);
         }
         result.put("localVariables", locals);

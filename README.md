@@ -105,6 +105,52 @@ different ones:
 requested version when it is one of `2024-11-05`, `2025-03-26`, `2025-06-18`,
 and otherwise answers with the newest it supports.
 
+### Function and stack-local refinement
+
+Use `ghidra_set_function_no_return` to set or clear a function's non-returning
+attribute without replacing its signature:
+
+```json
+{"name":"fatal_error","noReturn":true}
+```
+
+Provide `address` instead of `name` to select by address. Names must match exactly
+and uniquely; namespace-qualified names and external functions are supported.
+For thunks, Ghidra changes the ultimate target, reported as `targetFunction` and
+`targetAddress`. Pass `noReturn: false` to clear the flag. Re-decompile callers to
+see the updated control flow. This changes function metadata; it does not repair
+existing listing bodies or instruction flow overrides.
+
+Use `ghidra_replace_stack_variables` to replace fragmented stack locals with
+typed arrays, structures, or pointers in one transaction:
+
+```json
+{
+  "functionName": "buildRequestInfo",
+  "dryRun": true,
+  "variables": [
+    {"name":"requestBuffer","dataType":"char[64]","stackOffset":"-0x80"},
+    {"name":"requestInfo","dataType":"RequestInfo","stackOffset":"-0x100"}
+  ]
+}
+```
+
+Create `RequestInfo` first, and use offsets and sizes recovered from your function.
+`ghidra_get_function` reports `noReturn`, numeric `stackOffset` values, and local
+`firstUseOffset` values. Offsets are signed Ghidra stack coordinates, not raw
+instruction SP/FP displacements. Supply an integer, decimal string, or signed
+`0x` hex string. `functionAddress` takes precedence over `functionName`.
+
+The preview returns `removedVariables` and `createdVariables`. Set `dryRun` to
+`false` (the default) to apply. Every persisted stack local intersecting a new
+range is removed in full, including partial overlaps and locals with different
+first-use offsets. New locals have first-use offset zero. Unaffected locals and
+parameters are preserved; overlaps with parameters or compound storage are
+rejected. Requested ranges must not overlap, and names must be unique and must
+not collide with unaffected variables. A failed edit rolls back the entire batch.
+Decompiler-only locals need not be committed before replacement. Re-decompile
+afterwards to check the recovered layout; this tool does not split variable lifetimes.
+
 ### Taint analysis through MCP
 
 Call `ghidra_taint_query` with a preset to start without writing the pattern DSL:

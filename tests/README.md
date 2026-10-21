@@ -13,6 +13,7 @@ MCP server's two HTTP transports.
 | `scripts/TaintHeadlessTest.java` | GhidraScript post-script: runs taint queries + emulation and prints `CHECK <name>: PASS/FAIL`. |
 | `scripts/McpTransportHeadlessTest.java` | Starts the MCP server in-process and runs a full client handshake over both transports. |
 | `scripts/SymbolicHeadlessTest.java` | Exercises Z3 path constraints, symbolic memory, bounds, and concrete replay using deterministic x64 instruction fixtures. |
+| `scripts/RefinementHeadlessTest.java` | Exercises non-returning functions and atomic stack-local replacement through JSON-RPC on an isolated Ghidra database. |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
 | `build_binary.ps1` | Recompile `test_vuln.o` (only needed if you edit `test_vuln.c`; requires clang). |
@@ -28,6 +29,8 @@ pwsh tests/run_headless_test.ps1 -SkipBuild
 pwsh tests/run_headless_test.ps1 -Script McpTransportHeadlessTest.java
 # Symbolic exploration and bundled native Z3 loading:
 pwsh tests/run_headless_test.ps1 -Script SymbolicHeadlessTest.java
+# Function metadata and stack-local refinement:
+pwsh tests/run_headless_test.ps1 -Script RefinementHeadlessTest.java
 ```
 
 To check a *running* Ghidra's MCP server rather than a headless one, use
@@ -35,6 +38,10 @@ To check a *running* Ghidra's MCP server rather than a headless one, use
 
 ## What is covered
 
+- **Refinement** (`RefinementHeadlessTest`): setting/clearing non-returning flags,
+  changed caller decompilation, external/thunk targets, ambiguous names, stack
+  replacement previews, partial overlaps, arrays/structs/pointers, protected
+  parameters and compound storage, invalid batches, and rollback after edits.
 - **Symbolic exploration** (`SymbolicHeadlessTest`): witnesses satisfying multiple
   branches, contradictory constraints, avoided addresses, symbolic memory,
   exported emulator arguments, state/step/operation/loop limits, unsupported

@@ -212,6 +212,8 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
         toolRegistry.register(new RenameLabelTool());
         toolRegistry.register(new RetypeVariableTool());
         toolRegistry.register(new SetFunctionSignatureTool());
+        toolRegistry.register(new SetFunctionNoReturnTool());
+        toolRegistry.register(new ReplaceStackVariablesTool());
         toolRegistry.register(new SetCommentTool());
         toolRegistry.register(new CreateStructTool());
         toolRegistry.register(new AutoCreateStructTool());
