@@ -81,11 +81,22 @@ public final class SymbolicArithmetic {
                 }
                 yield count;
             }
-            // Division is deliberately unsupported until exceptional inputs are modeled.
+            // The caller excludes faulting operands first (see isDivision): Z3 assigns
+            // x/0 a value, where the machine raises an exception.
+            case PcodeOp.INT_DIV -> ctx.mkBVUDiv(a, b);
+            case PcodeOp.INT_SDIV -> ctx.mkBVSDiv(a, b);
+            case PcodeOp.INT_REM -> ctx.mkBVURem(a, b);
+            case PcodeOp.INT_SREM -> ctx.mkBVSRem(a, b);
             default -> throw unsupported("p-code " + PcodeOp.getMnemonic(opcode));
         };
         if (result.getSortSize() != bits) throw unsupported("unexpected operand width for " + PcodeOp.getMnemonic(opcode));
         return (BitVecExpr) result.simplify();
+    }
+
+    /** Ops the machine faults on for a zero divisor, where Z3 would return a value. */
+    public static boolean isDivision(int opcode) {
+        return opcode == PcodeOp.INT_DIV || opcode == PcodeOp.INT_SDIV
+            || opcode == PcodeOp.INT_REM || opcode == PcodeOp.INT_SREM;
     }
 
     private BitVecExpr sign(BitVecExpr value) {

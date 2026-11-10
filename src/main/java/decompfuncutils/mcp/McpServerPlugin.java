@@ -318,6 +318,7 @@ public class McpServerPlugin extends ProgramPlugin
         toolRegistry.register(new CreateVtableStructTool());
         toolRegistry.register(new GenerateFuzzerTool());
         toolRegistry.register(new GetCallGraphTool());
+        toolRegistry.register(new GetDataflowTool(decompPool));
         toolRegistry.register(new NavigateToTool());
         toolRegistry.register(new SearchMemoryTool());
 

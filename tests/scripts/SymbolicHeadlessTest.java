@@ -63,6 +63,7 @@ public class SymbolicHeadlessTest extends GhidraScript {
         Address call = code("e8fbffff0f90c3");
         result = explore(args(call, 5));
         check("call_incomplete", "incomplete".equals(result.get("status")), result);
+        extended(range, mem, loop);
         args = args(range, 10);
         args.put("maxStates", 1.5);
         invalid("fractional_limit", args);
@@ -76,9 +77,109 @@ public class SymbolicHeadlessTest extends GhidraScript {
         println("HEADLESS_TEST_RESULT " + (failed == 0 ? "PASS" : "FAIL"));
     }
 
+    /** Division, skipped calls, undefined memory, several solutions, and the emulator's reporting. */
+    @SuppressWarnings("unchecked")
+    private void extended(Address range, Address mem, Address loop) throws Exception {
+        Map<?,?> replay = (Map<?,?>) solution(explore(args(range, 10))).get("replay");
+        check("replay_path_matched", Boolean.TRUE.equals(replay.get("pathMatched")), replay);
+
+        // mov eax,edi; xor edx,edx; mov ecx,7; div ecx; cmp edx,3; jne failure; success...; failure...
+        Address rem = code("89f831d2b907000000f7f183fa037506b801000000c331c0c3");
+        Map<String,Object> result = explore(args(rem, 16));
+        boolean found = "found".equals(result.get("status"));
+        check("division_found", found, result);
+        if (found) {
+            long x = Long.parseLong(((Map<?,?>) solution(result).get("inputs")).get("x").toString().substring(2), 16);
+            check("remainder_constraint", x % 7 == 3, x);
+            check("constant_divisor_cannot_fault", Integer.valueOf(0).equals(result.get("divisionFaultPaths")), result.get("divisionFaultPaths"));
+        }
+        // mov eax,100; xor edx,edx; div edi; cmp eax,10; jne failure; success...; failure...
+        Address quotient = code("b86400000031d2f7f783f80a7506b801000000c331c0c3");
+        result = explore(args(quotient, 14));
+        found = "found".equals(result.get("status"));
+        check("symbolic_divisor_found", found, result);
+        if (found) {
+            check("symbolic_divisor_value", "0xa".equals(((Map<?,?>) solution(result).get("inputs")).get("x")), solution(result).get("inputs"));
+            check("zero_divisor_counted", ((Number) result.get("divisionFaultPaths")).intValue() >= 1, result.get("divisionFaultPaths"));
+        }
+
+        // call <unmapped>; cmp eax,0x2a; jne failure; success...; failure...
+        Address called = code("e8fbffff0f83f82a7506b801000000c331c0c3");
+        check("call_stops_by_default", "incomplete".equals(explore(args(called, 10)).get("status")), "callPolicy=stop");
+        Map<String,Object> args = args(called, 10);
+        args.put("callPolicy", "skip");
+        result = explore(args);
+        found = "found".equals(result.get("status"));
+        check("call_skipped_found", found, result);
+        if (found) {
+            Map<String,Object> solution = solution(result);
+            List<Map<String,Object>> calls = (List<Map<String,Object>>) solution.get("skippedCalls");
+            check("call_return_assumed", calls != null && calls.size() == 1 && "0x2a".equals(calls.get(0).get("assumedReturn")), calls);
+            replay = (Map<?,?>) solution.get("replay");
+            check("call_skip_replay", Boolean.TRUE.equals(replay.get("verified")) && Boolean.TRUE.equals(replay.get("pathMatched")), replay);
+            Map<String,Object> replayArgs = (Map<String,Object>) solution.get("emulateArguments");
+            Map<?,?> emulated = (Map<?,?>) new EmulateFunctionTool().execute(replayArgs, currentProgram, null);
+            check("call_skip_exported_replay", called.add(10).toString().equals(emulated.get("pcAtStop"))
+                && Integer.valueOf(1).equals(emulated.get("skippedCallCount")), emulated);
+        }
+
+        // The byte at [rsi] has no seed and no program bytes behind it.
+        args = args(mem, 6);
+        args.put("registers", Map.of("RSI", "0x700000"));
+        check("undefined_memory_stops_by_default", "incomplete".equals(explore(args).get("status")), "uninitializedMemory=stop");
+        args.put("uninitializedMemory", "symbolic");
+        result = explore(args);
+        found = "found".equals(result.get("status"));
+        check("undefined_memory_symbolic", found, result);
+        if (found) {
+            List<Map<String,Object>> assumed = (List<Map<String,Object>>) solution(result).get("assumedMemory");
+            check("undefined_memory_reported", assumed != null && assumed.stream().anyMatch(
+                m -> "00700000".equals(m.get("address")) && "42".equals(m.get("hexBytes"))), assumed);
+            check("undefined_memory_replay", Boolean.TRUE.equals(((Map<?,?>) solution(result).get("replay")).get("verified")), solution(result).get("replay"));
+        }
+        args.put("uninitializedMemory", "zero");
+        result = explore(args);
+        check("undefined_memory_zero", "exhausted".equals(result.get("status")) && Boolean.TRUE.equals(result.get("complete")), result);
+        args.put("uninitializedMemory", "random");
+        invalid("unknown_memory_policy", args);
+
+        // cmp edi,5; je ok; cmp edi,9; je ok; xor eax,eax; ret; ok: mov eax,1; ret
+        Address two = code("83ff05740883ff09740331c0c3b801000000c3");
+        args = args(two, 13);
+        result = explore(args);
+        check("one_solution_by_default", ((List<?>) result.get("solutions")).size() == 1 && Boolean.FALSE.equals(result.get("complete")), result);
+        args.put("maxSolutions", 4);
+        result = explore(args);
+        Set<Object> values = new HashSet<>();
+        for (Map<String,Object> s : (List<Map<String,Object>>) result.get("solutions")) values.add(((Map<?,?>) s.get("inputs")).get("x"));
+        check("all_solutions", values.equals(Set.of("0x5", "0x9")) && Boolean.TRUE.equals(result.get("complete")), result);
+
+        // Concrete emulator: time limit, undefined reads, memory dump.
+        EmulateFunctionTool emulator = new EmulateFunctionTool();
+        Map<String,Object> run = new LinkedHashMap<>(Map.of("entry", loop.toString(), "maxSteps", 2000000, "timeoutMs", 50));
+        Map<?,?> emulated = (Map<?,?>) emulator.execute(run, currentProgram, null);
+        check("emulator_timeout", "timeout".equals(emulated.get("stopReason")), emulated.get("stopReason") + " after " + emulated.get("steps"));
+        run = new LinkedHashMap<>(Map.of("entry", mem.toString(), "stackPointer", "0x800000",
+            "registers", Map.of("RSI", "0x700000"), "stopAddresses", List.of(mem.add(2).toString())));
+        emulated = (Map<?,?>) emulator.execute(run, currentProgram, null);
+        List<Map<String,Object>> reads = (List<Map<String,Object>>) emulated.get("uninitializedReads");
+        check("emulator_reports_undefined_read", reads != null && reads.stream().anyMatch(m -> "00700000".equals(m.get("address"))), emulated);
+        run.put("memory", List.of(Map.of("address", "00700000", "hexBytes", "42")));
+        run.put("readMemory", List.of(Map.of("address", "00700000", "length", 1)));
+        emulated = (Map<?,?>) emulator.execute(run, currentProgram, null);
+        List<Map<String,Object>> dump = (List<Map<String,Object>>) emulated.get("memoryAtStop");
+        check("emulator_seeded_read_is_quiet", emulated.get("uninitializedReads") == null, emulated.get("uninitializedReads"));
+        check("emulator_memory_dump", dump != null && "42".equals(dump.get(0).get("hex")), dump);
+        run.put("timeoutMs", 0);
+        try { emulator.execute(run, currentProgram, null); check("emulator_bad_timeout", false, "accepted 0"); }
+        catch (IllegalArgumentException expected) { check("emulator_bad_timeout", true, expected.getMessage()); }
+    }
+
     private void arithmetic() {
         try (Context ctx = new Context()) {
             SymbolicArithmetic a = new SymbolicArithmetic(ctx);
+            check("unsigned_division", ((BitVecNum) a.apply(PcodeOp.INT_DIV, 8, ctx.mkBV(100,8), ctx.mkBV(7,8))).getInt() == 14, "100 / 7");
+            check("signed_remainder", ((BitVecNum) a.apply(PcodeOp.INT_SREM, 8, ctx.mkBV(249,8), ctx.mkBV(3,8))).getInt() == 255, "-7 % 3");
             check("wide_shift", ((BitVecNum) a.apply(PcodeOp.INT_LEFT, 8, ctx.mkBV(1,8), ctx.mkBV(256,16))).getInt() == 0, "1 << 256");
             check("signed_shift", ((BitVecNum) a.apply(PcodeOp.INT_SRIGHT, 8, ctx.mkBV(128,8), ctx.mkBV(256,16))).getInt() == 255, "negative >> 256");
             check("signed_overflow", ((BitVecNum) a.apply(PcodeOp.INT_SCARRY, 8, ctx.mkBV(127,8), ctx.mkBV(1,8))).getInt() == 1, "127 + 1");

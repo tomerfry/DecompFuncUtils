@@ -38,6 +38,18 @@ Double-click or use `Ctrl+G` on struct field names in the decompiler to navigate
 
 **Use case:** When analyzing a vtable like `vtable->doSomething`, double-clicking on `doSomething` jumps directly to that function.
 
+### 🔷 Data Flow Hover
+Hover a variable, a called function's name, or an operator in the Decompiler to see what it is **affected by** and what it **affects** at that spot.
+
+- **Affected by:** the named variables, constants, call results (`getenv()`), memory reads (`*ptr`) and caller-supplied arguments the value is computed from. Hovering a *read* shows the definitions that reach that particular use; hovering a declaration covers every use.
+- **Affects:** the call arguments it is passed as (`memcpy() argument 3 (__n)`), memory it is stored to, the return value, branch conditions, and other variables it flows into.
+- **may be modified by:** calls whose side effects can change a value that lives in memory.
+- The header keeps what the hidden built-in popups would have said: the variable's data type and kind, or the callee's signature.
+
+The search stays inside the current function, stops at the nearest named variable (hover that one to go further), and is bounded, so it never decompiles or blocks the UI. Enable the **DataflowDecompilerHoverPlugin** in *File → Configure*; turn the popup on or off under *Edit → Tool Options → Decompiler Popups → Data Flow Display*. Constants still show the scalar popup.
+
+Agents get the same lists from the `ghidra_get_dataflow` MCP tool (see below).
+
 ---
 
 ## Installation
@@ -154,6 +166,27 @@ not collide with unaffected variables. A failed edit rolls back the entire batch
 Decompiler-only locals need not be committed before replacement. Re-decompile
 afterwards to check the recovered layout; this tool does not split variable lifetimes.
 
+### Local data flow through MCP
+
+`ghidra_get_dataflow` answers "what does this depend on, and what does it feed?"
+inside one function, using the same analysis as the Decompiler's Data Flow hover:
+
+```json
+{"function":"cp","variable":"__n"}
+{"address":"0x001000bc"}
+{"function":"cp","address":"0x001000bc","variable":"dst"}
+```
+
+Give `variable` for every use of a decompiler variable, `address` for the call
+(or store, return, branch, assignment) at that instruction, or both for that
+variable as read or written there. The result has `affectedBy`, `affects` and
+`mayBeModifiedBy`, each entry with a `kind` (`call result`, `constant`,
+`memory read`, `call argument`, `return`, `branch`, `param`, `local`, ...), a
+`text`, and usually an `address`. `maxDepth` (default 8) and `maxItems`
+(default 50) bound the answer; `affectedByTotal`/`affectsTotal` and the
+`*Truncated` flags say when something was cut. It does not cross calls or track
+values through memory: use the taint tools for that.
+
 ### Taint analysis through MCP
 
 Call `ghidra_taint_query` with a preset to start without writing the pattern DSL:
@@ -234,6 +267,20 @@ must be positive (capped at 2,000,000).
 Re-emulate local branch witnesses to check reachability and machine-branch
 direction. Skipped external calls do not model callee side effects.
 
+The emulator also reports what a run silently depended on, and bounds it:
+
+- `uninitializedReads` lists memory that was read before anything wrote it
+  (address, size, and the instruction that read it). The emulator treats such
+  bytes as zero, so this list is what to seed when a result looks wrong.
+- `timeoutMs` (default 30000, max 600000) stops a run by wall clock with
+  `stopReason: "timeout"`, for loops that would otherwise burn the step budget.
+- `readMemory` takes up to 16 `{address, length}` ranges (length ≤ 1024) and
+  returns their bytes at the stop point in `memoryAtStop`.
+- `skipAllCalls` steps over every call, internal ones included, and
+  `callReturnValues` supplies the value each skipped call returns, in execution
+  order. This replays a witness that `ghidra_explore_paths` found with
+  `callPolicy: "skip"`, and lets one function be run in isolation.
+
 ### Bounded symbolic path exploration
 
 `ghidra_explore_paths` solves constraints across branches within one little-endian
@@ -266,9 +313,32 @@ branch trace, and `emulateArguments` for `ghidra_emulate_function`. Targets stop
 execution before the target instruction. `status: "found"` reports a verified
 witness; `"exhausted"` with `complete: true` means no target is reachable within
 the stated model and avoid scope. `"incomplete"` is not proof of unreachability.
+`maxSolutions` (1–16) returns several witnesses, each on a different path;
+`complete: true` alongside solutions means those are all the paths there are.
+
+`replay.pathMatched` says whether the concrete run followed the same instruction
+sequence the solver reasoned about. When it is `false` the inputs still reach the
+target, but by another route, and `replay.divergedAt` says where they parted.
+
+Two opt-in policies let exploration continue where it would otherwise stop. Each
+trades soundness for reach, and each solution lists what it assumed:
+
+- `callPolicy: "skip"` steps over every call and makes its return value a fresh
+  unknown the solver may choose. The callee's writes to memory and to other
+  registers are ignored. A witness lists the values it needs in `skippedCalls`
+  (`assumedReturn` per call site), so it reads as "reachable *if* the callee can
+  return this", not as proof.
+- `uninitializedMemory: "symbolic"` turns each byte that has no seed and no
+  program bytes behind it into an unknown, reported in `assumedMemory`; `"zero"`
+  reads such bytes as 0. This gets past stack canaries, uninitialized locals and
+  unseeded heap contents. The default, `"stop"`, ends the path.
+
+Integer division and remainder are supported. Inputs that would fault (a zero
+divisor, or the signed minimum divided by −1) are excluded from the path that
+continues, and `divisionFaultPaths` counts the places where such inputs exist.
 
 State, instruction, loop-visit, p-code operation, and solver/time limits bound the
-search. Calls, division, symbolic addresses, executable-memory writes, and other
+search. Symbolic addresses, executable-memory writes, floating point, and other
 unsupported operations terminate affected paths with diagnostics. Only one
 exploration runs at a time; concurrent requests return `status: "busy"`.
 The extension bundles Z3 and its native loader dependencies; native loading
