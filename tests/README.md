@@ -8,7 +8,7 @@ MCP server's two HTTP transports.
 
 | File | Purpose |
 |------|---------|
-| `test_vuln.c` | Source of the test cases (UAF, double-free, tainted sinks, arithmetic, external call). |
+| `test_vuln.c` | Source of the test cases (UAF, double-free, tainted sinks, builder-buffer injection, allocation and length bugs, arithmetic, external call), each unsafe case paired with safe lookalikes. |
 | `test_vuln.o` | Committed x86-64 Linux ELF object compiled from `test_vuln.c`. This is what the test imports. |
 | `scripts/TaintHeadlessTest.java` | GhidraScript post-script: runs taint queries + emulation and prints `CHECK <name>: PASS/FAIL`. |
 | `scripts/McpTransportHeadlessTest.java` | Starts the MCP server in-process and runs a full client handshake over both transports. |
@@ -74,6 +74,29 @@ To check a *running* Ghidra's MCP server rather than a headless one, use
   `printf` format string both match; a constant-length `memcpy` does not.
 - **Source-specific taint** `tainted($v, "source")`: `tainted($fmt, "getenv")` matches
   while `tainted($fmt, "read")` does not — confirms the source name actually filters.
+- **Query engine regressions** (`testEngineRegressions`): three-element ordering
+  with the third statement placed before the second, control-flow order for
+  elements without a gap, nested calls in patterns and in the source, calls and
+  assignments that only appear inside a condition, dereference without a gap,
+  `...` in a right-hand-side call, stores, literal / wildcard operands and
+  `<<`, `&`, `|` in argument patterns, conditions as pattern elements, statement
+  distances, the single-statement wildcard, `guard:` clauses, gap negatives that
+  compare call arguments, NULL checks found independently of statement
+  boundaries, parameters as sources (`tainted`) versus real input
+  (`tainted_ext`), buffer contents judged at the sink in program order, long
+  computations that used to decay below the taint threshold, loops (a correct
+  list-freeing loop versus a use in a later iteration), reported sink
+  locations, and parse errors for unsupported syntax.
+- **Vulnerability presets**: every preset in `positives` has safe lookalikes in
+  `negatives` that must not match — command / format injection through builder
+  buffers (constant input, write after the sink, a different buffer, an
+  overwritten buffer), allocation-size overflow (division check, range check,
+  `strlen`-derived sizes), allocation versus copy length (same size, derived
+  size, compared sizes, same field read twice, `strlen` called twice),
+  unchecked allocations (checked early, checked in a nested block), signed
+  lengths (lower bound checked, unsigned, string length), `realloc`, TOCTOU
+  (different path, reversed order), unchecked `read` results, constant stack
+  overflows, and the exec / Windows process sinks.
 - **Emulation**: a pure-arithmetic function returns the correct value; `skipCalls`
   steps over an external `printf` and still returns the right value, whereas without
   `skipCalls` the same run stops with `error` at the external call.
@@ -109,8 +132,17 @@ reads or different buffers. Lifetime tests cover repeated harmless calls,
 mutually exclusive frees, reallocation, and `free(NULL)`. The fixture uses
 `-fno-builtin` so Clang preserves the API calls under test.
 
-The buffer model recognizes direct pointer arguments; arbitrary loads from
-input-filled scalar storage, memory overwrites, and interprocedural pointer
-writes remain outside this regression coverage.
+The buffer model follows modeled library calls (`read`/`recv`/`fgets`,
+`strcpy`/`strcat`/`sprintf`/`memcpy`, …) on direct pointer arguments, in program
+order. Byte-wise writes, writes made by callees, struct fields reached through
+a stored-and-reloaded pointer, and C++ patterns (`find_no_npos_check`) remain
+outside this regression coverage. A query that throws is counted
+(`queries_ran_without_errors`), so an "excludes" check cannot pass because the
+query failed.
+
+`test_vuln.c` fixtures are parameter-free unsafe/safe pairs; add new ones at the
+end and rebuild with `build_binary.ps1` (clang, `-O0 -fno-builtin`). Functions
+used by the emulator and symbolic tests (`add3`, `with_call`, …) must keep their
+code.
 
 Additional regressions cover 64-node reachability chains in both engines, MCP query presets, one-function pagination without omissions or duplicates, coverage metadata, and invalid query arguments. Test runs use unique temporary settings and project directories; the runner stops immediately on a failed build.
