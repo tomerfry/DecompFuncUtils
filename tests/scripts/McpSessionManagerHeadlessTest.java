@@ -68,7 +68,8 @@ public class McpSessionManagerHeadlessTest extends GhidraScript {
         }
         @Override public boolean requiresEdt() { return false; }
         @Override public Object execute(Map<String, Object> args, Program program, PluginTool tool) {
-            return window;
+            // The manager's routing argument must never reach the window's tool.
+            return args.containsKey("window") ? window + "!leaked-window-arg" : window;
         }
     }
 
@@ -177,6 +178,7 @@ public class McpSessionManagerHeadlessTest extends GhidraScript {
 
         runHttpChecks();
         runBindingChecks();
+        runPerCallWindowChecks();
         runClosedWindowChecks();
         runEdgeChecks();
 
@@ -370,6 +372,95 @@ public class McpSessionManagerHeadlessTest extends GhidraScript {
         router.removeSession("F");
         check("ended_session_frees_window", "Loaded".equals(text(call(router, "G", WHO, "{}"), 0)),
             "G did not get the window of the ended session");
+    }
+
+    // ---- one session, several windows at once (parallel sub-agents) ----
+
+    private void runPerCallWindowChecks() throws Exception {
+        FakeDirectory dir = new FakeDirectory();
+        McpSessionRouter router = newRouter(dir);
+        dir.all.add(new FakeWindow("W1", 13231, true));
+        dir.all.add(new FakeWindow("W2", 13232, true));
+        dir.all.add(new FakeWindow("W3", 13233, false));
+
+        check("percall_setup", "W1".equals(text(call(router, "P", WHO, "{}"), 0)), "P not in W1");
+
+        JsonObject w2 = call(router, "P", WHO, "{\"window\":\"W2\"}");
+        check("percall_routes_to_named_window", "W2".equals(text(w2, 0)) && text(w2, 1) == null,
+            w2.toString());
+        check("percall_name_ignores_case", "W3".equals(text(call(router, "P", WHO, "{\"window\":\"w3\"}"), 0)),
+            "w3 did not reach W3");
+        check("percall_by_port", "W2".equals(text(call(router, "P", WHO, "{\"window\":\"13232\"}"), 0))
+            && "W3".equals(text(call(router, "P", WHO, "{\"window\":13233}"), 0)), "port did not match");
+        check("percall_leaves_binding_alone", "W1".equals(text(call(router, "P", WHO, "{}"), 0)),
+            "binding moved");
+
+        // Three "sub-agents" on one session hammer three windows at the same time.
+        String[] targets = { "W1", "W2", "W3" };
+        java.util.concurrent.atomic.AtomicInteger wrong = new java.util.concurrent.atomic.AtomicInteger();
+        List<Thread> threads = new ArrayList<>();
+        for (int t = 0; t < targets.length; t++) {
+            final String target = targets[t];
+            final int base = 10_000 * (t + 1);
+            Thread th = new Thread(() -> {
+                for (int i = 0; i < 60; i++) {
+                    String body = "{\"jsonrpc\":\"2.0\",\"id\":" + (base + i) + ",\"method\":\"tools/call\","
+                        + "\"params\":{\"name\":\"" + WHO + "\",\"arguments\":{\"window\":\"" + target + "\"}}}";
+                    JsonObject r = JsonParser.parseString(router.handleRequest(body, "P")).getAsJsonObject();
+                    if (!target.equals(text(r, 0)) || r.get("id").getAsInt() != base + i) {
+                        wrong.incrementAndGet();
+                    }
+                }
+            });
+            threads.add(th);
+            th.start();
+        }
+        for (Thread th : threads) {
+            th.join(30_000);
+        }
+        check("percall_parallel_no_crosstalk", wrong.get() == 0, wrong.get() + " misrouted calls");
+
+        JsonObject other = call(router, "Q", WHO, "{}");
+        check("percall_windows_count_as_in_use", isError(other) && errorText(other).contains("in use"),
+            other.toString());
+
+        JsonObject status = payload(call(router, "P", "ghidra_session_status", "{}"));
+        JsonObject w2Entry = windowEntry(status, "W2");
+        check("status_reports_percall_use", w2Entry != null && w2Entry.has("usedPerCall")
+            && !w2Entry.get("thisSession").getAsBoolean()
+            && windowEntry(status, "W1").get("thisSession").getAsBoolean(), status.toString());
+
+        JsonObject missing = call(router, "P", WHO, "{\"window\":\"Nope\"}");
+        check("percall_unknown_window_rejected", isError(missing) && errorText(missing).contains("W2"),
+            missing.toString());
+
+        // An unbound session can work purely per call, without being bound anywhere.
+        JsonObject unbound = call(router, "R", WHO, "{\"window\":\"W3\"}");
+        JsonObject rStatus = payload(call(router, "R", "ghidra_session_status", "{}"));
+        check("percall_needs_no_binding", "W3".equals(text(unbound, 0))
+            && rStatus.getAsJsonObject("session").get("window").isJsonNull(), rStatus.toString());
+
+        String list = router.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}", "P");
+        boolean windowTool = false;
+        boolean sessionTool = true;
+        for (var t : JsonParser.parseString(list).getAsJsonObject().getAsJsonObject("result").getAsJsonArray("tools")) {
+            JsonObject def = t.getAsJsonObject();
+            boolean has = def.getAsJsonObject("inputSchema").getAsJsonObject("properties").has("window");
+            String name = def.get("name").getAsString();
+            if ("ghidra_decompile_function".equals(name)) {
+                windowTool = has && def.getAsJsonObject("inputSchema").getAsJsonObject("properties").size() > 1;
+            }
+            if ("ghidra_session_status".equals(name) || "ghidra_session_release".equals(name)) {
+                sessionTool &= !has;
+            }
+        }
+        check("tools_advertise_window_arg", windowTool && sessionTool,
+            "windowTool=" + windowTool + " sessionTool=" + sessionTool);
+
+        call(router, "P", "ghidra_session_release", "{}");
+        call(router, "R", "ghidra_session_release", "{}");
+        check("release_frees_percall_windows", "W1".equals(text(call(router, "Q", WHO, "{}"), 0)),
+            "Q still kept out after release");
     }
 
     // ---- a window closing under a session ----

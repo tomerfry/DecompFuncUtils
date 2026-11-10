@@ -345,6 +345,22 @@ CodeBrowser window of its own:
 | `ghidra_session_attach` | Switch this session to an existing window, by name or direct port |
 | `ghidra_session_release` | Give up this session's window; the window stays open |
 
+**Several windows from one session (parallel sub-agents).** Sub-agents share
+their parent's MCP connection, so the manager sees them as one session with one
+bound window. To let them work side by side, every forwarded `ghidra_*` tool
+takes an optional `window` argument (a window name, or its direct port) that
+runs that single call in the named window and leaves the binding alone:
+
+1. The parent opens one window per sub-agent:
+   `ghidra_session_open_window` with `{"name": "libfoo.so", "bind": false}`.
+2. Each sub-agent is told its window and passes it on every call, e.g.
+   `ghidra_decompile_function` with `{"name": "main", "window": "CodeBrowser(2)"}`.
+
+Windows used this way count as in use, so other sessions are not bound into
+them. All windows share Ghidra's single Swing thread: read-only analysis such as
+decompiling runs in parallel across windows, while edits and other UI-bound
+calls from different sub-agents take turns.
+
 Things to know:
 
 - **A Ghidra project must be open** for the manager to open windows. With only
