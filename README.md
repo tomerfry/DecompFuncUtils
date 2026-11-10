@@ -234,6 +234,20 @@ must be positive (capped at 2,000,000).
 Re-emulate local branch witnesses to check reachability and machine-branch
 direction. Skipped external calls do not model callee side effects.
 
+The emulator also reports what a run silently depended on, and bounds it:
+
+- `uninitializedReads` lists memory that was read before anything wrote it
+  (address, size, and the instruction that read it). The emulator treats such
+  bytes as zero, so this list is what to seed when a result looks wrong.
+- `timeoutMs` (default 30000, max 600000) stops a run by wall clock with
+  `stopReason: "timeout"`, for loops that would otherwise burn the step budget.
+- `readMemory` takes up to 16 `{address, length}` ranges (length ≤ 1024) and
+  returns their bytes at the stop point in `memoryAtStop`.
+- `skipAllCalls` steps over every call, internal ones included, and
+  `callReturnValues` supplies the value each skipped call returns, in execution
+  order. This replays a witness that `ghidra_explore_paths` found with
+  `callPolicy: "skip"`, and lets one function be run in isolation.
+
 ### Bounded symbolic path exploration
 
 `ghidra_explore_paths` solves constraints across branches within one little-endian
@@ -266,9 +280,32 @@ branch trace, and `emulateArguments` for `ghidra_emulate_function`. Targets stop
 execution before the target instruction. `status: "found"` reports a verified
 witness; `"exhausted"` with `complete: true` means no target is reachable within
 the stated model and avoid scope. `"incomplete"` is not proof of unreachability.
+`maxSolutions` (1–16) returns several witnesses, each on a different path;
+`complete: true` alongside solutions means those are all the paths there are.
+
+`replay.pathMatched` says whether the concrete run followed the same instruction
+sequence the solver reasoned about. When it is `false` the inputs still reach the
+target, but by another route, and `replay.divergedAt` says where they parted.
+
+Two opt-in policies let exploration continue where it would otherwise stop. Each
+trades soundness for reach, and each solution lists what it assumed:
+
+- `callPolicy: "skip"` steps over every call and makes its return value a fresh
+  unknown the solver may choose. The callee's writes to memory and to other
+  registers are ignored. A witness lists the values it needs in `skippedCalls`
+  (`assumedReturn` per call site), so it reads as "reachable *if* the callee can
+  return this", not as proof.
+- `uninitializedMemory: "symbolic"` turns each byte that has no seed and no
+  program bytes behind it into an unknown, reported in `assumedMemory`; `"zero"`
+  reads such bytes as 0. This gets past stack canaries, uninitialized locals and
+  unseeded heap contents. The default, `"stop"`, ends the path.
+
+Integer division and remainder are supported. Inputs that would fault (a zero
+divisor, or the signed minimum divided by −1) are excluded from the path that
+continues, and `divisionFaultPaths` counts the places where such inputs exist.
 
 State, instruction, loop-visit, p-code operation, and solver/time limits bound the
-search. Calls, division, symbolic addresses, executable-memory writes, and other
+search. Symbolic addresses, executable-memory writes, floating point, and other
 unsupported operations terminate affected paths with diagnostics. Only one
 exploration runs at a time; concurrent requests return `status: "busy"`.
 The extension bundles Z3 and its native loader dependencies; native loading

@@ -16,10 +16,16 @@ public final class ExplorePathsTool implements McpTool {
     @Override public String description() {
         return "Explore feasible paths through one x86/x64 function using symbolic registers or memory " +
             "and Z3 bit-vector constraints. Find inputs reaching targetAddresses while avoiding avoidAddresses. " +
-            "Solutions are replayed in Ghidra's concrete emulator. Explicit state, step, loop, and time limits " +
-            "apply. Calls, symbolic addresses, division, and unsupported p-code stop affected paths and " +
-            "report incomplete coverage. No program changes. Unseeded ordinary registers start at zero; " +
-            "unmapped/uninitialized memory must be seeded. Requires a concrete stackPointer.";
+            "Solutions are replayed in Ghidra's concrete emulator, which also reports whether the replay " +
+            "followed the same instruction path (replay.pathMatched). Explicit state, step, loop, and time " +
+            "limits apply. By default calls, symbolic addresses, uninitialized memory and unsupported p-code " +
+            "stop the affected path and report incomplete coverage. Two opt-in policies explore further at " +
+            "the cost of assumptions, which each solution lists: callPolicy=skip treats a call's return " +
+            "value as a fresh unknown (skippedCalls), and uninitializedMemory=symbolic|zero supplies bytes " +
+            "the image does not define (assumedMemory). Integer division is supported; inputs that would " +
+            "fault are excluded and counted in divisionFaultPaths. maxSolutions returns several distinct " +
+            "paths. No program changes. Unseeded ordinary registers start at zero. Requires a concrete " +
+            "stackPointer.";
     }
 
     @Override public Map<String, Object> inputSchema() {
@@ -46,6 +52,16 @@ public final class ExplorePathsTool implements McpTool {
         p.put("maxPcodeOps", limit(100000, 500000, "Total p-code operations across all paths"));
         p.put("timeoutMs", limit(10000, 60000, "Overall execution deadline, including solver checks and replay"));
         p.put("solverTimeoutMs", limit(1000, 5000, "Per-check solver timeout, capped by remaining overall time"));
+        p.put("maxSolutions", limit(1, 16, "Stop after this many witnesses, each on a different path"));
+        p.put("callPolicy", Map.of("type", "string", "enum", List.of("stop", "skip"), "default", "stop",
+            "description", "stop: a call ends the path (sound). skip: step over every call, making its return " +
+                "value a fresh unknown the solver may choose; the callee's memory and other register effects " +
+                "are ignored. Witnesses then list the return values they assume in skippedCalls."));
+        p.put("uninitializedMemory", Map.of("type", "string", "enum", List.of("stop", "zero", "symbolic"),
+            "default", "stop",
+            "description", "What a read of memory with no seed and no program bytes does. stop: ends the path. " +
+                "zero: reads 0. symbolic: each such byte is an unknown the solver may choose, reported in " +
+                "assumedMemory (useful for stack canaries, uninitialized locals and heap contents)."));
         return Map.of("type", "object", "additionalProperties", false, "properties", p,
             "required", List.of("entry", "targetAddresses", "stackPointer", "symbolicInputs"));
     }

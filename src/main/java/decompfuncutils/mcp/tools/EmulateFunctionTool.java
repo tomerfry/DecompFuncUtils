@@ -40,6 +40,12 @@ public class EmulateFunctionTool implements McpTool {
     private static final int MAX_BRANCH_TRACE = 5000;
     private static final int MAX_SKIPPED_CALLS = 2000;
     private static final int DEFAULT_SYMBOLIC_EXPR_DEPTH = 8;
+    private static final int DEFAULT_TIMEOUT_MS = 30_000;
+    private static final int HARD_MAX_TIMEOUT_MS = 600_000;
+    private static final int MAX_UNINIT_READS = 200;
+    private static final int MAX_READ_RANGES = 16;
+    private static final int MAX_READ_LENGTH = 1024;
+    private static final int MAX_CALL_RETURN_VALUES = 4096;
 
     private final DecompInterfacePool decompPool;
 
@@ -59,7 +65,9 @@ public class EmulateFunctionTool implements McpTool {
                "register state, tracked memory writes, and (optionally) a conditional-branch trace " +
                "of the single concrete run. Note: branchTrace reflects ONE execution — it is not a " +
                "generalized path condition. The stack pointer is not auto-initialized; callers " +
-               "should seed 'stackPointer' for functions that use the stack.";
+               "should seed 'stackPointer' for functions that use the stack. Reads of memory nobody " +
+               "seeded are zero-filled and listed in 'uninitializedReads', which says what to seed. " +
+               "A wall-clock 'timeoutMs' bounds the run; 'readMemory' dumps ranges at the stop point.";
     }
 
     @Override
@@ -112,6 +120,20 @@ public class EmulateFunctionTool implements McpTool {
                 "is left untouched."));
         props.put("skipCallReturnValue", Map.of("type", "string",
             "description", "Value (decimal or 0x-hex) written to skipCallReturnRegister after each skipped call (default 0)."));
+        props.put("skipAllCalls", Map.of("type", "boolean",
+            "description", "If true, step over EVERY call instruction (internal, external and indirect) instead " +
+                "of executing the callee. Each skipped call takes its return value from 'callReturnValues' in " +
+                "order, then from skipCallReturnValue. Use it to replay a witness from ghidra_explore_paths " +
+                "found with callPolicy=skip, or to test one function in isolation. Default false."));
+        props.put("callReturnValues", Map.of("type", "array", "items", Map.of("type", "string"),
+            "description", "Return values (decimal or 0x-hex) for skipped calls, consumed in execution order. " +
+                "Written to skipCallReturnRegister, or to the default calling convention's return register."));
+        props.put("timeoutMs", Map.of("type", "integer",
+            "description", "Wall-clock limit for the run (default 30000, max 600000). Stop reason becomes 'timeout'."));
+        props.put("readMemory", Map.of("type", "array",
+            "description", "Up to 16 {address, length} ranges (length <= 1024) to dump from emulator memory " +
+                "when the run stops; returned in 'memoryAtStop'.",
+            "items", Map.of("type", "object")));
         schema.put("properties", props);
         schema.put("required", List.of("entry"));
         return schema;
@@ -139,6 +161,38 @@ public class EmulateFunctionTool implements McpTool {
         boolean trackMemoryWrites = !Boolean.FALSE.equals(arguments.get("trackMemoryWrites"));
         boolean includeScratch = Boolean.TRUE.equals(arguments.get("includeScratch"));
         boolean skipCalls = Boolean.TRUE.equals(arguments.get("skipCalls"));
+        boolean skipAllCalls = Boolean.TRUE.equals(arguments.get("skipAllCalls"));
+        long timeoutMs = ((Number) arguments.getOrDefault("timeoutMs", DEFAULT_TIMEOUT_MS)).longValue();
+        if (timeoutMs < 1 || timeoutMs > HARD_MAX_TIMEOUT_MS) {
+            throw new IllegalArgumentException("timeoutMs must be between 1 and " + HARD_MAX_TIMEOUT_MS);
+        }
+        List<BigInteger> callReturnValues = new ArrayList<>();
+        Object rawReturns = arguments.get("callReturnValues");
+        if (rawReturns != null) {
+            if (!(rawReturns instanceof List<?> list) || list.size() > MAX_CALL_RETURN_VALUES) {
+                throw new IllegalArgumentException("callReturnValues must be an array of at most "
+                    + MAX_CALL_RETURN_VALUES + " values");
+            }
+            for (Object value : list) callReturnValues.add(parseBigInt(String.valueOf(value)));
+        }
+        List<Address> readAddresses = new ArrayList<>();
+        List<Integer> readLengths = new ArrayList<>();
+        Object rawReads = arguments.get("readMemory");
+        if (rawReads != null) {
+            if (!(rawReads instanceof List<?> list) || list.size() > MAX_READ_RANGES) {
+                throw new IllegalArgumentException("readMemory must be an array of at most " + MAX_READ_RANGES + " ranges");
+            }
+            for (Object item : list) {
+                if (!(item instanceof Map<?, ?> range) || !(range.get("length") instanceof Number length)) {
+                    throw new IllegalArgumentException("readMemory items must be {address, length}");
+                }
+                if (length.intValue() < 1 || length.intValue() > MAX_READ_LENGTH) {
+                    throw new IllegalArgumentException("readMemory length must be between 1 and " + MAX_READ_LENGTH);
+                }
+                readAddresses.add(McpUtil.parseAddress(String.valueOf(range.get("address")), program));
+                readLengths.add(length.intValue());
+            }
+        }
         String skipRetRegName = (String) arguments.get("skipCallReturnRegister");
         String skipRetValStr = (String) arguments.get("skipCallReturnValue");
 
@@ -158,6 +212,38 @@ public class EmulateFunctionTool implements McpTool {
 
         EmulatorHelper emu = new EmulatorHelper(program);
         try {
+            // --- Record reads of memory that nothing initialized. The emulator
+            // zero-fills them and carries on, so without this list a run that went
+            // wrong because of a missing seed looks like a run that went right.
+            List<Map<String, Object>> uninitReads = new ArrayList<>();
+            int[] uninitCount = { 0 };
+            Set<Address> uninitSeen = new HashSet<>();
+            emu.setMemoryFaultHandler(new ghidra.pcode.memstate.MemoryFaultHandler() {
+                @Override
+                public boolean uninitializedRead(Address address, int size, byte[] buf, int bufOffset) {
+                    if (emu.getEmulateExecutionState()
+                            == ghidra.pcode.emulate.EmulateExecutionState.INSTRUCTION_DECODE) {
+                        return false; // executing unmapped bytes stays an error
+                    }
+                    if (address.getAddressSpace().isMemorySpace() && uninitSeen.add(address)) {
+                        uninitCount[0]++;
+                        if (uninitReads.size() < MAX_UNINIT_READS) {
+                            Map<String, Object> read = new LinkedHashMap<>();
+                            read.put("address", address.toString());
+                            read.put("size", size);
+                            read.put("pc", String.valueOf(emu.getExecutionAddress()));
+                            uninitReads.add(read);
+                        }
+                    }
+                    return true; // treat as initialized (zero), as the emulator does by default
+                }
+
+                @Override
+                public boolean unknownAddress(Address address, boolean write) {
+                    return false;
+                }
+            });
+
             // --- Seed stack pointer first so subsequent sentinel-on-stack works ---
             Register spReg = (spRegOverride != null)
                 ? program.getLanguage().getRegister(spRegOverride)
@@ -217,14 +303,24 @@ public class EmulateFunctionTool implements McpTool {
             emu.writeRegister(pcReg, entry.getOffset());
 
             // --- Resolve optional skip-call return register/value ---
-            Register skipRetReg = (skipCalls && skipRetRegName != null && !skipRetRegName.isEmpty())
+            boolean skipping = skipCalls || skipAllCalls;
+            Register skipRetReg = (skipping && skipRetRegName != null && !skipRetRegName.isEmpty())
                 ? program.getLanguage().getRegister(skipRetRegName) : null;
-            if (skipCalls && skipRetRegName != null && skipRetReg == null) {
+            if (skipping && skipRetRegName != null && !skipRetRegName.isEmpty() && skipRetReg == null) {
                 throw new IllegalArgumentException("Unknown skip-call return register: " + skipRetRegName);
+            }
+            if (skipRetReg == null && !callReturnValues.isEmpty()) {
+                skipRetReg = defaultReturnRegister(program);
+                if (skipRetReg == null) {
+                    throw new IllegalArgumentException("callReturnValues needs skipCallReturnRegister: this " +
+                        "program's default calling convention has no single return register");
+                }
             }
             BigInteger skipRetVal = (skipRetReg != null)
                 ? parseBigInt(skipRetValStr != null && !skipRetValStr.isEmpty() ? skipRetValStr : "0")
                 : null;
+            int nextCallReturn = 0;
+            long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
             List<Map<String, Object>> skippedCalls = new ArrayList<>();
 
             // --- Symbolic resolver (only active when symbolicBranches=true) ---
@@ -253,18 +349,29 @@ public class EmulateFunctionTool implements McpTool {
                     break;
                 }
 
-                Instruction instr = (recordBranches || skipCalls)
+                // A tight loop can burn the whole step budget without ever stopping.
+                if ((i & 0x3ff) == 0 && System.nanoTime() >= deadline) {
+                    stopReason = "timeout";
+                    break;
+                }
+
+                Instruction instr = (recordBranches || skipping)
                     ? program.getListing().getInstructionAt(pc) : null;
 
-                // --- Auto-skip un-emulatable external CALLs (opt-in) ---
-                if (skipCalls && instr != null) {
-                    String skippedSym = resolveSkippableCall(program, instr);
+                // --- Step over calls: every call (skipAllCalls), or only those whose
+                // target cannot be emulated (skipCalls) ---
+                if (skipping && instr != null) {
+                    String skippedSym = skipAllCalls ? anyCallLabel(program, instr) : null;
+                    if (skippedSym == null && skipCalls) skippedSym = resolveSkippableCall(program, instr);
                     if (skippedSym != null) {
                         Address fall = instr.getFallThrough();
                         if (fall != null) {
                             emu.writeRegister(pcReg, fall.getOffset());
+                            BigInteger returned = null;
                             if (skipRetReg != null) {
-                                emu.writeRegister(skipRetReg, skipRetVal);
+                                returned = nextCallReturn < callReturnValues.size()
+                                    ? callReturnValues.get(nextCallReturn++) : skipRetVal;
+                                emu.writeRegister(skipRetReg, returned);
                             }
                             skippedCallCount++;
                             if (skippedCalls.size() < MAX_SKIPPED_CALLS) {
@@ -272,6 +379,7 @@ public class EmulateFunctionTool implements McpTool {
                                 sc.put("pc", pc.toString());
                                 sc.put("symbol", skippedSym);
                                 sc.put("resumedAt", fall.toString());
+                                if (returned != null) sc.put("returned", "0x" + returned.toString(16));
                                 skippedCalls.add(sc);
                             }
                             steps++;
@@ -352,7 +460,30 @@ public class EmulateFunctionTool implements McpTool {
                 }
             }
 
-            if (skipCalls) {
+            if (!uninitReads.isEmpty()) {
+                result.put("uninitializedReads", uninitReads);
+                result.put("uninitializedReadCount", uninitCount[0]);
+                result.put("uninitializedReadNote", "These addresses were read before anything wrote them and " +
+                    "were treated as zero. Seed them through 'memory' if the result depends on them.");
+            }
+            if (!readAddresses.isEmpty()) {
+                List<Map<String, Object>> dumps = new ArrayList<>();
+                for (int r = 0; r < readAddresses.size(); r++) {
+                    Map<String, Object> dump = new LinkedHashMap<>();
+                    dump.put("address", readAddresses.get(r).toString());
+                    dump.put("length", readLengths.get(r));
+                    byte[] bytes = emu.readMemory(readAddresses.get(r), readLengths.get(r));
+                    if (bytes == null) dump.put("error", "not readable");
+                    else dump.put("hex", HexFormat.of().formatHex(bytes));
+                    dumps.add(dump);
+                }
+                result.put("memoryAtStop", dumps);
+            }
+            if (callReturnValues.size() > nextCallReturn) {
+                result.put("unusedCallReturnValues", callReturnValues.size() - nextCallReturn);
+            }
+
+            if (skipping) {
                 result.put("skippedCalls", skippedCalls);
                 result.put("skippedCallCount", skippedCallCount);
                 if (skippedCallCount > skippedCalls.size()) {
@@ -496,6 +627,27 @@ public class EmulateFunctionTool implements McpTool {
             bucket.add(mw);
         }
         return out;
+    }
+
+    /** A label for any call instruction (for skipAllCalls), or null if it is not a call. */
+    private static String anyCallLabel(Program program, Instruction instr) {
+        FlowType ft = instr.getFlowType();
+        if (ft == null || !ft.isCall()) return null;
+        Address[] flows = instr.getFlows();
+        if (flows == null || flows.length == 0) return "indirect";
+        Function f = program.getFunctionManager().getFunctionAt(flows[0]);
+        return f != null ? f.getName() : flows[0].toString();
+    }
+
+    /** The register a pointer-sized value is returned in, per the default calling convention. */
+    private static Register defaultReturnRegister(Program program) {
+        try {
+            var storage = program.getCompilerSpec().getDefaultCallingConvention()
+                .getReturnLocation(new ghidra.program.model.data.PointerDataType(), program);
+            return storage != null ? storage.getRegister() : null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
