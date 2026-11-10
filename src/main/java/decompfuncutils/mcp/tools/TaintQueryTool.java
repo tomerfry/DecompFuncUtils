@@ -27,8 +27,17 @@ public class TaintQueryTool implements McpTool {
     public String description() {
         return "Execute a taint query using the built-in DSL to find vulnerability patterns. " +
                "Syntax: PATTERN name { <C-like pattern> } WHERE <constraints>. " +
-               "Constraints: tainted($var), flows_to($src, $dst), is_constant($var), function_is($func, \"free\"), etc. " +
-               "Provide query OR preset. Presets share the UI built-in catalog, including tainted_copy_length, tainted_format, use_after_free, double_free. " +
+               "Pattern statements: calls f($a, _, ...), nested calls malloc(strlen($s)), arithmetic arguments malloc($a * $b), " +
+               "assignments $p = f(...), dereferences *$p, branch conditions $p == 0, gaps '...' with not:$p=_ / not:f($p) / not:($p == 0). " +
+               "Statements match in control-flow order. " +
+               "Constraints: tainted_ext($v) (real input sources only: getenv/read/recv/..., also through sprintf/strcpy/strcat builder buffers), " +
+               "tainted($v) (also treats every parameter as a source), tainted($v, \"read\"), unchecked($v), bounded($v), nonneg_checked($v), " +
+               "overflow_checked($a, $b), signed($v), same($a, $b), related($a, $b), const_eq/ne/lt/le/gt/ge($a, $b|N), in_loop(), " +
+               "returned_by($v, \"f\"), function_in($f, \"a\", \"b\"), function_is, flows_to, is_constant, is_param, is_local; combine with AND/OR/NOT. " +
+               "Provide query OR preset. Presets share the UI built-in catalog, including tainted_copy_length, tainted_format, command_injection_buffer, " +
+               "alloc_mul_overflow, alloc_copy_mismatch, unchecked_alloc_deref, signed_length_copy, unchecked_read_length, realloc_misuse, " +
+               "toctou_file_access, use_after_free, double_free. " +
+               "Each match gives the first matched statement (matchAddress) and the sink (sinkAddress, sinkCode, trace). " +
                "Use startAfter from nextStartAfter to resume bounded scans. Results are heuristic candidates, not confirmed vulnerabilities.";
     }
 
@@ -144,7 +153,15 @@ public class TaintQueryTool implements McpTool {
                     continue;
                 }
 
+                int errorsBefore = matcher.getSearchErrorCount();
                 List<QueryMatch> queryMatches = matcher.matchInFunctionWithMarkup(query, highFunc, markup, true);
+                if (matcher.getSearchErrorCount() > errorsBefore) {
+                    // The matcher abandoned this function; report it instead of
+                    // counting it as analyzed with zero matches.
+                    failures.add(Map.of("function", func.getName(), "functionAddress", lastAddress,
+                        "reason", "Matcher error: " + matcher.getLastSearchError()));
+                    continue;
+                }
                 functionsAnalyzed++;
                 for (QueryMatch match : queryMatches) {
                     Map<String, Object> m = new LinkedHashMap<>();
@@ -152,6 +169,11 @@ public class TaintQueryTool implements McpTool {
                     m.put("functionAddress", func.getEntryPoint().toString());
                     m.put("matchAddress", match.address != null ? match.address.toString() : null);
                     m.put("matchedCode", match.matchedCode);
+                    // Location of the last matched element; equals matchAddress for
+                    // single-statement patterns.
+                    m.put("sinkAddress", match.sinkAddress != null ? match.sinkAddress.toString() : null);
+                    m.put("sinkCode", match.sinkCode);
+                    m.put("trace", match.trace);
                     m.put("bindings", stringifyBindings(match.bindings));
                     m.put("confidence", match.confidence);
                     matches.add(m);
@@ -169,8 +191,9 @@ public class TaintQueryTool implements McpTool {
             result.put("complete", !truncated && failures.isEmpty() && !monitor.isCancelled());
             result.put("confidenceMeaning", "Structural match score, not a probability of exploitability.");
             result.put("limitations", List.of("Heuristic pattern and taint matching; findings require manual validation.",
-                "Direct input buffers are modeled; arbitrary pointer writes, overwrites and aliases remain approximate.",
+                "Buffer contents follow modeled library calls (read/recv/fgets, strcpy/strcat/sprintf/memcpy, ...) in program order; byte-wise writes, callee writes and aliases remain approximate.",
                 "CFG reachability does not prove branch feasibility, missing sanitization or insufficient destination capacity.",
+                "unchecked/bounded/overflow_checked look for a comparison of the value that decides a branch; they do not prove the check is sufficient or on every path.",
                 "Wrapper return-source analysis is bounded to three nested callees; unknown call returns remain conservative.",
                 "complete describes scan coverage for this scope, not proof that the program is safe."));
             result.put("decompileTimeout", decompileTimeout == Integer.MAX_VALUE ? "disabled" : decompileTimeout);

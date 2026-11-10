@@ -195,10 +195,38 @@ Call `ghidra_taint_query` with a preset to start without writing the pattern DSL
 {"preset":"tainted_copy_length","maxFunctions":100}
 ```
 
-The UI and MCP share a curated preset catalog: tainted copy lengths (`memcpy`,
-`memmove`), format strings (`printf`, `fprintf`, `sprintf`, `snprintf`, `syslog`),
-unbounded string copies/input, shell commands, SQL execution, and memory lifetime
-patterns. `tainted_copy_length` and `tainted_format` remain supported aliases.
+The UI and MCP share a curated preset catalog. `tainted_copy_length` and
+`tainted_format` remain supported aliases.
+
+| Preset | Reports |
+|--------|---------|
+| `memcpy_overflow`, `memmove_overflow`, `unbounded_copy_length` | Copy length derived from input; the `unbounded` variant also requires that the length is never bounds-checked, clamped, or a plain `strlen` |
+| `strcpy_overflow`, `sprintf_overflow`, `gets_usage` | Unbounded string copy / formatting of input |
+| `format_string`, `fprintf_format`, `snprintf_format`, `syslog_format` | Input used as a format string (`printf`, `vprintf`, `fprintf`, `vfprintf`, `dprintf`, `sprintf`, `vsprintf`, `snprintf`, `vsnprintf`, `syslog`) |
+| `format_string_buffer`, `command_injection_buffer` | A buffer built with `sprintf`/`snprintf`/`strcpy`/`strcat`/… from input, then used as a format string or run as a command |
+| `command_injection`, `popen_injection`, `exec_injection` | Input reaching `system`, `popen`, or the path of `execl`/`execlp`/`execle`/`execv`/`execvp`/`execve` |
+| `winexec_injection`, `shellexecute_injection`, `createprocess_injection` | Input reaching `WinExec`, `ShellExecuteA/W`, `CreateProcessA/W` |
+| `alloc_mul_overflow`, `alloc_add_overflow`, `realloc_mul_overflow` | `malloc($a * $b)` / `malloc($n + const)` with an input operand and no overflow or range check |
+| `alloc_copy_mismatch`, `alloc_read_mismatch` | `$p = malloc($n)` then `memcpy`/`read` into `$p` with an input length that is neither derived from nor compared with `$n` |
+| `unchecked_alloc_deref`, `unchecked_alloc_use` | Result of `malloc`/`calloc`/`realloc`/`strdup` dereferenced, or passed to a copy function, without ever being compared with NULL |
+| `signed_length_copy`, `signed_length_alloc` | Signed input length reaching `memcpy`/`read`/`malloc`… with no check that rejects negative values |
+| `unchecked_read_length` | Return value of `read`/`recv` used as a length without any check |
+| `stack_buffer_const_overflow`, `stack_buffer_const_read` | Constant length larger than the fixed-size stack array it is copied or read into |
+| `realloc_misuse` | `$p = realloc($p, $n)`: the only pointer is lost when `realloc` fails |
+| `toctou_file_access` | `access`/`stat`/`lstat` on a path followed by `open`/`fopen`/`unlink`/`chmod`/… on the same path |
+| `use_after_free`, `use_after_free_as_arg`, `use_after_free_as_arg2`, `double_free`, `double_free_like` | Memory lifetime patterns |
+| `sql_injection` | Input reaching `sqlite3_exec`, `mysql_query`, `PQexec` |
+
+Sink presets use `tainted_ext`: the data must come from a real input source
+(`getenv`, `read`, `recv`, `fgets`, `scanf`, …) — directly, through the return
+value of a wrapper that returns such data, or through a buffer that an earlier
+call on the path filled (`read(fd, buf, n)`) or built from tainted data
+(`sprintf(cmd, "ping %s", buf)`). Buffer contents are judged at the sink, in
+program order: a write that happens after the sink does not taint it, and a
+later `strcpy`/`sprintf` that always runs before the sink replaces what was
+there. `tainted($v)` additionally treats **every parameter of the function** as
+attacker controlled; use it in a custom query for a broader, noisier sweep. In
+`main`, the parameters count as external input for both.
 
 Copy-length queries require tainted **lengths**; a fixed-size copy of input data
 alone is not reported. Format queries inspect the format argument, including
@@ -207,16 +235,70 @@ pointers, require CFG reachability between matched statements, and restrict
 free-like or dereferencing calls to explicitly modeled APIs. Secure CRT `_s`
 functions are not matched as ordinary libc functions with different signatures.
 Wrapper returns require returned-value source evidence; merely calling an input
-API inside a wrapper is insufficient. Direct buffer fills (`read`, `recv`,
-`fread`, `fgets`, etc.) are matched to the same buffer at a later use.
+API inside a wrapper is insufficient.
 
 These are investigation candidates, not proof of overflow or exploitability:
-destination capacity, intervening buffer overwrites, sanitization, and branch
-predicate feasibility are not fully modeled. Legacy exploratory templates
-(including hardcoded comparisons, unchecked allocation, and binary-specific
-C++ examples) remain available by name through `query`, but are omitted from the
-default selector and MCP presets. Use `ghidra_find_integer_truncation` for
+destination capacity, byte-wise buffer writes, writes made by callees, the
+sufficiency of a bounds check, and branch predicate feasibility are not
+modeled. `unchecked`, `bounded` and `overflow_checked` look for a comparison of
+the value that decides a branch anywhere in the function; they do not prove the
+check is correct or covers every path. Legacy exploratory templates (hardcoded
+comparisons, parameter-to-sink sweeps, statement-level truncation patterns)
+remain available by name through `query`, but are omitted from the default
+selector and MCP presets. Use `ghidra_find_integer_truncation` for
 allocation/copy width mismatches.
+
+#### Pattern language
+
+A query is `PATTERN name { statements } WHERE constraints`, or just one
+statement with an optional `WHERE`. Statements are matched against the
+decompiled function's p-code, **in control-flow order**: each statement must be
+able to execute after the previous one, whether or not `...` separates them.
+Anything the parser does not understand is an error.
+
+| Statement | Matches |
+|-----------|---------|
+| `f($a, _, ...)` | A call. `$a` binds a value (a second use must be the same value), `_` is any argument, `...` any remaining arguments (`f(..., $x, ...)`: some argument). `$f(...)` binds the function name. FORTIFY wrappers (`__printf_chk`, …) are matched with the plain function's argument order. |
+| `f(g($x), $a * $b, $n + 16)` | Nested calls and arithmetic arguments (`+ - * / % << >> & \| ^`, operands `$var`, `_`, numbers). Matched on the value's computation, so `n = strlen(s); p = malloc(n);` matches `malloc(strlen($s))`, and `x << 3` matches `$x * 8`. |
+| `$p = f(...)`, `$s = $a * $b`, `$x = $y` | Assignment of a call result, a computed value, or a copy. |
+| `*$p`, `*$p = $v` | Read or write through `$p`, including `$p->field` and `$p[i]`. |
+| `$p == 0`, `$n < $max` | A comparison that decides a branch. |
+| `char $buf[$n]` | A local array (`$n` is its size in bytes; `[_]` for any size). |
+| `...`, `...{0,5}` | A gap; optionally at most N printed statements. |
+| `... not:$p=_` | Gap in which `$p` is not reassigned on the path. |
+| `... not:free($p)` | Gap in which that call (with those arguments) does not execute. |
+| `... not:($p == 0)`, `... guard:($p == 0)` | Gap without / with a branch on that comparison. |
+| `_` | Exactly one statement in between. |
+
+| Constraint | Meaning |
+|------------|---------|
+| `tainted_ext($v)` | Tainted by a real input source (see above). |
+| `tainted($v)`, `tainted($v, "read")` | Also treats parameters as sources / restricts to one named source. |
+| `unchecked($v)` | The value never reaches a comparison that decides a branch (for pointers: a comparison with a constant such as NULL). Follows the value through copies, casts and phi nodes, so it does not depend on where the decompiler prints the check. |
+| `bounded($v)` | The value reaches an ordered comparison (`<`, `<=`, …), or is a `min()`-style merge of bounded values. |
+| `nonneg_checked($v)` | A branch rejects negative values (signed comparison with 0/1/-1, or any unsigned comparison). |
+| `overflow_checked($a, $b)`, `overflow_checked($n)` | Every non-constant operand is bounded, or a division / carry test guards the computation. |
+| `signed($v)` | The value is sign-extended, or is a variable of a signed integer type. |
+| `same($a, $b)` | The same value, ignoring casts and integer extensions. |
+| `related($a, $b)` | One is computed from the other, both read the same location or call the same function on the same arguments, or they are compared with each other. |
+| `returned_by($v, "strlen", …)` | The value is (computed from) the result of one of these calls. |
+| `const_eq($a, 16)`, `const_ne`, `const_lt`, `const_le`, `const_gt`, `const_ge` | Compare a constant binding with a number or another binding (unsigned). |
+| `in_loop()`, `in_loop($v)` | The last matched statement / the statement that matched `$v` is inside a loop. |
+| `function_in($f, "a", "b")`, `function_is($f, "a")` | The bound function name is one of these (wrapper prefixes ignored). |
+| `flows_to($a, $b)`, `is_constant($v)`, `is_param($v)`, `is_local($v)` | Data flow and value kind. |
+
+Combine constraints with `AND`, `OR`, `NOT` and parentheses. Examples:
+
+```text
+PATTERN cmd { snprintf($buf, _, ...); ...; system($buf); } WHERE tainted_ext($buf)
+malloc($a * $b) WHERE tainted_ext($a) AND NOT overflow_checked($a, $b)
+PATTERN nullderef { $p = malloc(_); ... not:$p=_; *$p; } WHERE unchecked($p)
+PATTERN stack { char $buf[$size]; read(_, $buf, $len); } WHERE const_gt($len, $size)
+```
+
+Each match reports the first matched statement (`matchAddress`) and the last
+one (`sinkAddress`, `sinkCode`), plus a `trace` with one line per matched
+statement; `matchedCode` shows both ends.
 
 Provide either `preset` or `query`, never both. To focus on one function:
 

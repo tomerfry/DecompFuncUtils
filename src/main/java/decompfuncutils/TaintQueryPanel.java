@@ -228,10 +228,16 @@ public class TaintQueryPanel extends ComponentProviderAdapter {
             highlightPattern(doc, text, "\\$\\w+", styleVariable);
             
             // Constraint functions
-            highlightPattern(doc, text, "\\b(tainted|flows_to|is_constant|is_param|is_local)\\s*\\(", styleConstraint);
-            
+            highlightPattern(doc, text, "\\b(tainted_ext|tainted|flows_to|is_constant|is_param|is_local|unchecked|bounded"
+                + "|nonneg_checked|overflow_checked|signed|same|related|returned_by|in_loop|function_is|function_in"
+                + "|const_eq|const_ne|const_lt|const_le|const_gt|const_ge)\\s*\\(", styleConstraint);
+
+            // Gap clauses
+            highlightPattern(doc, text, "\\b(not|guard):", styleKeyword);
+
             // Function calls
-            highlightPattern(doc, text, "\\b(strcpy|sprintf|memcpy|printf|system|malloc|free|gets|fopen|execve|popen)\\b", styleFunction);
+            highlightPattern(doc, text, "\\b(strcpy|strcat|sprintf|snprintf|memcpy|memmove|printf|system|malloc|calloc"
+                + "|realloc|free|gets|read|recv|fopen|open|access|execve|execl|popen)\\b", styleFunction);
             
             // Comments
             highlightPattern(doc, text, "//[^\n]*", styleComment);
@@ -392,13 +398,52 @@ public class TaintQueryPanel extends ComponentProviderAdapter {
             "      // C-like code pattern\n" +
             "  } WHERE constraints\n\n" +
             "VARIABLES:\n" +
-            "  $name - Binds to any variable\n" +
-            "  _     - Wildcard (matches anything)\n" +
-            "  ...   - Matches zero or more statements\n\n" +
+            "  $name - Binds to a value; a second use must be the same value\n" +
+            "  _     - Wildcard (any argument / any value)\n" +
+            "  ...   - As an argument: any remaining arguments\n\n" +
+            "STATEMENTS (matched in control-flow order):\n" +
+            "  f($a, _, ...)           - Call; $f(...) binds the function name\n" +
+            "  f(g($x), $a * $b)       - Nested call / arithmetic argument\n" +
+            "                            operators: + - * / % << >> & | ^\n" +
+            "                            operands: $var, _, numbers\n" +
+            "  $p = f(...)             - Call result;  $s = $a * $b;  $x = $y\n" +
+            "  *$p                     - Read or write through $p (also $p->f, $p[i])\n" +
+            "  *$p = $v                - Write through $p\n" +
+            "  $p == 0   $n < $max     - Comparison that decides a branch\n" +
+            "  char $buf[$n]           - Local array ($n = size in bytes; [_] any)\n" +
+            "  ...                     - Gap: any code in between\n" +
+            "  ...{0,5}                - Gap of at most 5 statements\n" +
+            "  ... not:$p=_            - Gap in which $p is not reassigned\n" +
+            "  ... not:free($p)        - Gap without that call (arguments checked)\n" +
+            "  ... not:($p == 0)       - Gap without a branch on that comparison\n" +
+            "  ... guard:($p == 0)     - Gap that contains such a branch\n" +
+            "  _                       - Exactly one statement in between\n" +
+            "  Unknown syntax is reported as a parse error.\n\n" +
             "CONSTRAINTS:\n" +
-            "  tainted($var)           - Variable is tainted\n" +
+            "  tainted_ext($var)       - Tainted by real input (getenv, read, recv,\n" +
+            "                            fgets, scanf...), directly or through a buffer\n" +
+            "                            filled by strcpy/strcat/sprintf/memcpy...\n" +
+            "  tainted($var)           - Same, but every function parameter also\n" +
+            "                            counts as a source (broader, noisier)\n" +
             "  tainted($var, \"src\")    - Tainted by specific source\n" +
             "  flows_to($a, $b)        - Data flows from $a to $b\n" +
+            "  unchecked($var)         - Never compared in a branch condition\n" +
+            "                            (pointers: never compared with a constant)\n" +
+            "  bounded($var)           - Compared with <, <=, >, >= in a branch\n" +
+            "  nonneg_checked($var)    - A branch rejects negative values\n" +
+            "  overflow_checked($a,$b) - Operands are bounded, or a division /\n" +
+            "                            carry check guards the computation\n" +
+            "  signed($var)            - Sign-extended, or a signed variable\n" +
+            "  same($a, $b)            - Same value (casts/extensions ignored)\n" +
+            "  related($a, $b)         - One derives from the other, both read the\n" +
+            "                            same location, or they are compared\n" +
+            "  returned_by($v, \"f\",..) - Value is the result of a call to f\n" +
+            "  const_eq($a, N)         - Constant comparisons; also const_ne,\n" +
+            "                            const_lt, const_le, const_gt, const_ge;\n" +
+            "                            second operand: number or $var\n" +
+            "  in_loop() / in_loop($v) - Last matched statement / $v's site is in a loop\n" +
+            "  function_in($f, \"a\", \"b\") - Bound function name is one of these\n" +
+            "  function_is($f, \"a\")    - Bound function name is a\n" +
             "  is_constant($var)       - Variable is a constant\n" +
             "  is_param($var)          - Variable is a parameter\n" +
             "  is_local($var)          - Variable is a local\n" +
@@ -407,16 +452,30 @@ public class TaintQueryPanel extends ComponentProviderAdapter {
             "  c1 OR c2                - Either must be true\n\n" +
             "EXAMPLES:\n" +
             "  // Format string vulnerability\n" +
-            "  printf($fmt) WHERE tainted($fmt) AND NOT is_constant($fmt)\n\n" +
+            "  printf($fmt) WHERE tainted_ext($fmt) AND NOT is_constant($fmt)\n\n" +
+            "  // Command built in a buffer, then executed\n" +
+            "  PATTERN cmd {\n" +
+            "      sprintf($buf, ...);\n" +
+            "      ...;\n" +
+            "      system($buf);\n" +
+            "  } WHERE tainted_ext($buf)\n\n" +
             "  // Buffer overflow\n" +
             "  PATTERN bof {\n" +
             "      char $buf[_];\n" +
             "      strcpy($buf, $src);\n" +
-            "  } WHERE tainted($src)\n\n" +
+            "  } WHERE tainted_ext($src)\n\n" +
+            "  // Allocation size overflow\n" +
+            "  malloc($a * $b) WHERE tainted_ext($a) AND NOT overflow_checked($a, $b)\n\n" +
+            "  // Unchecked allocation\n" +
+            "  PATTERN nullderef {\n" +
+            "      $p = malloc(_);\n" +
+            "      ... not:$p=_;\n" +
+            "      *$p;\n" +
+            "  } WHERE unchecked($p)\n\n" +
             "  // Use-after-free\n" +
             "  PATTERN uaf {\n" +
             "      free($ptr);\n" +
-            "      ...;\n" +
+            "      ... not:$ptr=_;\n" +
             "      *$ptr;\n" +
             "  }";
         
@@ -425,7 +484,7 @@ public class TaintQueryPanel extends ComponentProviderAdapter {
         textArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
         
         JScrollPane scrollPane = new JScrollPane(textArea);
-        scrollPane.setPreferredSize(new Dimension(500, 500));
+        scrollPane.setPreferredSize(new Dimension(640, 560));
         
         JOptionPane.showMessageDialog(mainPanel, scrollPane, 
             "Query Syntax Help", JOptionPane.INFORMATION_MESSAGE);
