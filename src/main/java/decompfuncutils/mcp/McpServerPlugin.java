@@ -41,13 +41,16 @@ import java.util.stream.Stream;
                   "so several windows can be driven by several agent sessions in parallel."
 )
 //@formatter:on
-public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListener {
+public class McpServerPlugin extends ProgramPlugin
+        implements OptionsChangeListener, McpWindowDirectory.Window {
 
     private static final String OPTION_PORT = "MCP Server Port";
     private static final String OPTION_AUTH_TOKEN = "MCP Auth Token";
     private static final String OPTION_AUTO_START = "MCP Auto Start";
 
-    private static final int DEFAULT_PORT = 13100;
+    // 13100 is the session manager's fixed port (McpSessionManagerPlugin); windows
+    // take their own direct ports from here upward.
+    private static final int DEFAULT_PORT = 13101;
     private static final String DEFAULT_AUTH_TOKEN = "";
     // On by default: every window that carries this plugin claims its own port, so
     // opening a second CodeBrowser is all it takes to get a second agent lane.
@@ -63,8 +66,9 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
     private McpProtocolHandler protocolHandler;
     private DecompInterfacePool decompPool;
     private Path portFile;
-    private int runningPort = -1;
+    private volatile int runningPort = -1;
     private String startedAt;
+    private volatile boolean disposed;
 
     private int port = DEFAULT_PORT;
     private String authToken = DEFAULT_AUTH_TOKEN;
@@ -100,7 +104,52 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
 
     /** Whether this window's server is currently accepting MCP connections. */
     public boolean isServerRunning() {
-        return transport != null && transport.isRunning();
+        McpHttpTransport t = transport;
+        return t != null && t.isRunning();
+    }
+
+    // ---- McpWindowDirectory.Window: how the session manager sees this window ----
+
+    @Override
+    public String name() {
+        return windowName();
+    }
+
+    @Override
+    public int port() {
+        return runningPort;
+    }
+
+    @Override
+    public String activeProgram() {
+        Program active = getCurrentProgram();
+        return active != null ? active.getName() : null;
+    }
+
+    @Override
+    public List<String> programs() {
+        List<String> names = new ArrayList<>();
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm != null) {
+            for (Program p : pm.getAllOpenPrograms()) {
+                names.add(p.getName());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Stopping a window's server (Tools -> MCP Server -> Stop) also takes it out of
+     * the session manager's reach, so Stop means "no agent touches this window".
+     */
+    @Override
+    public boolean isOpen() {
+        return !disposed && isServerRunning();
+    }
+
+    @Override
+    public McpRequestHandler handler() {
+        return protocolHandler;
     }
 
     private void setupOptions() {
@@ -193,7 +242,24 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
     private void setupToolRegistry() {
         toolRegistry = new McpToolRegistry();
         decompPool = new DecompInterfacePool();
+        registerStandardTools(toolRegistry, decompPool);
 
+        protocolHandler = new McpProtocolHandler(
+            toolRegistry,
+            this::getCurrentProgram,
+            () -> this.tool
+        );
+        // Tell each connecting session which window it landed in — with several
+        // windows served from one Ghidra, "the active program" is ambiguous
+        // otherwise.
+        protocolHandler.setInstructionsSupplier(this::sessionInstructions);
+    }
+
+    /**
+     * Register the full per-window tool set. Shared with the session manager, which
+     * lists the same tools from its fixed port before any window exists.
+     */
+    public static void registerStandardTools(McpToolRegistry toolRegistry, DecompInterfacePool decompPool) {
         // P0 — Core RE Operations (read-only)
         toolRegistry.register(new GetProgramInfoTool());
         toolRegistry.register(new ListFunctionsTool());
@@ -266,16 +332,6 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
 
         // GUI
         toolRegistry.register(new ScreenshotTool());
-
-        protocolHandler = new McpProtocolHandler(
-            toolRegistry,
-            this::getCurrentProgram,
-            () -> this.tool
-        );
-        // Tell each connecting session which window it landed in — with several
-        // windows served from one Ghidra, "the active program" is ambiguous
-        // otherwise.
-        protocolHandler.setInstructionsSupplier(this::sessionInstructions);
     }
 
     /** Orientation text handed to a client in the initialize response. */
@@ -518,6 +574,7 @@ public class McpServerPlugin extends ProgramPlugin implements OptionsChangeListe
 
     @Override
     protected void dispose() {
+        disposed = true;
         stopServer();
         McpWorkspaceRegistry.unregister(this);
         super.dispose();

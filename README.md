@@ -91,9 +91,12 @@ The built extension will be in `dist/`.
 For per-data constants, variable lifetime splitting, per-use union fields, and
 running scripts against the active program, see [MCP cleanup controls](docs/mcp-cleanup.md).
 
-The plugin exposes Ghidra to AI agents over MCP. Each Ghidra tool window serves
-**both** MCP transports on its own port, because different clients speak
-different ones:
+The plugin exposes Ghidra to AI agents over MCP. A **session manager** listens
+on one fixed port (`13100`) from the moment Ghidra starts and gives every agent
+session a CodeBrowser window of its own — see
+[Session manager](#session-manager-one-fixed-port-13100). Each tool window also
+keeps a direct port of its own (`13101` upward). Every port serves **both** MCP
+transports, because different clients speak different ones:
 
 | Endpoint | Transport | Used by |
 |---|---|---|
@@ -282,19 +285,19 @@ The committed `.codex/config.toml` does this:
 
 ```toml
 [mcp_servers.ghidra]
-url = "http://127.0.0.1:13101/mcp"
+url = "http://127.0.0.1:13100/mcp"
 ```
 
-Two caveats worth knowing:
+That is the session manager, so the URL stays valid across Ghidra restarts and
+however many windows are open. Two caveats worth knowing:
 
 - Codex reads a project's `.codex/config.toml` **only for trusted projects**.
   If `codex mcp list` doesn't show `ghidra`, accept Codex's "trust this folder?"
   prompt, or register it globally with
   `codex mcp add ghidra --url http://127.0.0.1:13100/mcp`.
-- TOML has no environment-variable interpolation, so that port is literal. It is
-  pinned to the window that was live when it was written, and a restarted
-  Ghidra may claim a different port — check with `./tools/ghidra-claude.ps1 -List`
-  and either edit the file or retarget per session with the launcher below or
+- TOML has no environment-variable interpolation, so that port is literal. To
+  pin Codex to one window's direct port instead of the manager, retarget per
+  session with the launcher below or
   `codex -c mcp_servers.ghidra.url="http://127.0.0.1:13102/mcp"`.
 
 The first time an agent calls a Ghidra tool, Codex asks you to approve it — that
@@ -310,13 +313,67 @@ Claude Code uses the legacy SSE transport via the committed `.mcp.json`:
   "url": "${GHIDRA_MCP_URL:-http://127.0.0.1:13100/sse}" } } }
 ```
 
-Unlike Codex's config, this one *does* interpolate, so `GHIDRA_MCP_URL` chooses
-the window. Note that `/sse` is a long-lived stream: once open it stays open,
+The default is the session manager. Unlike Codex's config, this one *does*
+interpolate, so setting `GHIDRA_MCP_URL` pins a session to one window's direct
+port instead. Note that `/sse` is a long-lived stream: once open it stays open,
 sending a `: keepalive` comment every 30s. **That is the healthy steady state,
 not a hang** — responses to your `POST /message` calls arrive as `event: message`
 frames on that stream.
 
-### One server per tool window (13100–13149)
+### Session manager: one fixed port (13100)
+
+The session manager runs in the Ghidra **Project window**, so it is listening as
+soon as Ghidra is up — before any CodeBrowser exists — and it never moves to
+another port. Every agent session uses the same URL
+(`http://127.0.0.1:13100/sse` or `/mcp`), and the manager gives each one a
+CodeBrowser window of its own:
+
+- A session's first `ghidra_*` call binds it to a window no other session is
+  using, preferring one that already has a binary loaded. If no window is open,
+  the manager opens a CodeBrowser. The result of that first call says which
+  window the session landed in.
+- If every window is in use, the call fails and tells the agent to call
+  `ghidra_session_open_window`, so a session never drifts into someone else's
+  window by accident.
+- All other `ghidra_*` tools then act on the bound window, exactly as they do
+  on that window's direct port.
+
+| Tool | What it does |
+|---|---|
+| `ghidra_session_status` | The window this session is bound to, plus every open window, its programs and how many sessions use it |
+| `ghidra_session_open_window` | Open a new CodeBrowser (optionally on a program of the project) and move this session into it |
+| `ghidra_session_attach` | Switch this session to an existing window, by name or direct port |
+| `ghidra_session_release` | Give up this session's window; the window stays open |
+
+Things to know:
+
+- **A Ghidra project must be open** for the manager to open windows. With only
+  the Project window and no project, tool calls fail with that message.
+- **A closed window is an error, not a move.** If a session's window closes, or
+  its server is stopped from *Tools → MCP Server → Stop*, the session's calls
+  fail until it attaches or opens a window itself. Moving it silently would aim
+  its next edit at a different binary.
+- **A silent session stops reserving its window after 30 minutes.** It stays
+  bound; other sessions are simply allowed in again. This covers clients that
+  exit without closing their session.
+- **Windows are not closed by the manager.** Close them in Ghidra.
+- **One Ghidra process owns the port.** A second Ghidra started alongside logs
+  that `13100` is taken and runs without a manager; its windows are still
+  reachable on their direct ports.
+
+The manager loads on its own: it is a Project-window plugin in Ghidra's
+*Utility* package, which every saved Project-window configuration already
+includes. Its port, auth token and auto-start live in the Project window under
+*Edit → Tool Options → MCP Session Manager*, and *Tools → MCP Session Manager*
+has Start, Stop and Status. `curl http://127.0.0.1:13100/discovery` reports
+`"role": "session-manager"` and the windows it routes to.
+
+After updating the extension, each CodeBrowser shows Ghidra's **"New Plugins
+Found!"** prompt once, because the extension gained a plugin. Answer it (No is
+fine). While the prompt is up Ghidra cannot finish opening that window, so a
+manager call that opens a window gives up after 45 seconds and says so.
+
+### One server per tool window (13101–13150)
 
 The unit of parallelism is the **Ghidra tool window**, not the Ghidra process.
 Each window that carries the plugin runs its own MCP server on its own port and
@@ -325,9 +382,11 @@ one Ghidra are two independent lanes for two agent sessions. This matters becaus
 a Ghidra project is locked to a single process: several windows are the only way
 to work on several binaries of the same project at once.
 
-When a server starts it takes the first free port beginning at the configured one
-(default `13100`, under *Edit → Tool Options → MCP Server*), so the second window
-lands on `13101`, the third on `13102`, and so on — across windows and across
+These direct ports sit beside the session manager and are for pinning a client
+to one specific window. When a window's server starts it takes the first free
+port beginning at the configured one (default `13101`, under *Edit → Tool Options
+→ MCP Server*; `13100` belongs to the session manager), so the second window
+lands on `13102`, the third on `13103`, and so on — across windows and across
 processes alike. Each window advertises itself in
 `~/.ghidra-mcp/server-<pid>-<port>.json` with its port, window name, project, and
 loaded binaries; several files share a pid when one Ghidra hosts several windows.
@@ -345,7 +404,9 @@ curl http://127.0.0.1:13101/discovery                # one window's status
 ### Running multiple sessions in parallel
 
 You can drive several binaries at once with no cross-talk, one agent session per
-window.
+window. The simple way is the session manager: start as many agent sessions as
+you like against `13100` and each gets its own window. The steps below are the
+manual alternative, pinning each session to a window's direct port.
 
 1. Add a lane. Any of:
    - **From Ghidra:** `Tools → MCP Server → New MCP Window` — opens another window
@@ -413,6 +474,7 @@ outcomes:
 | `POST /mcp` → 404 or 405, `/sse` fine | Ghidra is running an older build with no `/mcp` endpoint | Close Ghidra, install the current extension, restart. The endpoint is created at server start, so restarting *just* the MCP server is not enough. |
 | `POST /sse` → 405 | A Streamable HTTP client was pointed at the legacy endpoint | Use the `/mcp` URL for that client. |
 | `/discovery` unreachable | Server not started, or wrong port | `Tools → MCP Server → Start`; confirm the port with `-List`. |
+| `13100` refuses connections with Ghidra open | Session manager not running: port held by another Ghidra, or the plugin was unticked | Project window: `Tools → MCP Session Manager → Start`, or tick *MCP Session Manager* under `File → Configure → Utility`. |
 | Client reports a timeout on `GET /sse` | The stream is *supposed* to stay open | Not a failure. Check for a real error on the `POST /message` side instead. |
 | Handshake fine, tool call denied | Client-side approval prompt (Codex) | Approve the tool; in `codex exec` MCP calls are auto-cancelled. |
 | Tools list, but calls fail with "No program is currently open" | Server is up before a binary is loaded | Open a program, or call `ghidra_open_program` first. |
