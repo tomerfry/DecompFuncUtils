@@ -38,6 +38,18 @@ Double-click or use `Ctrl+G` on struct field names in the decompiler to navigate
 
 **Use case:** When analyzing a vtable like `vtable->doSomething`, double-clicking on `doSomething` jumps directly to that function.
 
+### 🔷 Data Flow Hover
+Hover a variable, a called function's name, or an operator in the Decompiler to see what it is **affected by** and what it **affects** at that spot.
+
+- **Affected by:** the named variables, constants, call results (`getenv()`), memory reads (`*ptr`) and caller-supplied arguments the value is computed from. Hovering a *read* shows the definitions that reach that particular use; hovering a declaration covers every use.
+- **Affects:** the call arguments it is passed as (`memcpy() argument 3 (__n)`), memory it is stored to, the return value, branch conditions, and other variables it flows into.
+- **may be modified by:** calls whose side effects can change a value that lives in memory.
+- The header keeps what the hidden built-in popups would have said: the variable's data type and kind, or the callee's signature.
+
+The search stays inside the current function, stops at the nearest named variable (hover that one to go further), and is bounded, so it never decompiles or blocks the UI. Enable the **DataflowDecompilerHoverPlugin** in *File → Configure*; turn the popup on or off under *Edit → Tool Options → Decompiler Popups → Data Flow Display*. Constants still show the scalar popup.
+
+Agents get the same lists from the `ghidra_get_dataflow` MCP tool (see below).
+
 ---
 
 ## Installation
@@ -153,6 +165,27 @@ rejected. Requested ranges must not overlap, and names must be unique and must
 not collide with unaffected variables. A failed edit rolls back the entire batch.
 Decompiler-only locals need not be committed before replacement. Re-decompile
 afterwards to check the recovered layout; this tool does not split variable lifetimes.
+
+### Local data flow through MCP
+
+`ghidra_get_dataflow` answers "what does this depend on, and what does it feed?"
+inside one function, using the same analysis as the Decompiler's Data Flow hover:
+
+```json
+{"function":"cp","variable":"__n"}
+{"address":"0x001000bc"}
+{"function":"cp","address":"0x001000bc","variable":"dst"}
+```
+
+Give `variable` for every use of a decompiler variable, `address` for the call
+(or store, return, branch, assignment) at that instruction, or both for that
+variable as read or written there. The result has `affectedBy`, `affects` and
+`mayBeModifiedBy`, each entry with a `kind` (`call result`, `constant`,
+`memory read`, `call argument`, `return`, `branch`, `param`, `local`, ...), a
+`text`, and usually an `address`. `maxDepth` (default 8) and `maxItems`
+(default 50) bound the answer; `affectedByTotal`/`affectsTotal` and the
+`*Truncated` flags say when something was cut. It does not cross calls or track
+values through memory: use the taint tools for that.
 
 ### Taint analysis through MCP
 
