@@ -13,7 +13,18 @@
  *   - is_constant($var)          : variable is a constant
  *   - is_param($var)             : variable is a function parameter  
  *   - is_local($var)             : variable is a local variable
- *   - calls($func)               : pattern contains call to func
+ *   - tainted_ext($var)          : tainted by a real input source (parameters do not count)
+ *   - unchecked($var)            : value never reaches a comparison feeding a branch
+ *   - bounded($var)              : value reaches an ordered (<, <=, ...) comparison feeding a branch
+ *   - nonneg_checked($var)       : a branch rejects negative values of the variable
+ *   - overflow_checked($a[, $b]) : operands of a size computation are range- or division-checked
+ *   - signed($var)               : value is a signed integer (sign-extended or signed type)
+ *   - same($a, $b)               : both bind the same value (casts / extensions ignored)
+ *   - related($a, $b)            : one derives from the other, or the two are compared
+ *   - const_eq/ne/lt/le/gt/ge($a, $b|N) : compare constant bindings
+ *   - in_loop($var) / in_loop()  : binding site (or the last matched element) is inside a loop
+ *   - function_is($f, "name") / function_in($f, "a", "b", ...)
+ *   - returned_by($var, "f", ...) : value is the return value of one of the named calls
  *   - NOT constraint             : negation
  *   - c1 AND c2                  : conjunction
  *   - c1 OR c2                   : disjunction
@@ -42,7 +53,9 @@ public class TaintQuery {
         public boolean isArray;
         public String arraySize;    // "_" for any, number for specific, null for not array
         public boolean isPointer;
-        
+        /** {@code $n} in {@code char $buf[$n]}: bound to the array length in bytes (a Long). */
+        public String sizeVar;
+
         @Override
         public boolean matches(TokenContext ctx, Map<String, Object> bindings) {
             if (!ctx.isVariableDeclaration()) return false;
@@ -69,7 +82,9 @@ public class TaintQuery {
     public static class FunctionCall extends PatternElement {
         public String funcName;     // literal name or "$var" for any
         public List<String> args;   // "$arg1", "$arg2", "..." for varargs
-        
+        /** Parsed argument patterns (same order as {@link #args}); set by the parser. */
+        public List<Expr> argExprs;
+
         @Override
         public boolean matches(TokenContext ctx, Map<String, Object> bindings) {
             if (!ctx.isFunctionCall()) return false;
@@ -112,7 +127,9 @@ public class TaintQuery {
     public static class Assignment extends PatternElement {
         public String lhs;  // "$var" or pattern
         public String rhs;  // "$var", expression pattern, or "_" for any
-        
+        /** Parsed right-hand side; null for the legacy cast form {@code (type)$var}. */
+        public Expr rhsExpr;
+
         @Override
         public boolean matches(TokenContext ctx, Map<String, Object> bindings) {
             if (!ctx.isAssignment()) return false;
@@ -157,6 +174,100 @@ public class TaintQuery {
         }
     }
     
+    // ------------------------------------------------------------------
+    // Expression patterns (call arguments, assignment right-hand sides,
+    // operands of conditions). Produced by TaintQueryParser.
+    // ------------------------------------------------------------------
+    public static abstract class Expr {
+        /** Collect $variables referenced by this expression. */
+        public void collectVariables(Set<String> out) {}
+        /** Collect literal (non-$) function names called inside this expression. */
+        public void collectCallNames(Set<String> out) {}
+    }
+
+    /** {@code $name} - binds to (or must equal) a value. */
+    public static class VarExpr extends Expr {
+        public final String name;
+        public VarExpr(String name) { this.name = name; }
+        @Override public void collectVariables(Set<String> out) { out.add(name); }
+        @Override public String toString() { return name; }
+    }
+
+    /** {@code _} - any single value. */
+    public static class AnyExpr extends Expr {
+        @Override public String toString() { return "_"; }
+    }
+
+    /** {@code ...} - any remaining arguments (only valid as a call argument). */
+    public static class RestExpr extends Expr {
+        @Override public String toString() { return "..."; }
+    }
+
+    /** Integer literal. */
+    public static class LiteralExpr extends Expr {
+        public final long value;
+        public LiteralExpr(long value) { this.value = value; }
+        @Override public String toString() {
+            return value >= 0 && value < 10 ? Long.toString(value) : "0x" + Long.toHexString(value);
+        }
+    }
+
+    /** {@code left op right} with op one of + - * / % << >> & | ^. */
+    public static class BinaryExpr extends Expr {
+        public final String op;
+        public final Expr left, right;
+        public BinaryExpr(String op, Expr left, Expr right) { this.op = op; this.left = left; this.right = right; }
+        @Override public void collectVariables(Set<String> out) { left.collectVariables(out); right.collectVariables(out); }
+        @Override public void collectCallNames(Set<String> out) { left.collectCallNames(out); right.collectCallNames(out); }
+        @Override public String toString() { return left + " " + op + " " + right; }
+    }
+
+    /** {@code name(args)} used as a value, e.g. {@code malloc(strlen($s))}. */
+    public static class CallExpr extends Expr {
+        public final String funcName;
+        public final List<Expr> args;
+        public CallExpr(String funcName, List<Expr> args) { this.funcName = funcName; this.args = args; }
+        @Override public void collectVariables(Set<String> out) {
+            if (funcName.startsWith("$")) out.add(funcName);
+            for (Expr a : args) a.collectVariables(out);
+        }
+        @Override public void collectCallNames(Set<String> out) {
+            if (!funcName.startsWith("$")) out.add(funcName);
+            for (Expr a : args) a.collectCallNames(out);
+        }
+        @Override public String toString() {
+            StringBuilder sb = new StringBuilder(funcName).append("(");
+            for (int i = 0; i < args.size(); i++) { if (i > 0) sb.append(", "); sb.append(args.get(i)); }
+            return sb.append(")").toString();
+        }
+    }
+
+    /** {@code *expr} used as a value: a load through the pointer. */
+    public static class DerefExpr extends Expr {
+        public final Expr pointer;
+        public DerefExpr(Expr pointer) { this.pointer = pointer; }
+        @Override public void collectVariables(Set<String> out) { pointer.collectVariables(out); }
+        @Override public void collectCallNames(Set<String> out) { pointer.collectCallNames(out); }
+        @Override public String toString() { return "*" + pointer; }
+    }
+
+    /**
+     * A comparison that decides a branch: {@code $p == 0}, {@code $n < $max}.
+     * == and != are interchangeable (the decompiler normalises freely), as are
+     * the ordered operators and the operand order.
+     */
+    public static class Condition extends PatternElement {
+        public Expr left;
+        public String op;
+        public Expr right;
+
+        @Override
+        public boolean matches(TokenContext ctx, Map<String, Object> bindings) { return false; }
+
+        @Override
+        public String toString() { return left + " " + op + " " + right; }
+    }
+
     public static class Wildcard extends PatternElement {
         // Matches any single statement or "_" for anything
         @Override
@@ -215,7 +326,9 @@ public class TaintQuery {
     public static class NegativePattern {
         public String varName;      // Variable that must NOT be assigned
         public String pattern;      // Full pattern that must NOT appear
-        
+        /** Parsed form of {@link #pattern}: a call that must not execute in the gap. */
+        public FunctionCall call;
+
         // Conditional branch barrier: not:($var == 0xffffffff) or not:($var cmp const)
         // If set, the gap must NOT contain a conditional branch that compares
         // the bound variable against the given constant - meaning such a check
@@ -248,24 +361,106 @@ public class TaintQuery {
     public static class TaintedConstraint extends Constraint {
         public String varName;
         public String sourceName;  // null for any source
-        
+        /** tainted_ext(): only real input sources count, parameters do not. */
+        public boolean externalOnly;
+
         @Override
         public boolean evaluate(Map<String, Object> bindings, TaintContext taintCtx) {
             Object var = bindings.get(varName);
             if (var == null) return false;
-            
+
+            // Buffer contents are judged where the variable was last matched
+            // (e.g. at the sink), not at the first pattern element.
+            taintCtx.setUseSite(bindings.get(SITE_PREFIX + varName));
+            if (externalOnly) {
+                return taintCtx.isTaintedExternal(var);
+            }
             if (sourceName != null) {
                 return taintCtx.isTaintedBySource(var, sourceName);
             }
             return taintCtx.isTainted(var);
         }
-        
+
         @Override
         public String toString() {
+            if (externalOnly) {
+                return "tainted_ext(" + varName + ")";
+            }
             if (sourceName != null) {
                 return "tainted(" + varName + ", \"" + sourceName + "\")";
             }
             return "tainted(" + varName + ")";
+        }
+    }
+
+    /**
+     * Value/site predicates that need p-code analysis. {@code kind} is the
+     * constraint name; {@code vars} are $variables, {@code names} are quoted
+     * strings and {@code number} an optional integer literal operand.
+     */
+    public static class CheckConstraint extends Constraint {
+        public String kind;
+        public List<String> vars = new ArrayList<>();
+        public List<String> names = new ArrayList<>();
+        public Long number;
+
+        private Object bound(Map<String, Object> bindings, int i) {
+            return i < vars.size() ? bindings.get(vars.get(i)) : null;
+        }
+
+        @Override
+        public boolean evaluate(Map<String, Object> bindings, TaintContext ctx) {
+            Object a = bound(bindings, 0);
+            Object b = bound(bindings, 1);
+            switch (kind) {
+                case "unchecked":      return a != null && ctx.isUnchecked(a);
+                case "bounded":        return a != null && ctx.isBounded(a);
+                case "nonneg_checked": return a != null && ctx.isNonNegativeChecked(a);
+                case "signed":         return a != null && ctx.isSigned(a);
+                case "overflow_checked":
+                    if (a == null) return false;
+                    return ctx.isOverflowChecked(a, vars.size() > 1 ? b : null);
+                case "same":           return a != null && b != null && ctx.isSame(a, b);
+                case "related":        return a != null && b != null && ctx.isRelated(a, b);
+                case "returned_by":    return a != null && ctx.isReturnedBy(a, names);
+                case "function_in": {
+                    if (!(a instanceof String called)) return false;
+                    for (String n : names) {
+                        if (functionNameMatches(called, n)) return true;
+                    }
+                    return false;
+                }
+                case "in_loop": {
+                    Object site = vars.isEmpty() ? bindings.get(LAST_SITE)
+                        : bindings.get(SITE_PREFIX + vars.get(0));
+                    return ctx.isInLoop(vars.isEmpty() ? null : a, site);
+                }
+                case "const_eq": case "const_ne": case "const_lt":
+                case "const_le": case "const_gt": case "const_ge": {
+                    Long x = a == null ? null : ctx.constantValue(a);
+                    Long y = vars.size() > 1 ? (b == null ? null : ctx.constantValue(b)) : number;
+                    if (x == null || y == null) return false;
+                    int c = Long.compareUnsigned(x, y);
+                    switch (kind) {
+                        case "const_eq": return c == 0;
+                        case "const_ne": return c != 0;
+                        case "const_lt": return c < 0;
+                        case "const_le": return c <= 0;
+                        case "const_gt": return c > 0;
+                        default:         return c >= 0;
+                    }
+                }
+                default:
+                    return false;
+            }
+        }
+
+        @Override
+        public String toString() {
+            List<String> parts = new ArrayList<>(vars);
+            for (String n : names) parts.add("\"" + n + "\"");
+            if (number != null) parts.add(Long.toString(number));
+            return kind + "(" + String.join(", ", parts) + ")";
         }
     }
     
@@ -277,7 +472,7 @@ public class TaintQuery {
         @Override
         public boolean evaluate(Map<String, Object> bindings, TaintContext taintCtx) {
             Object value = bindings.get(varName);
-            return value instanceof String name && TaintMatrixConverter.nameMatches(name, functionName);
+            return value instanceof String name && functionNameMatches(name, functionName);
         }
 
         @Override
@@ -432,7 +627,49 @@ public class TaintQuery {
         boolean isConstant(Object var);
         boolean isParameter(Object var);
         boolean isLocal(Object var);
+
+        // Analysis hooks added with the newer constraints. Defaults keep other
+        // TaintContext implementations source compatible.
+
+        /** Where the variable about to be tested was last matched (a PcodeOp), or null. */
+        default void setUseSite(Object site) {}
+        /** Tainted by a real input source; parameters are not sources. */
+        default boolean isTaintedExternal(Object var) { return isTainted(var); }
+        /** The value never reaches a comparison that decides a branch. */
+        default boolean isUnchecked(Object var) { return false; }
+        /** The value reaches an ordered comparison that decides a branch. */
+        default boolean isBounded(Object var) { return false; }
+        /** A branch rejects negative values (signed compare with 0/1/-1, or any unsigned compare). */
+        default boolean isNonNegativeChecked(Object var) { return false; }
+        /** Operands of a size computation are bounded, or a division-style check exists. */
+        default boolean isOverflowChecked(Object a, Object b) { return false; }
+        default boolean isSigned(Object var) { return false; }
+        default boolean isSame(Object a, Object b) { return a != null && a.equals(b); }
+        default boolean isRelated(Object a, Object b) { return isSame(a, b) || flowsTo(a, b) || flowsTo(b, a); }
+        default boolean isReturnedBy(Object var, List<String> functionNames) { return false; }
+        default boolean isInLoop(Object var, Object site) { return false; }
+        /** Constant value of a binding (unsigned), or null when it is not a constant. */
+        default Long constantValue(Object var) { return var instanceof Long l ? l : null; }
     }
+
+    /**
+     * Does a called function's name denote {@code target}? Wrapper prefixes and
+     * suffixes (__x, __x_chk, x@plt, __imp_x, ...) are ignored, and a C++
+     * qualified name matches on its last component.
+     */
+    public static boolean functionNameMatches(String called, String target) {
+        if (called == null || target == null) return false;
+        if (TaintMatrixConverter.nameMatches(called, target)) return true;
+        int scope = called.lastIndexOf("::");
+        return scope >= 0 && TaintMatrixConverter.nameMatches(called.substring(scope + 2), target);
+    }
+
+    /** Bindings whose key starts with this character are engine bookkeeping, not user variables. */
+    public static final String INTERNAL_PREFIX = "#";
+    /** {@code "#site:$var"} maps a variable to the PcodeOp where it was last matched. */
+    public static final String SITE_PREFIX = "#site:";
+    /** PcodeOp of the most recently matched pattern element (the sink once a match completes). */
+    public static final String LAST_SITE = "#last";
     
     // Getters
     public String getName() { return name; }
