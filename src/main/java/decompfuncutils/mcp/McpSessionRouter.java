@@ -47,6 +47,14 @@ public final class McpSessionRouter implements McpRequestHandler {
     public static final String TOOL_ATTACH = "ghidra_session_attach";
     public static final String TOOL_RELEASE = "ghidra_session_release";
 
+    /**
+     * Optional argument accepted by every forwarded tool: run this one call in the
+     * named window instead of the session's bound one. It exists for sub-agents,
+     * which share their parent's MCP connection and so share one binding; each
+     * sub-agent names its own window and they work side by side.
+     */
+    public static final String WINDOW_ARG = "window";
+
     // Per-window lane tools that hand out ports and attach commands. Through the
     // manager a session changes window with ghidra_session_*, so these would mislead.
     private static final Set<String> HIDDEN_WINDOW_TOOLS =
@@ -74,6 +82,17 @@ public final class McpSessionRouter implements McpRequestHandler {
         Window window;
         String lostWindow;
         long lastActivity;
+        // Windows this session reaches with the per-call window argument, and when
+        // it last did. They count as in use, so no other session is bound into them.
+        final Map<Window, Long> perCall = new HashMap<>();
+
+        List<Window> allWindows() {
+            List<Window> all = new ArrayList<>(perCall.keySet());
+            if (window != null && !all.contains(window)) {
+                all.add(window);
+            }
+            return all;
+        }
     }
 
     /** Where a routed call goes, plus a note when the session was bound just now. */
@@ -160,8 +179,10 @@ public final class McpSessionRouter implements McpRequestHandler {
         synchronized (lock) {
             removed = bindings.remove(sessionId);
         }
-        if (removed != null && removed.window != null) {
-            removed.window.handler().removeSession(sessionId);
+        if (removed != null) {
+            for (Window w : removed.allWindows()) {
+                w.handler().removeSession(sessionId);
+            }
         }
     }
 
@@ -170,13 +191,17 @@ public final class McpSessionRouter implements McpRequestHandler {
         // Cancellation targets a request that is running inside a window, so it
         // has to reach that window's handler. Never bind a session for this.
         if ("notifications/cancelled".equals(method)) {
-            Window window;
+            // The request may be running in the bound window or in one reached per
+            // call; a window that does not know the request id ignores the notice.
+            List<Window> windows;
             synchronized (lock) {
                 Binding b = bindings.get(session);
-                window = b != null ? b.window : null;
+                windows = b != null ? b.allWindows() : List.of();
             }
-            if (window != null && window.isOpen()) {
-                window.handler().handleRequest(requestJson, sessionId);
+            for (Window window : windows) {
+                if (window.isOpen()) {
+                    window.handler().handleRequest(requestJson, sessionId);
+                }
             }
         }
     }
@@ -202,7 +227,10 @@ public final class McpSessionRouter implements McpRequestHandler {
             + TOOL_OPEN_WINDOW + " to open another window (optionally on a program of the project) "
             + "and move into it, " + TOOL_ATTACH + " to switch to an existing window, and "
             + TOOL_RELEASE + " to give yours up. Every other ghidra_* tool acts on the window this "
-            + "session is bound to.");
+            + "session is bound to. To work in several windows at once (for example from parallel "
+            + "sub-agents, which share this one session), open them with " + TOOL_OPEN_WINDOW
+            + " bind=false and pass the window name as the '" + WINDOW_ARG + "' argument on each "
+            + "ghidra_* call; such a call runs in the named window and leaves the binding alone.");
         return result;
     }
 
@@ -215,12 +243,30 @@ public final class McpSessionRouter implements McpRequestHandler {
             Map<String, Object> def = new LinkedHashMap<>();
             def.put("name", tool.name());
             def.put("description", tool.description());
-            def.put("inputSchema", tool.inputSchema());
+            def.put("inputSchema", withWindowArg(tool.inputSchema()));
             tools.add(def);
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("tools", tools);
         return result;
+    }
+
+    /** Copy of a window tool's schema with the optional per-call window argument added. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> withWindowArg(Map<String, Object> schema) {
+        Map<String, Object> copy = new LinkedHashMap<>(schema);
+        Map<String, Object> properties = new LinkedHashMap<>();
+        if (schema.get("properties") instanceof Map) {
+            properties.putAll((Map<String, Object>) schema.get("properties"));
+        }
+        if (!properties.containsKey(WINDOW_ARG)) {
+            properties.put(WINDOW_ARG, Map.of("type", "string",
+                "description", "Optional. Run this call in the named Ghidra window (as listed by "
+                    + TOOL_STATUS + ") instead of the window this session is bound to. Lets "
+                    + "parallel sub-agents each work in their own window."));
+        }
+        copy.put("properties", properties);
+        return copy;
     }
 
     private static List<Map<String, Object>> sessionToolDefinitions() {
@@ -314,9 +360,72 @@ public final class McpSessionRouter implements McpRequestHandler {
             throw new McpError(-32602, "Unknown tool: " + toolName);
         }
 
+        String target = text(args.get(WINDOW_ARG));
+        if (target != null) {
+            Window window = perCallWindow(session, target);
+            return window.handler().handleRequest(withoutWindowArg(requestJson), sessionId);
+        }
+
         Route route = route(session);
         String response = route.window.handler().handleRequest(requestJson, sessionId);
         return route.note != null ? appendNote(response, route.note) : response;
+    }
+
+    /**
+     * Resolve the window named on a single call and record that this session is
+     * using it. The session's binding is left exactly as it was.
+     */
+    private Window perCallWindow(String session, String target) throws McpError {
+        List<Window> windows = directory.windows();
+        Window window = findWindow(windows, target);
+        if (window == null) {
+            throw new McpError(-32602, "No open Ghidra window matches '" + target + "' (the '"
+                + WINDOW_ARG + "' argument). Open windows: " + names(windows) + ". Open one with "
+                + TOOL_OPEN_WINDOW + ".");
+        }
+        long now = System.currentTimeMillis();
+        synchronized (lock) {
+            Binding b = bindings.computeIfAbsent(session, k -> new Binding());
+            b.lastActivity = now;
+            b.perCall.keySet().removeIf(w -> !w.isOpen());
+            b.perCall.put(window, now);
+        }
+        return window;
+    }
+
+    /** Match a window by name (ignoring case) or by its direct port. */
+    private static Window findWindow(List<Window> windows, String target) {
+        for (Window w : windows) {
+            if (w.name().equalsIgnoreCase(target)) {
+                return w;
+            }
+        }
+        try {
+            int port = (int) Double.parseDouble(target);
+            for (Window w : windows) {
+                if (w.port() == port) {
+                    return w;
+                }
+            }
+        } catch (NumberFormatException e) {
+            // not a port
+        }
+        return null;
+    }
+
+    private static List<String> names(List<Window> windows) {
+        List<String> names = new ArrayList<>();
+        for (Window w : windows) {
+            names.add(w.name());
+        }
+        return names;
+    }
+
+    /** The request as the window should see it: without the routing argument. */
+    private String withoutWindowArg(String requestJson) {
+        JsonObject request = JsonParser.parseString(requestJson).getAsJsonObject();
+        request.getAsJsonObject("params").getAsJsonObject("arguments").remove(WINDOW_ARG);
+        return new Gson().toJson(request);
     }
 
     /** Find the window a session's tool call goes to, binding the session if needed. */
@@ -406,8 +515,13 @@ public final class McpSessionRouter implements McpRequestHandler {
         int count = 0;
         for (Map.Entry<String, Binding> e : bindings.entrySet()) {
             Binding b = e.getValue();
-            if (b.window == window && !e.getKey().equals(session)
-                    && now - b.lastActivity < claimIdleMs) {
+            if (e.getKey().equals(session)) {
+                continue;
+            }
+            Long perCallUse = b.perCall.get(window);
+            boolean bound = b.window == window && now - b.lastActivity < claimIdleMs;
+            boolean perCall = perCallUse != null && now - perCallUse < claimIdleMs;
+            if (bound || perCall) {
                 count++;
             }
         }
@@ -450,6 +564,9 @@ public final class McpSessionRouter implements McpRequestHandler {
                 Map<String, Object> info = describe(w);
                 info.put("otherSessions", othersUsing(w, session, now));
                 info.put("thisSession", w == mine);
+                if (b != null && b.perCall.containsKey(w)) {
+                    info.put("usedPerCall", true);
+                }
                 list.add(info);
             }
             result.put("windows", list);
@@ -484,8 +601,10 @@ public final class McpSessionRouter implements McpRequestHandler {
             ? "This session's ghidra_* calls now act on '" + opened.name() + "'."
                 + (opened.activeProgram() == null
                     ? " It has no program yet; import one with ghidra_open_program." : "")
-            : "Window opened but this session stayed where it was. Another session picks it up "
-                + "on its first call, or attach with " + TOOL_ATTACH + ".");
+            : "Window opened but this session stayed where it was. Pass " + WINDOW_ARG + "='"
+                + opened.name() + "' on ghidra_* calls to work in it without moving (give each "
+                + "parallel sub-agent its own window this way). Otherwise another session picks it "
+                + "up on its first call.");
         return result;
     }
 
@@ -538,12 +657,16 @@ public final class McpSessionRouter implements McpRequestHandler {
 
     private Object release(String session, String sessionId) {
         Window was;
+        List<Window> held;
         synchronized (lock) {
             Binding b = bindings.remove(session);
             was = b != null ? b.window : null;
+            held = b != null ? b.allWindows() : List.of();
         }
-        if (was != null && sessionId != null) {
-            was.handler().removeSession(sessionId);
+        if (sessionId != null) {
+            for (Window w : held) {
+                w.handler().removeSession(sessionId);
+            }
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("released", was != null ? was.name() : null);
