@@ -158,13 +158,28 @@ public final class McpWorkspaceRegistry {
      * @return the new tool
      */
     public static PluginTool launchWindow(PluginTool source, DomainFile file, String templateName) {
-        Project project = source.getProject();
+        String preferred = (templateName != null && !templateName.isEmpty())
+            ? templateName : source.getToolName();
+        return launchWindow(source.getProject(), file, preferred);
+    }
+
+    /**
+     * Launch a new tool window for {@code project} without needing an existing
+     * window to copy from — what the session manager uses when Ghidra is showing
+     * only its Project window.
+     *
+     * <p>Must be called on the Swing thread.
+     *
+     * @param project   the open project, or null (rejected)
+     * @param file      program to open in the new window, or null for an empty one
+     * @param preferred tool template to instantiate; falls back to CodeBrowser
+     * @return the new tool
+     */
+    public static PluginTool launchWindow(Project project, DomainFile file, String preferred) {
         if (project == null) {
             throw new IllegalStateException("No Ghidra project is open, so no new window can be launched.");
         }
 
-        String preferred = (templateName != null && !templateName.isEmpty())
-            ? templateName : source.getToolName();
         ToolTemplate template = resolveTemplate(project, preferred);
         if (template == null) {
             throw new IllegalStateException("No tool template named '" + preferred +
@@ -272,6 +287,32 @@ public final class McpWorkspaceRegistry {
             }
         }
 
+        return findInProject(project, name);
+    }
+
+    /**
+     * Find a program file by full path or by name, looking only at the project
+     * tree. For callers that have no tool window to consult.
+     *
+     * @return the matching file, or null
+     */
+    public static DomainFile findProgramFile(Project project, String name, String path) {
+        if (project == null) {
+            return null;
+        }
+        if (path != null && !path.isEmpty()) {
+            DomainFile byPath = project.getProjectData().getFile(path);
+            if (byPath != null) {
+                return byPath;
+            }
+        }
+        if (name == null || name.isEmpty()) {
+            return null;
+        }
+        return findInProject(project, name);
+    }
+
+    private static DomainFile findInProject(Project project, String name) {
         DomainFolder root = project.getProjectData().getRootFolder();
         DomainFile direct = root.getFile(name);
         if (direct != null) {

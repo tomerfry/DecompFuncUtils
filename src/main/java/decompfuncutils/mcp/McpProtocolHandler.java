@@ -23,7 +23,7 @@ import java.util.function.Supplier;
  *
  * Supports: initialize, notifications/initialized, ping, tools/list, tools/call
  */
-public class McpProtocolHandler {
+public class McpProtocolHandler implements McpRequestHandler {
 
     private static final Set<String> TOOLS_WITHOUT_PROGRAM = Set.of(
         "ghidra_get_program_info",
@@ -38,9 +38,9 @@ public class McpProtocolHandler {
     // Protocol revisions this server can speak. The feature surface (tools with
     // text/image content) is identical across all three, so we echo whichever
     // the client asked for; unknown versions get our latest.
-    private static final Set<String> SUPPORTED_PROTOCOL_VERSIONS =
+    static final Set<String> SUPPORTED_PROTOCOL_VERSIONS =
         Set.of("2024-11-05", "2025-03-26", "2025-06-18");
-    private static final String LATEST_PROTOCOL_VERSION = "2025-06-18";
+    static final String LATEST_PROTOCOL_VERSION = "2025-06-18";
     private static final String SERVER_NAME = "ghidra-mcp";
     private static final String SERVER_VERSION = "1.0.0";
 
@@ -85,6 +85,7 @@ public class McpProtocolHandler {
      * @param requestJson the JSON-RPC request body
      * @param sessionId   the SSE session ID (used for per-session program context)
      */
+    @Override
     public String handleRequest(String requestJson, String sessionId) {
         JsonObject request;
         try {
@@ -138,6 +139,7 @@ public class McpProtocolHandler {
     /**
      * Remove session state when an SSE connection is closed.
      */
+    @Override
     public void removeSession(String sessionId) {
         if (sessionId != null) {
             sessionPrograms.remove(sessionId);

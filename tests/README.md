@@ -12,6 +12,7 @@ MCP server's two HTTP transports.
 | `test_vuln.o` | Committed x86-64 Linux ELF object compiled from `test_vuln.c`. This is what the test imports. |
 | `scripts/TaintHeadlessTest.java` | GhidraScript post-script: runs taint queries + emulation and prints `CHECK <name>: PASS/FAIL`. |
 | `scripts/McpTransportHeadlessTest.java` | Starts the MCP server in-process and runs a full client handshake over both transports. |
+| `scripts/McpSessionManagerHeadlessTest.java` | Drives the session manager's router with fake tool windows: binding, isolation between sessions, open/attach/release, closed windows, idle claims. |
 | `scripts/SymbolicHeadlessTest.java` | Exercises Z3 path constraints, symbolic memory, bounds, and concrete replay using deterministic x64 instruction fixtures. |
 | `scripts/RefinementHeadlessTest.java` | Exercises non-returning functions and atomic stack-local replacement through JSON-RPC on an isolated Ghidra database. |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
@@ -27,6 +28,8 @@ pwsh tests/run_headless_test.ps1
 pwsh tests/run_headless_test.ps1 -SkipBuild
 # MCP transport handshake test instead of the taint/emulator one:
 pwsh tests/run_headless_test.ps1 -Script McpTransportHeadlessTest.java
+# Session manager routing (one fixed port, a window per session):
+pwsh tests/run_headless_test.ps1 -Script McpSessionManagerHeadlessTest.java
 # Symbolic exploration and bundled native Z3 loading:
 pwsh tests/run_headless_test.ps1 -Script SymbolicHeadlessTest.java
 # Function metadata and stack-local refinement:

@@ -44,7 +44,7 @@ public class McpHttpTransport {
 
     private final int port;
     private final String authToken; // null = no auth
-    private final McpProtocolHandler protocolHandler;
+    private final McpRequestHandler protocolHandler;
     private HttpServer server;
 
     // Optional owner-supplied facts (which tool window, which programs) merged into
@@ -60,7 +60,7 @@ public class McpHttpTransport {
     // Scheduled executor for keepalive pings
     private ScheduledExecutorService keepaliveExecutor;
 
-    public McpHttpTransport(int port, String authToken, McpProtocolHandler protocolHandler) {
+    public McpHttpTransport(int port, String authToken, McpRequestHandler protocolHandler) {
         this.port = port;
         this.authToken = authToken;
         this.protocolHandler = protocolHandler;

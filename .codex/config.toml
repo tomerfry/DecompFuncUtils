@@ -7,11 +7,15 @@
 # Claude Code uses the legacy /sse endpoint instead - see .mcp.json. Both are
 # served on the same port by the same Ghidra instance.
 #
+# 13100 is the session manager: one fixed port for the whole Ghidra process that
+# gives each agent session a CodeBrowser window of its own, so this URL stays
+# valid across Ghidra restarts.
+#
 # TOML has no environment-variable interpolation, so the port below is literal.
-# To target a different Ghidra instance (ports 13100-13149), either:
-#   tools/ghidra-codex.ps1 -Binary libfoo.so        # discovers and overrides
+# To pin a session to one window's direct port (13101 upward) instead, either:
+#   tools/ghidra-claude.ps1 -Client codex -Binary libfoo.so   # discovers and overrides
 #   codex -c mcp_servers.ghidra.url="http://127.0.0.1:13102/mcp"
 # Run tools/mcp-handshake-probe.ps1 to check a server before launching.
 
 [mcp_servers.ghidra]
-url = "http://127.0.0.1:13101/mcp"
+url = "http://127.0.0.1:13100/mcp"
