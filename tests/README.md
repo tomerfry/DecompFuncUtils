@@ -15,6 +15,7 @@ MCP server's two HTTP transports.
 | `scripts/McpSessionManagerHeadlessTest.java` | Drives the session manager's router with fake tool windows: binding, isolation between sessions, open/attach/release, closed windows, idle claims. |
 | `scripts/SymbolicHeadlessTest.java` | Exercises Z3 path constraints, symbolic memory, bounds, and concrete replay using deterministic x64 instruction fixtures. |
 | `scripts/RefinementHeadlessTest.java` | Exercises non-returning functions and atomic stack-local replacement through JSON-RPC on an isolated Ghidra database. |
+| `scripts/DataflowHeadlessTest.java` | Exercises the data-flow slicer behind the Decompiler hover from real decompiler tokens, its tooltip HTML, and the `ghidra_get_dataflow` MCP tool. |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
 | `build_binary.ps1` | Recompile `test_vuln.o` (only needed if you edit `test_vuln.c`; requires clang). |
@@ -34,12 +35,25 @@ pwsh tests/run_headless_test.ps1 -Script McpSessionManagerHeadlessTest.java
 pwsh tests/run_headless_test.ps1 -Script SymbolicHeadlessTest.java
 # Function metadata and stack-local refinement:
 pwsh tests/run_headless_test.ps1 -Script RefinementHeadlessTest.java
+# Data-flow hover analysis and ghidra_get_dataflow:
+pwsh tests/run_headless_test.ps1 -Script DataflowHeadlessTest.java
 ```
 
 To check a *running* Ghidra's MCP server rather than a headless one, use
 `tools/mcp-handshake-probe.ps1` (see the MCP section of the top-level README).
 
 ## What is covered
+
+- **Data flow** (`DataflowHeadlessTest`): seeds taken from decompiler tokens the
+  way the hover takes them (variable read, assignment target, declaration, call
+  name, operator) and the tokens it must leave to other hovers (constants, types,
+  the function's own name); `getenv()` results reaching `printf`/`memcpy`
+  arguments, parameters reaching the return value and a branch condition,
+  constants, memory reads, `&buf`, calls that may modify a value; depth and
+  size caps; a sweep over every token of every function; tooltip HTML; and the
+  MCP tool returning the same lists. The hover's Swing wiring (service
+  registration, popup priority, the options checkbox) needs the GUI and is not
+  covered.
 
 - **Refinement** (`RefinementHeadlessTest`): setting/clearing non-returning flags,
   changed caller decompilation, external/thunk targets, ambiguous names, stack
