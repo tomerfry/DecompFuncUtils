@@ -496,6 +496,14 @@ CodeBrowser window of its own:
 | `ghidra_session_open_window` | Open a new CodeBrowser (optionally on a program of the project) and move this session into it |
 | `ghidra_session_attach` | Switch this session to an existing window, by name or direct port |
 | `ghidra_session_release` | Give up this session's window; the window stays open |
+| `ghidra_session_close_window` | Save the window's programs to the project and close the window (`save: false` discards changes instead) |
+
+**Saving work.** `ghidra_open_program` saves the imported binary into the
+project and opens it writable, then saves it again automatically when
+auto-analysis finishes. `ghidra_save_program` saves later edits (renames, types,
+comments) at any point, and `ghidra_session_close_window` saves everything open
+in a window and closes it. Neither ever raises a Ghidra dialog: if a save cannot
+happen yet (analysis still running, read-only file) the call fails and says why.
 
 **Several windows from one session (parallel sub-agents).** Sub-agents share
 their parent's MCP connection, so the manager sees them as one session with one

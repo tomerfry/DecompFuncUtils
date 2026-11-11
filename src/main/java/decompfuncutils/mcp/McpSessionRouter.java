@@ -29,8 +29,8 @@ import java.util.Set;
  * <ul>
  *   <li>{@code initialize} and {@code tools/list} are answered here, so a client
  *       can connect before any CodeBrowser exists.</li>
- *   <li>The {@code ghidra_session_*} tools open, list, attach to and release
- *       windows.</li>
+ *   <li>The {@code ghidra_session_*} tools open, list, attach to, release and
+ *       close windows.</li>
  *   <li>Every other tool call is forwarded, in process, to the window the session
  *       is bound to. An unbound session is bound on its first call: to a window no
  *       other session is using, or to a freshly opened one when none exists.</li>
@@ -46,6 +46,7 @@ public final class McpSessionRouter implements McpRequestHandler {
     public static final String TOOL_OPEN_WINDOW = "ghidra_session_open_window";
     public static final String TOOL_ATTACH = "ghidra_session_attach";
     public static final String TOOL_RELEASE = "ghidra_session_release";
+    public static final String TOOL_CLOSE_WINDOW = "ghidra_session_close_window";
 
     /**
      * Optional argument accepted by every forwarded tool: run this one call in the
@@ -226,7 +227,10 @@ public final class McpSessionRouter implements McpRequestHandler {
             + "if none exists; call " + TOOL_STATUS + " to see which window you are in. Use "
             + TOOL_OPEN_WINDOW + " to open another window (optionally on a program of the project) "
             + "and move into it, " + TOOL_ATTACH + " to switch to an existing window, and "
-            + TOOL_RELEASE + " to give yours up. Every other ghidra_* tool acts on the window this "
+            + TOOL_RELEASE + " to give yours up while leaving it open, and " + TOOL_CLOSE_WINDOW
+            + " to save its programs and close it. ghidra_save_program saves without closing; "
+            + "programs imported with ghidra_open_program are writable and are saved "
+            + "automatically when auto-analysis finishes. Every other ghidra_* tool acts on the window this "
             + "session is bound to. To work in several windows at once (for example from parallel "
             + "sub-agents, which share this one session), open them with " + TOOL_OPEN_WINDOW
             + " bind=false and pass the window name as the '" + WINDOW_ARG + "' argument on each "
@@ -309,6 +313,24 @@ public final class McpSessionRouter implements McpRequestHandler {
             + "and its programs stay open.",
             Map.of()));
 
+        Map<String, Object> closeProps = new LinkedHashMap<>();
+        closeProps.put("window", Map.of("type", "string",
+            "description", "Window to close, as listed by " + TOOL_STATUS + ". Defaults to the "
+                + "window this session is bound to."));
+        closeProps.put("save", Map.of("type", "boolean",
+            "description", "Save every changed program before closing (default true). Pass false "
+                + "to close and DISCARD unsaved changes."));
+        closeProps.put("force", Map.of("type", "boolean",
+            "description", "Close the window even though other sessions are using it "
+                + "(default false)."));
+        defs.add(toolDef(TOOL_CLOSE_WINDOW,
+            "Save the programs open in a Ghidra CodeBrowser window to the project and close the "
+            + "window. By default it closes the window this session is bound to and saves first, so "
+            + "no work is lost; the programs stay in the project and can be reopened with "
+            + TOOL_OPEN_WINDOW + ". Fails, leaving the window open, while auto-analysis is running "
+            + "or if a program cannot be saved.",
+            closeProps));
+
         return defs;
     }
 
@@ -348,6 +370,8 @@ public final class McpSessionRouter implements McpRequestHandler {
                 return successResponse(id, textResult(attach(args, session)));
             case TOOL_RELEASE:
                 return successResponse(id, textResult(release(session, sessionId)));
+            case TOOL_CLOSE_WINDOW:
+                return successResponse(id, textResult(closeWindow(args, session, sessionId)));
             default:
                 break;
         }
@@ -576,7 +600,8 @@ public final class McpSessionRouter implements McpRequestHandler {
             ? "No CodeBrowser window is open. Any ghidra_* tool call opens one, or call "
                 + TOOL_OPEN_WINDOW + "."
             : "Tool calls act on the window marked thisSession. " + TOOL_OPEN_WINDOW
-                + " opens another; " + TOOL_ATTACH + " switches to an existing one.");
+                + " opens another; " + TOOL_ATTACH + " switches to an existing one; "
+                + TOOL_CLOSE_WINDOW + " saves and closes one.");
         return result;
     }
 
@@ -672,6 +697,76 @@ public final class McpSessionRouter implements McpRequestHandler {
         result.put("released", was != null ? was.name() : null);
         result.put("hint", "This session is unbound. Its next ghidra_* call binds it to a free "
             + "window again.");
+        return result;
+    }
+
+    private Object closeWindow(Map<String, Object> args, String session, String sessionId)
+            throws McpError {
+        String name = text(args.get(WINDOW_ARG));
+        boolean save = args.get("save") == null || Boolean.parseBoolean(String.valueOf(args.get("save")));
+        boolean force = args.get("force") != null && Boolean.parseBoolean(String.valueOf(args.get("force")));
+
+        Window target;
+        int others;
+        synchronized (lock) {
+            if (name != null) {
+                List<Window> windows = directory.windows();
+                target = findWindow(windows, name);
+                if (target == null) {
+                    throw new McpError(-32602, "No open Ghidra window matches '" + name
+                        + "'. Open windows: " + names(windows));
+                }
+            } else {
+                Binding b = bindings.get(session);
+                target = b != null ? b.window : null;
+                if (target == null || !target.isOpen()) {
+                    throw new McpError(-32602, "This session is not bound to an open Ghidra window, "
+                        + "so there is nothing to close. Name one with the '" + WINDOW_ARG
+                        + "' argument; " + TOOL_STATUS + " lists them.");
+                }
+            }
+            others = othersUsing(target, session, System.currentTimeMillis());
+        }
+        if (others > 0 && !force) {
+            throw new McpError(-32603, others + " other session(s) are using window '" + target.name()
+                + "'. Closing it would pull it out from under them. Pass force=true to close it "
+                + "anyway" + (save ? " (its programs are saved first)." : "."));
+        }
+
+        // Closing waits on saves and on the Swing thread, so it runs outside the lock.
+        List<Map<String, Object>> programs;
+        try {
+            programs = target.close(save);
+        } catch (Exception e) {
+            throw new McpError(-32603, "Window '" + target.name() + "' was not closed: "
+                + e.getMessage());
+        }
+
+        // This session asked for the close, so it is simply unbound: its next call
+        // picks a window again. Other sessions that were in the window find out on
+        // their next call, as for any window that closes.
+        synchronized (lock) {
+            Binding b = bindings.get(session);
+            if (b != null) {
+                b.perCall.remove(target);
+                if (b.window == target) {
+                    b.window = null;
+                    b.lostWindow = null;
+                }
+            }
+        }
+        if (sessionId != null) {
+            target.handler().removeSession(sessionId);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("closed", target.name());
+        result.put("saved", save);
+        result.put("programs", programs);
+        result.put("hint", "The window is closed" + (save ? " and its programs are saved in the "
+            + "project" : "; unsaved changes were discarded") + ". Reopen a program with "
+            + TOOL_OPEN_WINDOW + " name=<program>. This session's next ghidra_* call binds it to "
+            + "a free window, or opens a new one.");
         return result;
     }
 

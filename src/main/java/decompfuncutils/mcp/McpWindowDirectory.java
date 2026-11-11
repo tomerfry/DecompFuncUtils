@@ -1,6 +1,7 @@
 package decompfuncutils.mcp;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * The session manager's view of the Ghidra tool windows it can route to.
@@ -31,6 +32,19 @@ public interface McpWindowDirectory {
 
         /** Handler that executes tool calls against this window. */
         McpRequestHandler handler();
+
+        /**
+         * Close the window without asking the operator anything.
+         *
+         * @param save true to save every changed program first; false to discard
+         *             unsaved changes
+         * @return one entry per program the window had open: {@code name} and
+         *         {@code status} ({@code saved}, {@code unchanged},
+         *         {@code added_to_project} or {@code discarded})
+         * @throws Exception if a program could not be saved or the window is busy;
+         *                   the window is then left open
+         */
+        List<Map<String, Object>> close(boolean save) throws Exception;
     }
 
     /** Every window currently serving MCP, in creation order. */

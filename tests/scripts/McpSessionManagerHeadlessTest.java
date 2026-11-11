@@ -98,6 +98,21 @@ public class McpSessionManagerHeadlessTest extends GhidraScript {
         }
         @Override public boolean isOpen() { return open; }
         @Override public McpRequestHandler handler() { return handler; }
+
+        volatile boolean busy;
+        volatile Boolean closedWithSave;
+
+        @Override public List<Map<String, Object>> close(boolean save) {
+            if (busy) {
+                throw new IllegalStateException("auto-analysis is still running");
+            }
+            closedWithSave = save;
+            open = false;
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name", "prog");
+            entry.put("status", save ? "saved" : "discarded");
+            return hasProgram ? List.of(entry) : List.of();
+        }
     }
 
     private final class FakeDirectory implements McpWindowDirectory {
@@ -181,9 +196,65 @@ public class McpSessionManagerHeadlessTest extends GhidraScript {
         runPerCallWindowChecks();
         runClosedWindowChecks();
         runEdgeChecks();
+        runCloseWindowChecks();
 
         println("HEADLESS_TEST_SUMMARY passed=" + passed + " failed=" + failed);
         println("HEADLESS_TEST_RESULT " + (failed == 0 ? "PASS" : "FAIL"));
+    }
+
+    // ---- ghidra_session_close_window: save and close ----
+
+    private void runCloseWindowChecks() {
+        FakeDirectory dir = new FakeDirectory();
+        FakeWindow one = new FakeWindow("One", 13301, true);
+        FakeWindow two = new FakeWindow("Two", 13302, true);
+        FakeWindow three = new FakeWindow("Three", 13303, true);
+        dir.all.add(one);
+        dir.all.add(two);
+        dir.all.add(three);
+        McpSessionRouter router = newRouter(dir);
+
+        JsonObject unbound = call(router, "A", "ghidra_session_close_window", "{}");
+        check("close_unbound_session_rejected", isError(unbound) && one.open && two.open,
+            unbound.toString());
+
+        call(router, "A", "ghidra_session_attach", "{\"window\":\"One\"}");
+        call(router, "B", "ghidra_session_attach", "{\"window\":\"Two\"}");
+
+        // A busy window stays open and the session stays bound to it.
+        one.busy = true;
+        JsonObject busy = call(router, "A", "ghidra_session_close_window", "{}");
+        check("close_busy_window_reported", isError(busy) && errorText(busy).contains("analysis")
+            && one.open && "One".equals(text(call(router, "A", WHO, "{}"), 0)), busy.toString());
+        one.busy = false;
+
+        JsonObject closed = call(router, "A", "ghidra_session_close_window", "{}");
+        check("close_bound_window_saves", !isError(closed) && !one.open
+            && Boolean.TRUE.equals(one.closedWithSave)
+            && "One".equals(payload(closed).get("closed").getAsString())
+            && "saved".equals(payload(closed).getAsJsonArray("programs").get(0).getAsJsonObject()
+                .get("status").getAsString()), closed.toString());
+
+        // The closer is unbound, not stranded: its next call takes a free window.
+        check("closer_rebinds_to_free_window", "Three".equals(text(call(router, "A", WHO, "{}"), 0)),
+            "A did not move to the free window");
+
+        JsonObject shared = call(router, "A", "ghidra_session_close_window", "{\"window\":\"Two\"}");
+        check("close_window_in_use_rejected", isError(shared) && two.open
+            && errorText(shared).contains("force"), shared.toString());
+
+        JsonObject forced = call(router, "A", "ghidra_session_close_window",
+            "{\"window\":\"Two\",\"force\":true,\"save\":false}");
+        check("close_named_window_discarding", !isError(forced) && !two.open
+            && Boolean.FALSE.equals(two.closedWithSave)
+            && "Three".equals(text(call(router, "A", WHO, "{}"), 0)), forced.toString());
+
+        JsonObject lost = call(router, "B", WHO, "{}");
+        check("other_session_told_window_closed", isError(lost) && errorText(lost).contains("Two"),
+            lost.toString());
+
+        JsonObject missing = call(router, "A", "ghidra_session_close_window", "{\"window\":\"Nope\"}");
+        check("close_unknown_window_rejected", isError(missing) && three.open, missing.toString());
     }
 
     // ---- over the real transport: connect before any window exists ----
@@ -241,7 +312,9 @@ public class McpSessionManagerHeadlessTest extends GhidraScript {
             check("manager_lists_session_tools", names.contains("ghidra_session_status")
                 && names.contains("ghidra_session_open_window")
                 && names.contains("ghidra_session_attach")
-                && names.contains("ghidra_session_release"), "tools=" + names);
+                && names.contains("ghidra_session_release")
+                && names.contains("ghidra_session_close_window")
+                && names.contains("ghidra_save_program"), "tools=" + names);
             check("manager_lists_window_tools", names.contains("ghidra_decompile_function")
                 && names.contains("ghidra_open_program") && names.size() > 40,
                 "count=" + names.size());
