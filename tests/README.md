@@ -12,7 +12,8 @@ MCP server's two HTTP transports.
 | `test_vuln.o` | Committed x86-64 Linux ELF object compiled from `test_vuln.c`. This is what the test imports. |
 | `scripts/TaintHeadlessTest.java` | GhidraScript post-script: runs taint queries + emulation and prints `CHECK <name>: PASS/FAIL`. |
 | `scripts/McpTransportHeadlessTest.java` | Starts the MCP server in-process and runs a full client handshake over both transports. |
-| `scripts/McpSessionManagerHeadlessTest.java` | Drives the session manager's router with fake tool windows: binding, isolation between sessions, open/attach/release, closed windows, idle claims. |
+| `scripts/McpSessionManagerHeadlessTest.java` | Drives the session manager's router with fake tool windows: binding, isolation between sessions, open/attach/release/close, closed windows, idle claims. |
+| `scripts/McpSaveHeadlessTest.java` | Checks the dialog-free program save: a never-saved import is added to the project, becomes writable, and later edits survive a reopen. |
 | `scripts/SymbolicHeadlessTest.java` | Exercises Z3 path constraints, symbolic memory, bounds, and concrete replay using deterministic x64 instruction fixtures. |
 | `scripts/RefinementHeadlessTest.java` | Exercises non-returning functions and atomic stack-local replacement through JSON-RPC on an isolated Ghidra database. |
 | `scripts/DataflowHeadlessTest.java` | Exercises the data-flow slicer behind the Decompiler hover from real decompiler tokens, its tooltip HTML, and the `ghidra_get_dataflow` MCP tool. |

@@ -28,6 +28,10 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
 
 //@formatter:off
@@ -150,6 +154,93 @@ public class McpServerPlugin extends ProgramPlugin
     @Override
     public McpRequestHandler handler() {
         return protocolHandler;
+    }
+
+    private static final long CLOSE_TIMEOUT_SECONDS = 45;
+
+    @Override
+    public List<Map<String, Object>> close(boolean save) throws Exception {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        Program[] open = pm != null ? pm.getAllOpenPrograms() : new Program[0];
+
+        // Ghidra answers "close a busy window" with a dialog. Refuse up front, so
+        // the agent is told instead of the operator being asked.
+        for (Program p : open) {
+            if (McpProgramSaver.isAnalyzing(p)) {
+                throw new IllegalStateException("auto-analysis is still running on '" + p.getName()
+                    + "'. Wait for it to finish (ghidra_get_program_info shows the function count "
+                    + "settling) and close the window again.");
+            }
+        }
+        if (tool.isExecutingCommand()) {
+            throw new IllegalStateException("window '" + windowName() + "' is busy with a background "
+                + "task. Try again when it has finished.");
+        }
+
+        // Save from this thread, not the Swing thread: a large program takes a
+        // while to write and the UI should not freeze for it.
+        List<Map<String, Object>> report = new ArrayList<>();
+        for (Program p : open) {
+            if (save) {
+                report.add(McpProgramSaver.save(tool, p, McpUtil.activeMonitor()));
+            } else {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("name", p.getName());
+                entry.put("status", p.isChanged() ? "discarded" : McpProgramSaver.STATUS_UNCHANGED);
+                report.add(entry);
+            }
+        }
+
+        Runnable closeWindow = () -> {
+            ProgramManager manager = tool.getService(ProgramManager.class);
+            if (manager != null) {
+                if (save) {
+                    for (Program p : manager.getAllOpenPrograms()) {
+                        if (p.isChanged() && p.canSave()) {
+                            throw new IllegalStateException("'" + p.getName() + "' changed again "
+                                + "while the window was being saved. Close the window again.");
+                        }
+                    }
+                }
+                // Everything worth keeping is saved, so skip Ghidra's save prompt.
+                manager.closeAllPrograms(true);
+            }
+            // With several windows of one tool open, Ghidra asks whether to keep this
+            // window's tool configuration. Answer "no" ahead of time.
+            tool.setConfigChanged(false);
+            tool.close();
+        };
+
+        if (SwingUtilities.isEventDispatchThread()) {
+            closeWindow.run();
+        } else {
+            CompletableFuture<Void> done = new CompletableFuture<>();
+            SwingUtilities.invokeLater(() -> {
+                try {
+                    closeWindow.run();
+                    done.complete(null);
+                } catch (Throwable t) {
+                    done.completeExceptionally(t);
+                }
+            });
+            try {
+                done.get(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                throw new IllegalStateException("Ghidra did not finish closing window '" + windowName()
+                    + "' within " + CLOSE_TIMEOUT_SECONDS + " seconds. It is most likely waiting on a "
+                    + "dialog; ask the operator to answer it in Ghidra.");
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                throw cause instanceof Exception ? (Exception) cause : new IllegalStateException(cause);
+            }
+        }
+
+        if (!disposed) {
+            throw new IllegalStateException("Ghidra kept window '" + windowName() + "' open"
+                + (save ? " (its programs were saved)" : "") + ". A plugin in that window declined "
+                + "the close.");
+        }
+        return report;
     }
 
     private void setupOptions() {
@@ -305,6 +396,7 @@ public class McpServerPlugin extends ProgramPlugin
         toolRegistry.register(new ListOpenProgramsTool());
         toolRegistry.register(new OpenProgramTool());
         toolRegistry.register(new SwitchProgramTool());
+        toolRegistry.register(new SaveProgramTool());
 
         // Multi-window (parallel work) management
         toolRegistry.register(new ListWindowsTool());

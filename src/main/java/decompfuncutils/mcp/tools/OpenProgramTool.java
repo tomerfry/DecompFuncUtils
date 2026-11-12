@@ -1,10 +1,11 @@
 package decompfuncutils.mcp.tools;
 
+import decompfuncutils.mcp.McpProgramSaver;
 import decompfuncutils.mcp.McpTool;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.services.ProgramManager;
-import ghidra.app.util.importer.AutoImporter;
 import ghidra.app.util.importer.MessageLog;
+import ghidra.app.util.importer.ProgramLoader;
 import ghidra.app.util.opinion.LoadResults;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.DomainFolder;
@@ -28,6 +29,8 @@ public class OpenProgramTool implements McpTool {
         return "Import and open a binary file for analysis in Ghidra. " +
                "Provide the filesystem path to the binary. " +
                "Ghidra will auto-detect the format and architecture. " +
+               "The program is saved into the project and opened writable, and it is saved " +
+               "again automatically once auto-analysis finishes. " +
                "The imported program becomes the active program.";
     }
 
@@ -105,61 +108,47 @@ public class OpenProgramTool implements McpTool {
             loaded.release(this);
 
             if (analyze && !GhidraProgramUtilities.isAnalyzed(loaded)) {
-                triggerAutoAnalysis(loaded);
+                triggerAutoAnalysis(loaded, tool);
             }
 
             return buildResult("opened_from_project", loaded);
         }
 
-        // Import the binary
+        // Import the binary and save it into the project. Without the save the
+        // program has no project file: Ghidra then shows it read-only and nothing
+        // done to it can ever be saved.
         Msg.info(this, "Importing binary: " + absPath);
         MessageLog log = new MessageLog();
-        LoadResults<Program> loadResults;
-        try {
-            loadResults = AutoImporter.importByUsingBestGuess(file, project,
-                rootFolder.getPathname(), this, log, TaskMonitor.DUMMY);
+        Program imported;
+        ProgramLoader.Builder loader = ProgramLoader.builder()
+            .source(file)
+            .project(project)
+            .projectFolderPath(rootFolder.getPathname())
+            .log(log)
+            .monitor(TaskMonitor.DUMMY);
+        if (programName != null && !programName.isEmpty()) {
+            loader.name(programName);
+        }
+        try (LoadResults<Program> loadResults = loader.load()) {
+            loadResults.save(TaskMonitor.DUMMY);
+            // Our own reference, so the program outlives the load results.
+            imported = loadResults.getPrimaryDomainObject(this);
         } catch (Exception e) {
             String logMsg = log.toString();
             throw new RuntimeException("Import failed for: " + filePath + " — " + e.getMessage() +
                 (logMsg.isEmpty() ? "" : "\nImport log: " + logMsg), e);
         }
 
-        if (loadResults == null) {
-            String logMsg = log.toString();
-            throw new RuntimeException("Import returned no results for: " + filePath +
-                (logMsg.isEmpty() ? "" : "\nImport log: " + logMsg));
+        try {
+            pm.openProgram(imported);
+            pm.setCurrentProgram(imported);
+        } finally {
+            // ProgramManager now holds the program.
+            imported.release(this);
         }
 
-        Program imported = loadResults.getPrimaryDomainObject();
-        if (imported == null) {
-            loadResults.release(this);
-            String logMsg = log.toString();
-            throw new RuntimeException("Failed to import binary: " + filePath +
-                (logMsg.isEmpty() ? "" : "\nImport log: " + logMsg));
-        }
-
-        loadResults.releaseNonPrimary(this);
-
-        // Rename if a custom name was provided
-        if (programName != null && !programName.isEmpty() && !imported.getName().equals(programName)) {
-            try {
-                imported.getDomainFile().setName(programName);
-            } catch (Exception e) {
-                Msg.warn(this, "Could not rename to " + programName + ": " + e.getMessage());
-            }
-        }
-
-        // Use pm.openProgram(Program) to hand the imported program directly to ProgramManager.
-        // This bypasses the DomainFileProxy entirely — ProgramManager acquires its own reference.
-        pm.openProgram(imported);
-        pm.setCurrentProgram(imported);
-
-        // Release our consumer lock — ProgramManager now owns the program
-        imported.release(this);
-
-        // Trigger auto-analysis
         if (analyze) {
-            triggerAutoAnalysis(imported);
+            triggerAutoAnalysis(imported, tool);
         }
 
         Msg.info(this, "Successfully imported and opened: " + imported.getName());
@@ -167,12 +156,17 @@ public class OpenProgramTool implements McpTool {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "imported");
         result.put("name", imported.getName());
+        result.put("projectPath", imported.getDomainFile().getPathname());
+        result.put("writable", imported.canSave());
         result.put("executablePath", imported.getExecutablePath());
         result.put("processor", imported.getLanguage().getProcessor().toString());
         result.put("pointerSize", imported.getDefaultPointerSize());
         result.put("analyzing", analyze);
-        result.put("hint", "Auto-analysis has been started. Use ghidra_get_program_info to check " +
-            "functionCount and confirm analysis progress before decompiling.");
+        result.put("hint", analyze
+            ? "The program is saved in the project and auto-analysis has been started; it is saved "
+                + "again automatically when analysis finishes. Use ghidra_get_program_info to check "
+                + "functionCount before decompiling, and ghidra_save_program to save later edits."
+            : "The program is saved in the project. Use ghidra_save_program to save later edits.");
         String logMsg = log.toString();
         if (!logMsg.isEmpty()) {
             result.put("importLog", logMsg);
@@ -184,6 +178,11 @@ public class OpenProgramTool implements McpTool {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", status);
         result.put("name", p.getName());
+        result.put("writable", p.canSave());
+        if (McpProgramSaver.isUnsavedToProject(p)) {
+            result.put("warning", "This program was never saved to the project, so Ghidra shows it "
+                + "read-only. Call ghidra_save_program to add it to the project.");
+        }
         result.put("executablePath", p.getExecutablePath());
         result.put("processor", p.getLanguage().getProcessor().toString());
         result.put("analyzed", GhidraProgramUtilities.isAnalyzed(p));
@@ -191,9 +190,11 @@ public class OpenProgramTool implements McpTool {
         return result;
     }
 
-    private void triggerAutoAnalysis(Program program) {
+    private void triggerAutoAnalysis(Program program, PluginTool tool) {
         try {
             AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
+            // Registered before analysis is scheduled so the end is never missed.
+            McpProgramSaver.saveWhenAnalysisEnds(tool, program);
             mgr.initializeOptions();
             mgr.reAnalyzeAll(null);
             Msg.info(this, "Auto-analysis triggered for: " + program.getName());
