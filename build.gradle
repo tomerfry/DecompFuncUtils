@@ -60,3 +60,8 @@ dependencies {
 // Ex: buildExtension.exclude '.idea/**'
 buildExtension.exclude 'bin/**'
 buildExtension.exclude '*.class'
+// Without these the zip packages agent worktrees and previously built zips -- each worktree
+// carries its own dist zip and z3 jar, which took the extension from ~80MB to over 400MB.
+buildExtension.exclude '.claude/**'
+buildExtension.exclude 'dist/**'
+buildExtension.exclude '.gradle/**'

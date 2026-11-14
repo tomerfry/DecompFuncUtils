@@ -391,6 +391,8 @@ public class McpServerPlugin extends ProgramPlugin
         toolRegistry.register(new ClearAndRepairTool());
         toolRegistry.register(new CreateFunctionTool());
         toolRegistry.register(new CreateBookmarkTool());
+        toolRegistry.register(new ResolveExternalsTool());
+        toolRegistry.register(new BacklinkImportsTool());
 
         // Program Management
         toolRegistry.register(new ListOpenProgramsTool());

@@ -17,6 +17,10 @@ MCP server's two HTTP transports.
 | `scripts/SymbolicHeadlessTest.java` | Exercises Z3 path constraints, symbolic memory, bounds, and concrete replay using deterministic x64 instruction fixtures. |
 | `scripts/RefinementHeadlessTest.java` | Exercises non-returning functions and atomic stack-local replacement through JSON-RPC on an isolated Ghidra database. |
 | `scripts/DataflowHeadlessTest.java` | Exercises the data-flow slicer behind the Decompiler hover from real decompiler tokens, its tooltip HTML, and the `ghidra_get_dataflow` MCP tool. |
+| `extlink/libtestdep.c`, `extlink/testmain.c` | Source of the cross-module link fixtures: an exported shared object and an executable that imports from it. Rebuild with `extlink/build.ps1` (needs clang + lld). |
+| `extlink/libtestdep.so.1`, `extlink/testmain` | Committed ELF pair. `testmain` carries `DT_NEEDED [libtestdep.so.1]` plus `UND` dynsym entries; the library defines and exports them. |
+| `scripts/ResolveExternalsHeadlessTest.java` | Exercises `ghidra_resolve_externals`: puts every import back into `<EXTERNAL>`, clears the library association, then checks the tool re-attributes both and stores the exporting address. Independent of whether this Ghidra's own External Symbol Resolver works. |
+| `scripts/BacklinkImportsHeadlessTest.java` | Exercises `ghidra_backlink_imports`: clickable `{@program ...}` back-links and bookmarks written into the library, block replacement on re-run, coexistence with another importer's block, and removal. |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
 | `build_binary.ps1` | Recompile `test_vuln.o` (only needed if you edit `test_vuln.c`; requires clang). |
@@ -147,3 +151,32 @@ used by the emulator and symbolic tests (`add3`, `with_call`, …) must keep the
 code.
 
 Additional regressions cover 64-node reachability chains in both engines, MCP query presets, one-function pagination without omissions or duplicates, coverage metadata, and invalid query arguments. Test runs use unique temporary settings and project directories; the runner stops immediately on a failed build.
+
+## Cross-module link tests
+
+`run_resolve_externals_test.ps1` drives both external-symbol tests over the
+`extlink/` pair:
+
+```powershell
+.\tests\run_resolve_externals_test.ps1
+.\tests\run_resolve_externals_test.ps1 -Script BacklinkImportsHeadlessTest.java -Analyze
+```
+
+Three things it has to get right, each of which produced a confusing failure:
+
+- **`-Analyze`.** Off by default, because external symbols and exported entry
+  points both come from the ELF loader, so the linking test needs no analysis
+  and finishes in seconds. The back-link test *does* need it: call sites only
+  exist once the callers have been disassembled, and without it the tool
+  correctly reports `noCallSitesInImporter`.
+- **The settings path.** The isolated tree under `XDG_CONFIG_HOME` must match
+  what Ghidra computes, or the extension is never found and every script
+  importing it fails with
+  `missing requirement osgi.wiring.package=decompfuncutils...`. Layout version 3
+  (Ghidra 12.3+) prefixes the parent directory with the user name --
+  `User-ghidra`, not `ghidra` -- so the runner reads the version, release name
+  and layout version from the install instead of hardcoding them.
+- **`-WorkRoot`.** The settings tree and project go here, `TEMP` by default.
+  Point it at a drive with room when the system drive is tight. Both runners now
+  delete their scratch afterwards; before that, every run left an extracted copy
+  of the extension behind.
