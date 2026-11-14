@@ -31,24 +31,28 @@ import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
-import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
- * Puts the angr debugger into a Ghidra tool window: the dockable "angr Debugger" panel, the
- * program counter and breakpoints drawn in the Listing, and right-click actions in the Listing
- * and Decompiler to start on a function, run to the cursor and toggle a breakpoint.
+ * The angr Debugger as a set of dockable windows: a control strip (what to debug, the step
+ * buttons, and a banner saying what just happened) and one window each for Registers, Stack,
+ * Calls, Memory, Output, Paths, Symbols and Imports &amp; Hooks. It draws the program counter and
+ * the breakpoints in the Listing and adds an "angr" menu and right-click actions.
  *
- * <p>The session it shows is the one in {@link AngrDebugger}, shared with the
- * {@code ghidra_angr_debug} MCP tool.
+ * <p>It is the plugin behind the "angr Debugger" tool in the Tool Chest ({@link AngrDebuggerTool}),
+ * and can be added to any other tool that shows a program. The session it shows is the one in
+ * {@link AngrDebugger}, shared with the {@code ghidra_angr_debug} MCP tool.
  */
 //@formatter:off
 @PluginInfo(
     status = PluginStatus.RELEASED,
-    packageName = "DecompFuncUtils",
+    packageName = AngrDebuggerPluginPackage.NAME,
     category = PluginCategoryNames.ANALYSIS,
     shortDescription = "angr Debugger",
     description = "Step a function of the program under angr: registers, stack, calls and memory at " +
@@ -57,131 +61,228 @@ import java.util.Map;
                   "its session with the ghidra_angr_debug MCP tool."
 )
 //@formatter:on
-public class AngrDebuggerPlugin extends ProgramPlugin implements AngrDebuggerController.Host {
+public class AngrDebuggerPlugin extends ProgramPlugin
+        implements AngrDebuggerController.Host, AngrDebuggerPanel.ViewHost {
 
+    public static final String CONTROL_VIEW = "angr Debugger";
+    private static final String MENU = "angr";
     private static final String PC_MARKERS = "angr Debugger PC";
     private static final String BREAKPOINT_MARKERS = "angr Debugger Breakpoints";
 
     private final AngrDebuggerController controller;
-    private final Provider provider;
+    private final Map<String, ViewProvider> providers = new LinkedHashMap<>();
     private final Map<Program, MarkerSet> pcMarkers = new HashMap<>();
     private final Map<Program, MarkerSet> breakpointMarkers = new HashMap<>();
+    private final List<DockingAction> actions = new ArrayList<>();
     private ToggleDockingAction followAction;
     private Address lastShown;
 
     public AngrDebuggerPlugin(PluginTool tool) {
         super(tool);
-        controller = new AngrDebuggerController(this::getCurrentProgram, this);
-        provider = new Provider(tool, getName());
+        controller = new AngrDebuggerController(this::getCurrentProgram, this, true);
+        AngrDebuggerPanel panel = controller.panel();
+        panel.setViewHost(this);
+
+        // The control strip spans the top; state sits to the right of the code, everything that
+        // reads as a list or a log shares the bottom. A saved tool layout overrides all of this.
+        provider(CONTROL_VIEW, panel, WindowPosition.TOP, "angr.control", WindowPosition.STACK);
+        provider("Registers", panel.view("Registers"), WindowPosition.RIGHT, "angr.state", WindowPosition.STACK);
+        provider("Stack", panel.view("Stack"), WindowPosition.RIGHT, "angr.state", WindowPosition.BOTTOM);
+        provider("Calls", panel.view("Calls"), WindowPosition.BOTTOM, "angr.trace", WindowPosition.STACK);
+        for (String view : List.of("Memory", "Output", "Paths", "Symbols", "Imports & Hooks")) {
+            provider(view, panel.view(view), WindowPosition.BOTTOM, "angr.trace", WindowPosition.STACK);
+        }
         createActions();
     }
 
-    // ---- the panel in the tool window ----
+    /** The controller behind the windows; for the tool preview and tests. */
+    public AngrDebuggerController controller() {
+        return controller;
+    }
 
-    private final class Provider extends ComponentProviderAdapter {
-        Provider(PluginTool tool, String owner) {
-            super(tool, "angr Debugger", owner);
-            setTitle("angr Debugger");
-            setDefaultWindowPosition(WindowPosition.BOTTOM);
-            setWindowMenuGroup("angr");
+    // ---- windows ----
+
+    private final class ViewProvider extends ComponentProviderAdapter {
+        private final String view;
+        private final JComponent component;
+
+        ViewProvider(String view, JComponent component, WindowPosition position, String group,
+                WindowPosition inGroup) {
+            super(AngrDebuggerPlugin.this.tool, view, AngrDebuggerPlugin.this.getName());
+            this.view = view;
+            this.component = component;
+            setTitle(view);
+            setDefaultWindowPosition(position);
+            setWindowGroup(group);
+            setIntraGroupPosition(inGroup);
+            setWindowMenuGroup(AngrDebuggerPluginPackage.NAME);
             addToTool();
+            setVisible(true);
         }
 
         @Override
         public JComponent getComponent() {
-            return controller.panel();
+            return component;
+        }
+
+        @Override
+        public void componentShown() {
+            loadImports();
+        }
+
+        @Override
+        public void componentActivated() {
+            loadImports();
+        }
+
+        /** The import list costs a round trip to angr; fetch it when someone first looks. */
+        private void loadImports() {
+            if (view.equals("Imports & Hooks") && !controller.panel().importsLoaded()
+                    && getCurrentProgram() != null) {
+                controller.refreshImports();
+            }
         }
     }
 
-    private void createActions() {
-        // In the panel's own menu, which is also where their key bindings are listed.
-        local("Step Into", KeyEvent.VK_F7, 0, "into");
-        local("Step Over", KeyEvent.VK_F8, 0, "over");
-        local("Step Out", KeyEvent.VK_F8, InputEvent.SHIFT_DOWN_MASK, "out");
-        local("Continue", KeyEvent.VK_F9, 0, "continue");
+    private void provider(String view, JComponent component, WindowPosition position, String group,
+            WindowPosition inGroup) {
+        providers.put(view, new ViewProvider(view, component, position, group, inGroup));
+    }
 
-        followAction = new ToggleDockingAction("Follow Program Counter in Listing", getName()) {
+    @Override
+    public void showView(String name) {
+        ViewProvider provider = providers.get(name);
+        if (provider != null) {
+            tool.showComponentProvider(provider, true);
+            provider.toFront();
+        }
+    }
+
+    @Override
+    public void countChanged(String name, int count) {
+        ViewProvider provider = providers.get(name);
+        if (provider != null) {
+            provider.setSubTitle(count > 0 ? "(" + count + ")" : "");
+            provider.setTabText(count > 0 ? name + " (" + count + ")" : name);
+        }
+    }
+
+    // ---- actions ----
+
+    private void createActions() {
+        step("Continue", "continue", KeyEvent.VK_F5, "1",
+            "Run to the next breakpoint, fork, return or fault");
+        step("Step Into", "into", KeyEvent.VK_F8, "1", "Execute one instruction, entering calls");
+        step("Step Over", "over", KeyEvent.VK_F10, "1",
+            "Execute one instruction, running a call through to its return");
+        step("Step Out", "out", KeyEvent.VK_F12, "1", "Run until the current function returns");
+
+        DockingAction pause = new DockingAction("angr Pause", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                controller.pause();
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                AngrDebugSession session = session();
+                return session != null && session.isRunning();
+            }
+        };
+        menu(pause, "Pause", "2", "Interrupt a run in progress");
+
+        DockingAction stop = new DockingAction("angr Stop", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                controller.stop();
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                return session() != null;
+            }
+        };
+        menu(stop, "Stop", "2", "End the debug session");
+
+        DockingAction debugHere = new DockingAction("Debug Function with angr", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                Address address = addressOf(context);
+                Program program = getCurrentProgram();
+                Function function = program.getFunctionManager().getFunctionContaining(address);
+                controller.prepare(program, function);
+                showView(CONTROL_VIEW);
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                Address address = addressOf(context);
+                return address != null
+                    && getCurrentProgram().getFunctionManager().getFunctionContaining(address) != null;
+            }
+        };
+        menu(debugHere, "Debug Function at Cursor", "0",
+            "Fill in the function at the cursor as the one to debug");
+        debugHere.setPopupMenuData(
+            new MenuData(new String[] { "angr Debugger", "Debug Function with angr" }, null, "angr"));
+
+        DockingAction runToCursor = new DockingAction("angr Run to Cursor", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                controller.runTo(addressOf(context));
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                return addressOf(context) != null && steppable();
+            }
+        };
+        menu(runToCursor, "Run to Cursor", "1", "Run until execution reaches the address at the cursor");
+        runToCursor.setPopupMenuData(
+            new MenuData(new String[] { "angr Debugger", "Run to Cursor" }, null, "angr"));
+
+        DockingAction toggleBreakpoint = new DockingAction("angr Toggle Breakpoint", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                controller.toggleBreakpoint(getCurrentProgram(), addressOf(context));
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                Address address = addressOf(context);
+                return address != null && address.isMemoryAddress();
+            }
+        };
+        menu(toggleBreakpoint, "Toggle Breakpoint", "3", "Set or clear a breakpoint at the cursor");
+        toggleBreakpoint.setKeyBindingData(new KeyBindingData(KeyEvent.VK_K, 0));
+        toggleBreakpoint.setPopupMenuData(
+            new MenuData(new String[] { "angr Debugger", "Toggle Breakpoint" }, null, "angr"));
+
+        DockingAction clearBreakpoints = new DockingAction("angr Clear Breakpoints", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                AngrDebugger.clearBreakpoints(getCurrentProgram());
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                return getCurrentProgram() != null && !AngrDebugger.breakpoints(getCurrentProgram()).isEmpty();
+            }
+        };
+        menu(clearBreakpoints, "Clear All Breakpoints", "3", "Remove every angr Debugger breakpoint");
+
+        followAction = new ToggleDockingAction("angr Follow Program Counter", getName()) {
             @Override
             public void actionPerformed(ActionContext context) {
                 // read where it is used
             }
         };
-        followAction.setMenuBarData(new MenuData(new String[] { "Follow Program Counter in Listing" }, "z"));
         followAction.setSelected(true);
-        followAction.setDescription("Move the Listing to the current instruction whenever execution stops");
-        provider.addLocalAction(followAction);
-
-        DockingAction debugHere = new DockingAction("Debug Function with angr", getName()) {
-            @Override
-            public void actionPerformed(ActionContext context) {
-                ProgramLocationActionContext location = (ProgramLocationActionContext) context;
-                Program program = location.getProgram();
-                Function function = program.getFunctionManager().getFunctionContaining(location.getAddress());
-                controller.prepare(program, function);
-                tool.showComponentProvider(provider, true);
-            }
-
-            @Override
-            public boolean isEnabledForContext(ActionContext context) {
-                return context instanceof ProgramLocationActionContext location
-                    && location.getAddress() != null && location.getProgram() != null
-                    && location.getProgram().getFunctionManager()
-                        .getFunctionContaining(location.getAddress()) != null;
-            }
-        };
-        debugHere.setPopupMenuData(
-            new MenuData(new String[] { "angr Debugger", "Debug Function with angr" }, null, "angr"));
-        debugHere.setDescription("Open the angr Debugger on the function at the cursor");
-        tool.addAction(debugHere);
-
-        DockingAction runToCursor = new DockingAction("angr Run to Cursor", getName()) {
-            @Override
-            public void actionPerformed(ActionContext context) {
-                controller.runTo(((ProgramLocationActionContext) context).getAddress());
-            }
-
-            @Override
-            public boolean isEnabledForContext(ActionContext context) {
-                return context instanceof ProgramLocationActionContext location
-                    && location.getAddress() != null && steppable(location.getProgram());
-            }
-        };
-        runToCursor.setPopupMenuData(
-            new MenuData(new String[] { "angr Debugger", "Run to Cursor" }, null, "angr"));
-        runToCursor.setDescription("Run the angr debug session until it reaches this address");
-        tool.addAction(runToCursor);
-
-        DockingAction toggleBreakpoint = new DockingAction("angr Toggle Breakpoint", getName()) {
-            @Override
-            public void actionPerformed(ActionContext context) {
-                ProgramLocationActionContext location = (ProgramLocationActionContext) context;
-                controller.toggleBreakpoint(location.getProgram(), location.getAddress());
-            }
-
-            @Override
-            public boolean isEnabledForContext(ActionContext context) {
-                return context instanceof ProgramLocationActionContext location
-                    && location.getAddress() != null && location.getProgram() != null
-                    && location.getAddress().isMemoryAddress();
-            }
-        };
-        toggleBreakpoint.setPopupMenuData(
-            new MenuData(new String[] { "angr Debugger", "Toggle Breakpoint" }, null, "angr"));
-        toggleBreakpoint.setDescription("Set or clear an angr Debugger breakpoint at this address");
-        tool.addAction(toggleBreakpoint);
-
-        DockingAction show = new DockingAction("Show angr Debugger", getName()) {
-            @Override
-            public void actionPerformed(ActionContext context) {
-                tool.showComponentProvider(provider, true);
-            }
-        };
-        show.setMenuBarData(new MenuData(new String[] { "Tools", "angr Debugger" }, null, "angr"));
-        show.setDescription("Show the angr Debugger panel");
-        tool.addAction(show);
+        menu(followAction, "Follow Program Counter in Listing", "4",
+            "Move the Listing to the current instruction whenever execution stops");
     }
 
-    private void local(String name, int key, int modifiers, String kind) {
+    private void step(String name, String kind, int key, String group, String description) {
         DockingAction action = new DockingAction("angr " + name, getName()) {
             @Override
             public void actionPerformed(ActionContext context) {
@@ -190,20 +291,39 @@ public class AngrDebuggerPlugin extends ProgramPlugin implements AngrDebuggerCon
 
             @Override
             public boolean isEnabledForContext(ActionContext context) {
-                return steppable(getCurrentProgram());
+                return steppable();
             }
         };
-        action.setMenuBarData(new MenuData(new String[] { name }, "a"));
-        action.setKeyBindingData(new KeyBindingData(key, modifiers));
-        action.setDescription(name + " in the angr debug session");
-        provider.addLocalAction(action);
+        action.setKeyBindingData(new KeyBindingData(key, 0));
+        menu(action, name, group, description);
     }
 
-    private static boolean steppable(Program program) {
-        if (program == null) {
-            return false;
+    private void menu(DockingAction action, String name, String group, String description) {
+        action.setMenuBarData(new MenuData(new String[] { MENU, name }, null, group));
+        action.setDescription(description);
+        tool.addAction(action);
+        actions.add(action);
+    }
+
+    /** The address an action applies to: where it was invoked, else the Listing cursor. */
+    private Address addressOf(ActionContext context) {
+        if (getCurrentProgram() == null) {
+            return null;
         }
-        AngrDebugSession session = AngrDebugger.session(program);
+        if (context instanceof ProgramLocationActionContext location
+                && location.getProgram() == getCurrentProgram() && location.getAddress() != null) {
+            return location.getAddress();
+        }
+        return currentLocation == null ? null : currentLocation.getAddress();
+    }
+
+    private AngrDebugSession session() {
+        Program program = getCurrentProgram();
+        return program == null ? null : AngrDebugger.session(program);
+    }
+
+    private boolean steppable() {
+        AngrDebugSession session = session();
         return session != null && !session.isRunning() && "paused".equals(session.status());
     }
 
@@ -227,6 +347,7 @@ public class AngrDebuggerPlugin extends ProgramPlugin implements AngrDebuggerCon
         if (program.isClosed()) {
             return;
         }
+        Address where = session == null || session.isRunning() ? null : session.pc();
         MarkerService markers = tool.getService(MarkerService.class);
         if (markers != null) {
             MarkerSet breakpoints = breakpointMarkers.computeIfAbsent(program, p ->
@@ -240,18 +361,21 @@ public class AngrDebuggerPlugin extends ProgramPlugin implements AngrDebuggerCon
                 markers.createPointMarker(PC_MARKERS, "Where the angr Debugger is stopped", p,
                     MarkerService.BREAKPOINT_PRIORITY + 1, true, true, true, pcColor(), pcIcon()));
             pc.clearAll();
-            Address where = session == null || session.isRunning() ? null : session.pc();
             if (where != null && program.getMemory().contains(where)) {
                 pc.add(where);
             }
         }
-        Address where = session == null || session.isRunning() ? null : session.pc();
         if (where != null && !where.equals(lastShown) && followAction.isSelected()
                 && program.getMemory().contains(where)) {
             goTo(program, where);
         }
         lastShown = where;
-        tool.contextChanged(provider);
+        tool.contextChanged(providers.get(CONTROL_VIEW));
+    }
+
+    /** The marker sets, by kind ("pc" or "breakpoints"); for the tool preview and tests. */
+    public MarkerSet markers(Program program, String kind) {
+        return "pc".equals(kind) ? pcMarkers.get(program) : breakpointMarkers.get(program);
     }
 
     // ---- program lifecycle ----
@@ -259,6 +383,8 @@ public class AngrDebuggerPlugin extends ProgramPlugin implements AngrDebuggerCon
     @Override
     protected void programActivated(Program program) {
         lastShown = null;
+        // The import list on screen belongs to the program that was active before.
+        controller.panel().forgetImports();
         controller.refresh();
     }
 
@@ -289,11 +415,16 @@ public class AngrDebuggerPlugin extends ProgramPlugin implements AngrDebuggerCon
 
     @Override
     protected void dispose() {
-        for (Program program : new java.util.ArrayList<>(pcMarkers.keySet())) {
+        for (Program program : new ArrayList<>(pcMarkers.keySet())) {
             removeMarkers(program);
         }
         controller.dispose();
-        provider.removeFromTool();
+        for (DockingAction action : actions) {
+            tool.removeAction(action);
+        }
+        for (ViewProvider provider : providers.values()) {
+            provider.removeFromTool();
+        }
         super.dispose();
     }
 

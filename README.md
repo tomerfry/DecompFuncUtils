@@ -629,34 +629,49 @@ go to the system temp directory; set `DFU_ANGR_TMP` to move them.
 
 ### angr Debugger
 
-The same engine as a debugger: step a function instruction by instruction, with
-breakpoints, registers, stack, calls and memory at every stop. It exists in two
-forms that drive **one shared session per program** - an agent stepping over
-MCP moves the program counter you see in the Listing, and a click in the panel
-moves the session the agent reads next.
+A debugger on the same engine, as **a tool of its own in the Tool Chest** -
+beside CodeBrowser, Debugger and Emulator in the Project window, not a panel
+inside one of them. Drag a program onto it, or open it and use File → Open.
 
-![angr Debugger panel stopped at a fork](docs/angr-debugger.png)
+![The angr Debugger tool stopped at a fork](docs/angr-debugger.png)
 
-**The panel.** Enable *AngrDebuggerPlugin* (File → Configure → DecompFuncUtils),
-then Window → angr Debugger, or right-click a function in the Listing or
-Decompiler → **angr Debugger → Debug Function with angr**. Type the arguments
-the way the call is written - `"hello", 5, 0x10, {"buffer": 64}` - and press
-Start.
+It appears in the Tool Chest the next time Ghidra starts after the extension is
+installed (a small front-end plugin adds it once; if you delete it, it stays
+deleted, and **Tools → Add angr Debugger to Tool Chest** in the Project window
+brings it back). It is also listed under Tools → Import Default Tools.
 
-- **Step Into / Step Over / Step Out / Continue** (F7 / F8 / Shift+F8 / F9 while
-  the panel has focus), **Pause** for a run in progress, **Stop**.
-- The banner says in a sentence what just happened and what to do about it;
-  refusals ("that value contradicts the path") appear there, not in dialogs.
-- The current instruction and the breakpoints are drawn in the Listing, which
-  follows the program counter. Right-click → **Toggle Breakpoint** / **Run to
-  Cursor**. Breakpoints belong to the program, so they can be set before a
-  session starts and survive a restart.
-- Registers changed by the last step are highlighted; a register or stack slot
-  that points at text shows the text, and one that points into the program shows
-  the symbol. Double-click any address to go there.
-- Tabs: **Stack**, **Calls** (library calls with arguments and result), **Memory**
-  (argument buffers, what the last step wrote, and your watches -
-  `g_config:16, 0x104000`), **Output**, **Paths**, **Symbols**, **Imports & Hooks**.
+The window is laid out for debugging: the control strip across the top, the
+Symbol Tree, Listing and Decompiler in the middle with **Registers** and
+**Stack** beside them, and **Calls / Memory / Output / Paths / Symbols /
+Imports & Hooks** as tabs along the bottom. Everything is an ordinary Ghidra
+window, so it can be moved, stacked, closed and reopened from the Window menu,
+and the rest of Ghidra (renaming, retyping, comments, search) works as usual
+while you debug.
+
+- **Start.** Type the function and its arguments the way the call is written -
+  `"hello", 5, 0x10, {"buffer": 64}` - or right-click a function in the Listing
+  or Decompiler → **angr Debugger → Debug Function with angr**, which fills the
+  function in.
+- **Step.** The buttons in the control strip, the **angr** menu, or the keys
+  Ghidra's own Debugger uses: **F5** Continue, **F8** Step Into, **F10** Step
+  Over, **F12** Step Out. **Pause** interrupts a run; **Stop** ends the session.
+- **The banner** says in a sentence what just happened and what to do about it.
+  Refusals ("that value contradicts the path") appear there, not in dialogs.
+- **In the Listing** the current instruction is marked and followed, and
+  breakpoints are drawn. **K** toggles a breakpoint at the cursor; right-click →
+  **Run to Cursor**. Breakpoints belong to the program, so they can be set
+  before a session starts and survive a restart.
+- **Registers** changed by the last step are highlighted. A register or stack
+  slot that points at text shows the text, and one that points into the program
+  shows the symbol. Double-click any address to go there. Right-click a register
+  to set it, concretize it or make it symbolic.
+- **Memory** shows the buffers you passed, what the last step wrote, and your
+  watches (`g_config:16, 0x104000`).
+
+The session is **shared with MCP**: an agent stepping with `ghidra_angr_debug`
+moves the program counter you see, and a click here moves the session the agent
+reads next. The debugger's plugin (*angr Debugger* package) can also be added to
+any other tool through File → Configure.
 
 **Over MCP**, `ghidra_angr_debug` takes an `action`: `start` (with `function`
 and `args` exactly as `ghidra_angr_emulate` takes them), `step_into`,

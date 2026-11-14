@@ -88,9 +88,32 @@ public class AngrDebuggerPanel extends JPanel {
     private Map<String, Object> snapshot;
     private boolean running;
 
+    /** Where the views live when each is a window of its own rather than a tab of this panel. */
+    public interface ViewHost {
+        /** Brings a view to the front, e.g. Paths when execution forks. */
+        void showView(String name);
+
+        /** The number of rows a view holds changed; shown next to its title. */
+        void countChanged(String name, int count);
+    }
+
+    private final Map<String, JComponent> views = new LinkedHashMap<>();
+    private final boolean detached;
+    private ViewHost viewHost;
+
+    /** The debugger as one panel: controls on top, registers left, everything else in tabs. */
     public AngrDebuggerPanel(Actions actions) {
+        this(actions, false);
+    }
+
+    /**
+     * @param detached true to make this panel only the control strip (launch bar, step buttons,
+     *                 banner) and leave the views to be placed by the caller - see {@link #view}
+     */
+    public AngrDebuggerPanel(Actions actions, boolean detached) {
         super(new BorderLayout(0, 6));
         this.actions = actions;
+        this.detached = detached;
         Font base = UIManager.getFont("Table.font");
         this.mono = new Font(Font.MONOSPACED, Font.PLAIN, base == null ? 12 : base.getSize());
         setBorder(new EmptyBorder(6, 6, 6, 6));
@@ -103,10 +126,15 @@ public class AngrDebuggerPanel extends JPanel {
         top.add(banner());
         add(top, BorderLayout.NORTH);
 
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, registersPane(), tabsPane());
-        split.setResizeWeight(0.34);
-        split.setBorder(null);
-        add(split, BorderLayout.CENTER);
+        JComponent registers = registersPane();
+        views.put("Registers", registers);
+        JComponent tabbed = tabsPane();
+        if (!detached) {
+            JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, registers, tabbed);
+            split.setResizeWeight(0.34);
+            split.setBorder(null);
+            add(split, BorderLayout.CENTER);
+        }
 
         showState(null, false);
     }
@@ -150,11 +178,24 @@ public class AngrDebuggerPanel extends JPanel {
         functionField.addActionListener(e -> start.doClick());
         argumentsField.addActionListener(e -> start.doClick());
 
-        c.gridy = 1;
-        c.gridx = 0;
-        c.gridwidth = 5;
-        c.fill = GridBagConstraints.HORIZONTAL;
-        JPanel options = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        return panel;
+    }
+
+    /** The step buttons, then the two launch options and how Ghidra thinks the function is called. */
+    private JComponent stepBar() {
+        JPanel steps = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
+        steps.add(button("Step Into", "Execute one instruction, entering calls (F8)", () -> actions.step("into")));
+        steps.add(button("Step Over", "Execute one instruction, running a call to its return (F10)",
+            () -> actions.step("over")));
+        steps.add(button("Step Out", "Run until the current function returns (F12)", () -> actions.step("out")));
+        steps.add(button("Continue", "Run to the next breakpoint, fork, return or fault (F5)",
+            () -> actions.step("continue")));
+        steps.add(Box.createHorizontalStrut(10));
+        steps.add(button("Pause", "Interrupt a run", actions::pause));
+        steps.add(button("Stop", "End the session", actions::stop));
+        steps.add(Box.createHorizontalStrut(14));
+
+        JPanel options = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
         symbolicImports.setToolTipText("<html>An import angr has no model for, and you wrote no hook for, "
             + "returns an <b>unknown</b> value.<br>Branches that depend on it stop the debugger so you can "
             + "choose a side.<br>Unticked, such imports return 0. Libraries missing from the project are "
@@ -165,22 +206,15 @@ public class AngrDebuggerPanel extends JPanel {
         options.add(symbolicImports);
         options.add(strictMemory);
         hintLabel.setForeground(palette.muted);
-        options.add(hintLabel);
-        panel.add(options, c);
-        return panel;
-    }
 
-    private JComponent stepBar() {
-        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
-        panel.add(button("Step Into", "Execute one instruction, entering calls (F7)", () -> actions.step("into")));
-        panel.add(button("Step Over", "Execute one instruction, running a call to its return (F8)",
-            () -> actions.step("over")));
-        panel.add(button("Step Out", "Run until the current function returns (Shift+F8)", () -> actions.step("out")));
-        panel.add(button("Continue", "Run to the next breakpoint, fork, return or fault (F9)",
-            () -> actions.step("continue")));
-        panel.add(Box.createHorizontalStrut(10));
-        panel.add(button("Pause", "Interrupt a run", actions::pause));
-        panel.add(button("Stop", "End the session", actions::stop));
+        // The hint takes whatever width is left and is cut short, not wrapped, when there is
+        // little; its tooltip always has all of it.
+        JPanel right = new JPanel(new BorderLayout(8, 0));
+        right.add(options, BorderLayout.WEST);
+        right.add(hintLabel, BorderLayout.CENTER);
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.add(steps, BorderLayout.WEST);
+        panel.add(right, BorderLayout.CENTER);
         return panel;
     }
 
@@ -246,14 +280,18 @@ public class AngrDebuggerPanel extends JPanel {
 
     private JComponent tabsPane() {
         JTable stack = table("stack", "Address", "Offset", "Value", "Notes");
+        stack.getColumnModel().getColumn(0).setPreferredWidth(125);
+        stack.getColumnModel().getColumn(1).setPreferredWidth(50);
+        stack.getColumnModel().getColumn(2).setPreferredWidth(125);
+        stack.getColumnModel().getColumn(3).setPreferredWidth(150);
         onDoubleClick(stack, "stack", "value");
-        tabs.addTab("Stack", new JScrollPane(stack));
+        addView("Stack", new JScrollPane(stack));
 
         JTable calls = table("calls", "Call", "From");
         calls.getColumnModel().getColumn(0).setPreferredWidth(400);
         calls.getColumnModel().getColumn(1).setPreferredWidth(230);
         onDoubleClick(calls, "calls", "fromAddress");
-        tabs.addTab("Calls", new JScrollPane(calls));
+        addView("Calls", new JScrollPane(calls));
 
         JTable memory = table("memory", "What", "Address", "Size", "Bytes", "Text");
         memory.getColumnModel().getColumn(3).setPreferredWidth(260);
@@ -271,11 +309,11 @@ public class AngrDebuggerPanel extends JPanel {
         JPanel memoryPanel = new JPanel(new BorderLayout());
         memoryPanel.add(watchBar, BorderLayout.NORTH);
         memoryPanel.add(new JScrollPane(memory), BorderLayout.CENTER);
-        tabs.addTab("Memory", memoryPanel);
+        addView("Memory", memoryPanel);
 
         output.setEditable(false);
         output.setFont(mono);
-        tabs.addTab("Output", new JScrollPane(output));
+        addView("Output", new JScrollPane(output));
 
         JTable paths = table("paths", "", "Path", "Status", "Location", "Condition taken");
         paths.getColumnModel().getColumn(0).setMaxWidth(26);
@@ -300,7 +338,7 @@ public class AngrDebuggerPanel extends JPanel {
         JPanel pathsPanel = new JPanel(new BorderLayout());
         pathsPanel.add(pathButtons, BorderLayout.NORTH);
         pathsPanel.add(new JScrollPane(paths), BorderLayout.CENTER);
-        tabs.addTab("Paths", pathsPanel);
+        addView("Paths", pathsPanel);
 
         JTable symbols = table("symbols", "Symbol", "Bits", "Value", "State");
         symbols.getColumnModel().getColumn(0).setPreferredWidth(240);
@@ -320,7 +358,7 @@ public class AngrDebuggerPanel extends JPanel {
         JPanel symbolsPanel = new JPanel(new BorderLayout());
         symbolsPanel.add(symbolButtons, BorderLayout.NORTH);
         symbolsPanel.add(new JScrollPane(symbols), BorderLayout.CENTER);
-        tabs.addTab("Symbols", symbolsPanel);
+        addView("Symbols", symbolsPanel);
 
         JTable imports = table("imports", "Target", "Library", "In project", "Handled by");
         imports.getColumnModel().getColumn(0).setPreferredWidth(190);
@@ -364,13 +402,48 @@ public class AngrDebuggerPanel extends JPanel {
         JPanel importsPanel = new JPanel(new BorderLayout());
         importsPanel.add(importsTop, BorderLayout.NORTH);
         importsPanel.add(new JScrollPane(imports), BorderLayout.CENTER);
-        tabs.addTab("Imports & Hooks", importsPanel);
-        tabs.addChangeListener(e -> {
-            if (tabs.getSelectedIndex() == tabs.getTabCount() - 1 && rows.get("imports") == null) {
-                actions.refreshImports();
-            }
-        });
+        addView("Imports & Hooks", importsPanel);
+        if (!detached) {
+            tabs.addChangeListener(e -> {
+                if (tabs.getSelectedIndex() == tabs.getTabCount() - 1 && rows.get("imports") == null) {
+                    actions.refreshImports();
+                }
+            });
+        }
         return tabs;
+    }
+
+    private void addView(String name, JComponent component) {
+        views.put(name, component);
+        if (!detached) {
+            tabs.addTab(name, component);
+        }
+    }
+
+    /** The names of the views, in display order: Registers, Stack, Calls, Memory, ... */
+    public Set<String> viewNames() {
+        return Collections.unmodifiableSet(views.keySet());
+    }
+
+    /** One view's component, for a caller that places the views itself (detached mode). */
+    public JComponent view(String name) {
+        return views.get(name);
+    }
+
+    public void setViewHost(ViewHost host) {
+        this.viewHost = host;
+    }
+
+    /** False until the Imports &amp; Hooks view has been filled once. */
+    public boolean importsLoaded() {
+        return rows.get("imports") != null;
+    }
+
+    /** Empties the Imports &amp; Hooks view, so it is fetched again for another program. */
+    public void forgetImports() {
+        rows.remove("imports");
+        ((DefaultTableModel) tables.get("imports").getModel()).setRowCount(0);
+        importsNote.setText(" ");
     }
 
     private JTable table(String key, String... columns) {
@@ -518,6 +591,7 @@ public class AngrDebuggerPanel extends JPanel {
     /** A line under the launch bar: how Ghidra thinks the function is called. */
     public void setHint(String text) {
         hintLabel.setText(text == null || text.isBlank() ? " " : text);
+        hintLabel.setToolTipText(text == null || text.isBlank() ? null : text);
     }
 
     /** A one-off message in the banner, for instance why an action was refused. */
@@ -635,7 +709,7 @@ public class AngrDebuggerPanel extends JPanel {
                     setBanner(palette.warn, "Forked at " + where,
                         "The branch depends on an unknown value, so execution split." + guard
                             + " Keep stepping to follow it, or pick another in the Paths tab.");
-                    tabs.setSelectedIndex(tabs.indexOfTab(titleOf("Paths")));
+                    selectTab("Paths");
                 }
                 else {
                     String why = switch (stop) {
@@ -864,9 +938,13 @@ public class AngrDebuggerPanel extends JPanel {
 
     private void retitle() {
         for (String name : List.of("Calls", "Paths", "Symbols", "Memory")) {
-            int index = indexOfBase(name);
             int count = rows.get(name.toLowerCase()) == null ? 0 : rows.get(name.toLowerCase()).size();
-            tabs.setTitleAt(index, count > 0 ? name + " (" + count + ")" : name);
+            if (!detached) {
+                tabs.setTitleAt(indexOfBase(name), count > 0 ? name + " (" + count + ")" : name);
+            }
+            if (viewHost != null) {
+                viewHost.countChanged(name, count);
+            }
         }
     }
 
@@ -878,10 +956,6 @@ public class AngrDebuggerPanel extends JPanel {
             }
         }
         return -1;
-    }
-
-    private String titleOf(String name) {
-        return tabs.getTitleAt(indexOfBase(name));
     }
 
     private static String valueOf(Map<String, Object> row) {
@@ -957,7 +1031,14 @@ public class AngrDebuggerPanel extends JPanel {
         return tabs;
     }
 
+    /** Brings a view forward: its tab here, or its window when the views are detached. */
     public void selectTab(String name) {
+        if (viewHost != null) {
+            viewHost.showView(name);
+        }
+        if (detached) {
+            return;
+        }
         int index = indexOfBase(name);
         if (index >= 0) {
             tabs.setSelectedIndex(index);

@@ -26,6 +26,7 @@ MCP server's two HTTP transports.
 | `scripts/AngrEmulateHeadlessTest.java` | Exercises `ghidra_angr_emulate` by calling the fixture's functions by name: argument forms, results, the call trace, faults on missing pointers, stubs, solving for inputs, limits, error messages, and a Ghidra signature changing placement and typing. |
 | `scripts/AngrDebugHeadlessTest.java` | Exercises `ghidra_angr_debug` and `ghidra_angr_hook`, and through them the session layer the panel shares: stepping, breakpoints, forks on an unknown import, paths, concretize / symbolize / set, faults, watches, time limits, and Python hooks (compile check, effect, live reload into a running session, inline hooks, a hook that raises). |
 | `scripts/AngrDebuggerPanelHeadlessTest.java` | Builds the angr Debugger panel without a tool window, drives it by clicking its real buttons against real sessions, checks its tables and banner, and paints it off-screen to `tests/_angr_debugger_*.png`. |
+| `run_angr_tool_test.ps1` | Opens the angr Debugger tool in a real (off-screen) Ghidra window and checks it; `-Export` regenerates the shipped tool file. |
 | `run_angr_test.ps1` | Build -> install -> run for the angr test. Needs a Python with angr (`tools/setup-angr.ps1`). |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
@@ -218,6 +219,42 @@ The debugger has two more scripts on the same runner:
 The runner points `DFU_ANGR_HOOKS` at a scratch folder, so the hooks these
 tests save and delete are never your own. The panel test covers the panel and
 its controller - what the buttons do, what the tables and banner show - and
-leaves PNGs of it in `tests/` to look at. It does **not** cover what needs a
-live Ghidra window: docking, the program-counter and breakpoint markers in the
-Listing, the right-click actions and the key bindings (`AngrDebuggerPlugin`).
+leaves PNGs of it in `tests/` to look at. What needs a live Ghidra window is
+covered by the tool test below.
+
+## angr Debugger tool test (a real window)
+
+```powershell
+.\tests\run_angr_tool_test.ps1            # check the tool as shipped
+.\tests\run_angr_tool_test.ps1 -Export    # regenerate the tool file first
+```
+
+This one is not headless. It starts
+`decompfuncutils.angr.ui.AngrDebuggerToolPreview` through Ghidra's own
+`support/launch.bat`, which creates a (hidden) Project window and opens the
+**angr Debugger** tool exactly as shipped on `angr/libangrdemo.so`. The tool
+window is placed off-screen and never takes focus; it is painted into
+`tests/_angr_tool_*.png` rather than looked at. Checked there:
+
+- the tool file is discovered among Ghidra's default tools and the front-end
+  plugin has put it in the Tool Chest;
+- opening it raises no dialog (in particular no "New Plugins Found!"), loads
+  the Listing, the Decompiler and the debugger's plugin, and none of the
+  extension's other plugins;
+- every debugger window is open, the **angr** menu's actions exist with their
+  key bindings;
+- starting a session marks the program counter in the Listing and moves the
+  Listing to it, stepping moves both, a breakpoint gets its marker, a fork
+  brings the Paths window forward, the Imports & Hooks window fills when
+  opened, and Stop clears the marker.
+
+`-Export` rebuilds `src/main/resources/defaultTools/angr_Debugger.tool`: Ghidra
+builds the tool from its plugin packages and the preview replaces the
+improvised window arrangement with the designed one (`arrange()` in the
+preview class). Re-run it when the debugger's windows change or the extension
+gains a plugin: a tool file lists the extension plugins it already knows, and
+Ghidra greets the first launch with "New Plugins Found!" about any other - the
+"raises no dialog" check is what catches a stale list.
+
+Not covered anywhere: key presses and mouse clicks themselves (the actions are
+invoked directly), and the value-prompt and hook-editor dialogs.

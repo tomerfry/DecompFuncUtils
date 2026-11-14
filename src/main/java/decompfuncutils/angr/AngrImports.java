@@ -42,14 +42,7 @@ public final class AngrImports {
         request.put("op", "imports");
         request.put("imageDir", image.directory.toString());
         request.put("imageKey", image.key);
-        JsonObject response;
-        try {
-            response = AngrWorkers.resultOf(
-                AngrWorkers.call(program.getUniqueProgramID(), python, request, 60_000, monitor));
-        }
-        catch (AngrWorkers.AngrUnavailableException e) {
-            throw new IllegalStateException(e.getMessage());
-        }
+        JsonObject response = ask(program, python, request, monitor);
         Map<String, String> models = new HashMap<>();
         JsonArray rows = response.getAsJsonArray("imports");
         for (JsonElement element : rows) {
@@ -110,8 +103,26 @@ public final class AngrImports {
         request.put("op", "check_hook");
         request.put("name", name);
         request.put("code", code);
+        ask(program, python, request, monitor);
+    }
+
+    /** Asks the program's debug session when it has an idle one, else a pooled worker. */
+    private static JsonObject ask(Program program, String python, Map<String, Object> request,
+            TaskMonitor monitor) throws Exception {
+        AngrDebugSession session = AngrDebugger.session(program);
+        if (session != null && !session.isRunning()) {
+            try {
+                return session.query(request, monitor);
+            }
+            catch (IllegalStateException e) {
+                if (!session.isClosed()) {
+                    throw e; // the worker answered: this is the real error
+                }
+                // the session ended under us; fall through to the pool
+            }
+        }
         try {
-            AngrWorkers.resultOf(
+            return AngrWorkers.resultOf(
                 AngrWorkers.call(program.getUniqueProgramID(), python, request, 60_000, monitor));
         }
         catch (AngrWorkers.AngrUnavailableException e) {

@@ -63,9 +63,14 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
     private volatile String lastError;
 
     public AngrDebuggerController(Supplier<Program> programSupplier, Host host) {
+        this(programSupplier, host, false);
+    }
+
+    /** @param detached true when the caller places the panel's views itself, as a tool window does */
+    public AngrDebuggerController(Supplier<Program> programSupplier, Host host, boolean detached) {
         this.programSupplier = programSupplier;
         this.host = host;
-        this.panel = new AngrDebuggerPanel(this);
+        this.panel = new AngrDebuggerPanel(this, detached);
         AngrDebugger.addListener(this);
     }
 
@@ -245,6 +250,10 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
             AngrDebugSession session =
                 AngrDebugger.start(program, host.configuredPython(), arguments, TaskMonitor.DUMMY);
             SwingUtilities.invokeLater(() -> panel.setHint(session.call.called));
+            // The first session on a program is also when its imports become interesting.
+            if (!panel.importsLoaded()) {
+                refreshImports();
+            }
         });
     }
 

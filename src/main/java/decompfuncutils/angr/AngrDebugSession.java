@@ -244,6 +244,17 @@ public final class AngrDebugSession {
         return snapshot;
     }
 
+    /**
+     * Runs a request that has nothing to do with the session's state (listing the imports,
+     * compiling a hook) on the session's own worker, which saves starting a second process just
+     * to ask.
+     */
+    public synchronized com.google.gson.JsonObject query(Map<String, Object> request, TaskMonitor monitor)
+            throws Exception {
+        ensureOpen();
+        return AngrWorkers.resultOf(worker.request(request, QUICK_MILLIS, monitor));
+    }
+
     // ---- watches ----
 
     /**
