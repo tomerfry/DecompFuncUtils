@@ -545,8 +545,11 @@ Ghidra contributes what it already knows and angr does the executing:
   Ghidra addresses, patches and relocations applied in Ghidra are in effect,
   and anything Ghidra can load can be run; the original file is never opened.
 - **Imports run as angr's models** (`malloc`, `strlen`, `memcpy`, `printf`, ...),
-  hooked at the thunk addresses Ghidra resolved. An import angr has no model
-  for does nothing, returns 0, and is listed in `unmodelledExternals`.
+  hooked at the thunk addresses Ghidra resolved, or as the
+  [Python hooks](#python-hooks) you wrote for them. An import with neither does
+  nothing, returns 0 (`unmodelledImports: "symbolic"` for an unknown value
+  instead), and is listed in `unmodelledExternals`. The libraries themselves do
+  not need to be in the project.
 - **Each call starts from the program's own memory.** Nothing carries over
   between calls.
 
@@ -623,6 +626,150 @@ no Ghidra restart. Alternatively set `DFU_ANGR_PYTHON`, or **Edit → Tool
 Options → MCP Server → angr Python Interpreter**, to any Python that can
 `import angr`. Without one, the tool's error says exactly this. Exported images
 go to the system temp directory; set `DFU_ANGR_TMP` to move them.
+
+### angr Debugger
+
+The same engine as a debugger: step a function instruction by instruction, with
+breakpoints, registers, stack, calls and memory at every stop. It exists in two
+forms that drive **one shared session per program** - an agent stepping over
+MCP moves the program counter you see in the Listing, and a click in the panel
+moves the session the agent reads next.
+
+![angr Debugger panel stopped at a fork](docs/angr-debugger.png)
+
+**The panel.** Enable *AngrDebuggerPlugin* (File → Configure → DecompFuncUtils),
+then Window → angr Debugger, or right-click a function in the Listing or
+Decompiler → **angr Debugger → Debug Function with angr**. Type the arguments
+the way the call is written - `"hello", 5, 0x10, {"buffer": 64}` - and press
+Start.
+
+- **Step Into / Step Over / Step Out / Continue** (F7 / F8 / Shift+F8 / F9 while
+  the panel has focus), **Pause** for a run in progress, **Stop**.
+- The banner says in a sentence what just happened and what to do about it;
+  refusals ("that value contradicts the path") appear there, not in dialogs.
+- The current instruction and the breakpoints are drawn in the Listing, which
+  follows the program counter. Right-click → **Toggle Breakpoint** / **Run to
+  Cursor**. Breakpoints belong to the program, so they can be set before a
+  session starts and survive a restart.
+- Registers changed by the last step are highlighted; a register or stack slot
+  that points at text shows the text, and one that points into the program shows
+  the symbol. Double-click any address to go there.
+- Tabs: **Stack**, **Calls** (library calls with arguments and result), **Memory**
+  (argument buffers, what the last step wrote, and your watches -
+  `g_config:16, 0x104000`), **Output**, **Paths**, **Symbols**, **Imports & Hooks**.
+
+**Over MCP**, `ghidra_angr_debug` takes an `action`: `start` (with `function`
+and `args` exactly as `ghidra_angr_emulate` takes them), `step_into`,
+`step_over`, `step_out`, `continue`, `run_to`, `add_breakpoint`,
+`remove_breakpoint`, `clear_breakpoints`, `state`, `select_path`, `drop_path`,
+`concretize`, `symbolize`, `set`, `reload_hooks`, `stop`. Each response gives
+where execution is, why it stopped, the registers that changed, new calls and
+memory writes, and a `hint` when there is a decision to make; `detail: "full"`
+adds every register and the stack.
+
+#### Analyzing a binary without its shared objects
+
+Nothing here needs the libraries a program links against to be in the project,
+because an import is never followed into its library. Each call to one is
+handled in place by the first of:
+
+1. **a Python hook** you (or an agent) wrote for it,
+2. **angr's own model** of the function, where it has one (`malloc`, `strlen`,
+   `memcpy`, `printf`, `read`, ... from its libc, POSIX and Windows CRT sets),
+3. **a stub** that returns an **unknown (symbolic) value** in the debugger, or 0
+   in the one-shot emulator (`unmodelledImports` chooses either way).
+
+Imported *variables* (`stdout`, `environ`, a missing library's globals) are
+mapped as memory rather than left unmapped, and are unknown values too when
+stubs are symbolic.
+
+The **Imports & Hooks** tab, and `ghidra_angr_hook` with `action: "imports"`,
+list every import with its library, whether that library is in the project, and
+which of the three handles it - so the imports nothing models are visible at a
+glance, and those are the candidates for a hook.
+
+#### Unknown values: forks, and concretizing
+
+An unknown value has a name you can type back - `read_config_ret_3` is the
+third unknown return, from `read_config`. As long as nothing depends on it,
+execution just carries it along. When a **branch** depends on one, execution
+*forks*: the debugger stops, stays on one side, and parks the other as a
+separate **path**.
+
+```json
+{"stop": "fork", "location": "needs_device+0x19",
+ "paths": [{"id": 0, "current": true,  "guard": "mystery_device_read_ret_1[31:0] == 0x1234"},
+           {"id": 1, "current": false, "guard": "mystery_device_read_ret_1[31:0] != 0x1234"}],
+ "symbols": [{"name": "mystery_device_read_ret_1", "bits": 64, "example": "0x1234"}]}
+```
+
+Keep stepping to follow the current path, switch with **Switch to Path** /
+`select_path`, or discard one with `drop_path`. To settle an unknown instead,
+**concretize** it:
+
+| | Panel | MCP |
+|---|---|---|
+| fix a symbol at a value | Symbols → Concretize... | `{"action":"concretize","symbol":"read_config_ret_3","value":"0x10"}` |
+| let the solver pick | leave the value as offered | omit `value` |
+| fix whatever a register or memory holds | right-click the register | `"register":"rax"` or `"address":"g_state","size":4` |
+| fix everything consistently | Concretize All | `"all": true` |
+
+A value that contradicts the branches already taken is refused, with the reason.
+The reverse is **symbolize** (right-click a register → Make Symbolic, or
+`{"action":"symbolize","register":"rdi","name":"len"}`): make something unknown
+to see what the code does with every value of it. `set` simply overwrites a
+register or memory - with a number, or with `"text"` / `{"buffer": 64}` to point
+it at fresh memory.
+
+#### Python hooks
+
+A hook replaces a function with Python you write. Parameters after `ctx` receive
+the call's arguments (as ints when concrete), and the return value becomes the
+function's result:
+
+```python
+# dfu-hook: target=read_config kind=replace enabled=true
+def hook(ctx, path, out, cap):
+    ctx.log("read_config", ctx.string(path))
+    ctx.write(out, b"mode=debug\n")
+    return 11
+```
+
+| `ctx.` | |
+|---|---|
+| `arg(i)`, `args` | the i-th argument: an int, or a bit-vector when symbolic |
+| `string(ptr)`, `read(ptr, n)`, `read_int(ptr, size)` | read memory |
+| `write(ptr, bytes_or_str)`, `write_int(ptr, value, size)`, `alloc(n)` | write memory; `alloc` is a fresh heap block |
+| `reg(name)`, `set_reg(name, value)` | registers |
+| `symbolic(name)` | a fresh unknown value, to return or store |
+| `constrain(cond)`, `value(v)`, `is_symbolic(v)` | solver access |
+| `log(...)` | a line in the call trace |
+| `state` | the angr `SimState`, for anything else; `angr` and `claripy` are imported |
+
+Hooks are created three ways that all produce the same thing: the panel's
+**Write Hook...** (double-click an import; it opens with a template naming the
+parameters Ghidra knows), `ghidra_angr_hook` with `action: "set"` (so an agent
+can write one), or any editor - each hook is one `.py` file under
+`~/.decompfuncutils/angr-hooks/<program>/`, with the first line saying what it
+attaches to. `target` is an import, a function of the program, or an address.
+`kind=inline` runs the hook when execution *reaches* the address and then
+carries on, skipping `skip` bytes of the original code (0 just observes).
+
+A hook is compiled when it is saved, so a syntax error comes back at once; a
+hook that raises at run time stops execution as a fault naming the line. Saving,
+enabling or deleting one takes effect in a running session immediately, and
+enabled hooks apply to `ghidra_angr_emulate` as well, which lists them in
+`pythonHooks`. Hooks are ordinary Python that runs with your privileges on this
+machine - the same trust `ghidra_run_script` already implies - so read what an
+agent wrote before leaning on it.
+
+#### Limits
+
+One session per program, concrete or symbolic, single-threaded code. Stepping is
+instruction-accurate; running is the same VEX interpreter as the emulator
+(about a thousand basic blocks a second). There is no reverse stepping: restart
+and run to a breakpoint instead. Each session is its own Python process and is
+given up after two idle hours.
 
 ### Bounded symbolic path exploration
 

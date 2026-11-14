@@ -24,6 +24,8 @@ MCP server's two HTTP transports.
 | `scripts/CrossModuleAnalyzerHeadlessTest.java` | Exercises the `Cross-Module Import Linker` analyzer: that auto-analysis alone leaves the library back-linked, the one-shot path used by Analysis > One Shot, idempotence, and each analysis option. |
 | `angr/angr_demo.c`, `angr/libangrdemo.so` | Source and committed ELF of the `ghidra_angr_emulate` fixture: small functions with one obvious behaviour each (stack arguments, out-parameters, structs, globals, libc calls, an import nothing models, a loop). Rebuild with `angr/build.ps1` (needs clang + lld). |
 | `scripts/AngrEmulateHeadlessTest.java` | Exercises `ghidra_angr_emulate` by calling the fixture's functions by name: argument forms, results, the call trace, faults on missing pointers, stubs, solving for inputs, limits, error messages, and a Ghidra signature changing placement and typing. |
+| `scripts/AngrDebugHeadlessTest.java` | Exercises `ghidra_angr_debug` and `ghidra_angr_hook`, and through them the session layer the panel shares: stepping, breakpoints, forks on an unknown import, paths, concretize / symbolize / set, faults, watches, time limits, and Python hooks (compile check, effect, live reload into a running session, inline hooks, a hook that raises). |
+| `scripts/AngrDebuggerPanelHeadlessTest.java` | Builds the angr Debugger panel without a tool window, drives it by clicking its real buttons against real sessions, checks its tables and banner, and paints it off-screen to `tests/_angr_debugger_*.png`. |
 | `run_angr_test.ps1` | Build -> install -> run for the angr test. Needs a Python with angr (`tools/setup-angr.ps1`). |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
@@ -205,3 +207,17 @@ than failing when there is none. It starts a real worker process, so it also
 covers the export of Ghidra's memory image, the JSON protocol, worker reuse
 between calls (the second call must be fast) and re-export after the program
 changes.
+
+The debugger has two more scripts on the same runner:
+
+```powershell
+.\tests\run_angr_test.ps1 -Script AngrDebugHeadlessTest.java
+.\tests\run_angr_test.ps1 -Script AngrDebuggerPanelHeadlessTest.java
+```
+
+The runner points `DFU_ANGR_HOOKS` at a scratch folder, so the hooks these
+tests save and delete are never your own. The panel test covers the panel and
+its controller - what the buttons do, what the tables and banner show - and
+leaves PNGs of it in `tests/` to look at. It does **not** cover what needs a
+live Ghidra window: docking, the program-counter and breakpoint markers in the
+Listing, the right-click actions and the key bindings (`AngrDebuggerPlugin`).

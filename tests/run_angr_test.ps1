@@ -20,6 +20,9 @@ param(
     [string]$GhidraInstall = $(if ($env:GHIDRA_INSTALL_DIR) { $env:GHIDRA_INSTALL_DIR } else { "C:\Users\User\Ghidra" }),
     [switch]$SkipBuild,
     [string]$GradleExe = "gradle",
+    # AngrEmulateHeadlessTest.java (default, the one-shot emulator), AngrDebugHeadlessTest.java
+    # (debug sessions, hooks) or AngrDebuggerPanelHeadlessTest.java (the panel, rendered off-screen).
+    [string]$Script = 'AngrEmulateHeadlessTest.java',
     # Interpreter to run angr under; exported to the test as DFU_ANGR_PYTHON.
     [string]$Python = "",
     # Where the throwaway settings tree, project and exported image go.
@@ -85,9 +88,12 @@ Write-Host "==> angr interpreter: $Python" -ForegroundColor Cyan
 
 $proj = Join-Path $WorkRoot "dfu_ghidra_proj_$runId"
 $imageTmp = Join-Path $WorkRoot "dfu_angr_tmp_$runId"
-New-Item -ItemType Directory -Force $proj, $imageTmp | Out-Null
+# Hooks the test saves go to a scratch folder, never to the user's own.
+$hookTmp = Join-Path $WorkRoot "dfu_angr_hooks_$runId"
+New-Item -ItemType Directory -Force $proj, $imageTmp, $hookTmp | Out-Null
 $sp  = Join-Path $repo "tests\scripts"
-$log = Join-Path $repo "tests\_last_AngrEmulateHeadlessTest_run.log"
+$log = Join-Path $repo ("tests\_last_" +
+    [System.IO.Path]::GetFileNameWithoutExtension($Script) + "_run.log")
 
 Write-Host "==> Running headless test..." -ForegroundColor Cyan
 $prevEAP = $ErrorActionPreference
@@ -95,20 +101,26 @@ $ErrorActionPreference = 'Continue'
 $prevXdg = $env:XDG_CONFIG_HOME
 $prevPy = $env:DFU_ANGR_PYTHON
 $prevTmp = $env:DFU_ANGR_TMP
+$prevHooks = $env:DFU_ANGR_HOOKS
+$prevOut = $env:DFU_TEST_OUTPUT
+$env:DFU_ANGR_HOOKS = $hookTmp
+# Where a test may leave something to look at (the panel test writes screenshots here).
+$env:DFU_TEST_OUTPUT = Join-Path $repo "tests"
 $env:XDG_CONFIG_HOME = $settingsRoot
 $env:DFU_ANGR_PYTHON = $Python
 $env:DFU_ANGR_TMP = $imageTmp
 $hlArgs = @($proj, 'T', '-import', $fixture, '-scriptPath', $sp,
-    '-postScript', 'AngrEmulateHeadlessTest.java', '-deleteProject')
+    '-postScript', $Script, '-deleteProject')
 try {
     & $hl @hlArgs *>&1 | Out-File -FilePath $log -Encoding utf8
 }
 finally {
-    foreach ($pair in @(@('XDG_CONFIG_HOME', $prevXdg), @('DFU_ANGR_PYTHON', $prevPy), @('DFU_ANGR_TMP', $prevTmp))) {
+    foreach ($pair in @(@('XDG_CONFIG_HOME', $prevXdg), @('DFU_ANGR_PYTHON', $prevPy), @('DFU_ANGR_TMP', $prevTmp),
+            @('DFU_ANGR_HOOKS', $prevHooks), @('DFU_TEST_OUTPUT', $prevOut))) {
         if ($null -eq $pair[1]) { Remove-Item "Env:\$($pair[0])" -ErrorAction SilentlyContinue }
         else { Set-Item "Env:\$($pair[0])" $pair[1] }
     }
-    Remove-Item -Recurse -Force $settingsRoot, $proj, $imageTmp -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $settingsRoot, $proj, $imageTmp, $hookTmp -ErrorAction SilentlyContinue
 }
 $ErrorActionPreference = $prevEAP
 

@@ -107,11 +107,15 @@ public final class AngrImage {
             byte[] buffer = new byte[1 << 16];
             for (MemoryBlock block : program.getMemory().getBlocks()) {
                 monitor.checkCancelled();
-                // Overlays and other spaces are not part of the flat address space the code runs
-                // in, and the EXTERNAL block is Ghidra's stand-in for imports: its addresses are
-                // hook targets, not memory.
-                if (block.isOverlay() || !block.isLoaded() || block.isExternalBlock()
-                        || !block.getStart().getAddressSpace().equals(space)) {
+                // Overlays and other spaces are not part of the flat address space the code runs in.
+                if (block.isOverlay() || !block.getStart().getAddressSpace().equals(space)) {
+                    continue;
+                }
+                // The EXTERNAL block is Ghidra's stand-in for imports. Functions in it are hooked;
+                // imported variables in it are plain storage, so it goes out as zero memory and a
+                // read of 'stdout' or a missing library's global does not fault.
+                boolean external = block.isExternalBlock();
+                if (!block.isLoaded() && !external) {
                     continue;
                 }
                 Map<String, Object> entry = new LinkedHashMap<>();
@@ -121,7 +125,7 @@ public final class AngrImage {
                 entry.put("perm", (block.isRead() ? "r" : "") + (block.isWrite() ? "w" : "")
                     + (block.isExecute() ? "x" : ""));
 
-                if (!block.isInitialized()) {
+                if (!block.isInitialized() || external) {
                     zero.add(entry);
                     continue;
                 }
@@ -164,6 +168,7 @@ public final class AngrImage {
         manifest.put("zero", zero);
         List<Map<String, Object>> externals = externalsOf(program, space);
         manifest.put("externals", externals);
+        manifest.put("externalData", externalDataOf(program, space));
 
         Files.writeString(dir.resolve("image.json"), GSON.toJson(manifest), StandardCharsets.UTF_8);
 
@@ -276,6 +281,36 @@ public final class AngrImage {
         return new ArrayList<>(byName.values());
     }
 
+    /**
+     * Imported variables: labels in the EXTERNAL block that are not functions. With unknown
+     * imports symbolic, the worker makes these unknown as well.
+     */
+    private static List<Map<String, Object>> externalDataOf(Program program, AddressSpace space) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (MemoryBlock block : program.getMemory().getBlocks()) {
+            if (!block.isExternalBlock() || !block.getStart().getAddressSpace().equals(space)) {
+                continue;
+            }
+            ghidra.program.model.symbol.SymbolIterator symbols = program.getSymbolTable()
+                .getSymbolIterator(block.getStart(), true);
+            while (symbols.hasNext() && out.size() < 4096) {
+                ghidra.program.model.symbol.Symbol symbol = symbols.next();
+                Address address = symbol.getAddress();
+                if (!block.contains(address)) {
+                    break;
+                }
+                if (!symbol.isPrimary() || program.getFunctionManager().getFunctionAt(address) != null) {
+                    continue;
+                }
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("name", symbol.getName());
+                entry.put("addr", hex(address.getOffset()));
+                out.add(entry);
+            }
+        }
+        return out;
+    }
+
     @SuppressWarnings("unchecked")
     private static void merge(Map<String, Object> entry, String field, Set<String> values) {
         List<String> list = (List<String>) entry.get(field);
@@ -332,7 +367,7 @@ public final class AngrImage {
         return cleaned.length() > 40 ? cleaned.substring(0, 40) : cleaned;
     }
 
-    static String hex(long value) {
+    public static String hex(long value) {
         return "0x" + Long.toHexString(value);
     }
 }

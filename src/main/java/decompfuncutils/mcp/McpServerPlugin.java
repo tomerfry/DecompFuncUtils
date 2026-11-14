@@ -424,6 +424,8 @@ public class McpServerPlugin extends ProgramPlugin
         // Emulation
         toolRegistry.register(new EmulateFunctionTool(decompPool));
         toolRegistry.register(new AngrEmulateTool());
+        toolRegistry.register(new AngrDebugTool());
+        toolRegistry.register(new AngrHookTool());
         toolRegistry.register(new ExplorePathsTool());
 
         // Constraint / symbolic-lite analysis

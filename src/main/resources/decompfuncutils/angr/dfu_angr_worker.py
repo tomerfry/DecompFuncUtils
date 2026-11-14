@@ -16,15 +16,26 @@ parameter storage) and which addresses are imports; this side only places values
 Requests:
   {"id": n, "op": "ping"}
   {"id": n, "op": "call", "imageDir": "...", "imageKey": "...", "spec": {...}}
+  {"id": n, "op": "imports", "imageDir": "...", "imageKey": "..."}
+  {"id": n, "op": "check_hook", "name": "...", "code": "..."}      -> compile only
   {"id": n, "op": "drop", "imageKey": "..."}
+  {"id": n, "op": "dbg_open", "imageDir": "...", "spec": {...}}      -> a live session
+  {"id": n, "op": "dbg_step", "session": s, "kind": "into|over|out|continue", ...}
+  {"id": n, "op": "dbg_state", "session": s}
+  {"id": n, "op": "dbg_edit", "session": s, "action": "concretize|symbolize|set|select|drop", ...}
+  {"id": n, "op": "dbg_hooks", "session": s, "spec": {...}}          -> re-install hooks
+  {"id": n, "op": "dbg_close", "session": s}
   {"id": n, "op": "shutdown"}
 """
 from __future__ import annotations
 
 import bisect
+import inspect
+import itertools
 import json
 import logging
 import os
+import re
 import sys
 import time
 import traceback
@@ -172,12 +183,194 @@ class ExternalStub(angr.SimProcedure):
         if dfu_value is not None:
             return claripy.BVV(dfu_value & ((1 << bits) - 1), bits)
         if dfu_symbolic:
-            value = claripy.BVS("ret_" + str(self.display_name), bits)
-            assumed = self.state.globals.get("dfu_assumed", ())
-            if len(assumed) < MAX_LOG_ENTRIES:
-                self.state.globals["dfu_assumed"] = assumed + ((str(self.display_name), value),)
-            return value
+            return fresh_symbol(self.state, str(self.display_name) + "_ret", bits, str(self.display_name))
         return claripy.BVV(0, bits)
+
+
+_SYMBOL_COUNTER = itertools.count(1)
+
+
+def fresh_symbol(state, base, bits, origin=None):
+    """
+    A new unconstrained value with a name a person can type back (to concretize it), recorded on
+    the state so results can say what value it had to take.
+    """
+    name = "%s_%d" % (re.sub(r"[^A-Za-z0-9_]", "_", base), next(_SYMBOL_COUNTER))
+    value = claripy.BVS(name, bits, explicit_name=True)
+    assumed = state.globals.get("dfu_assumed", ())
+    if len(assumed) < MAX_LOG_ENTRIES:
+        state.globals["dfu_assumed"] = assumed + ((origin or name, value),)
+    return value
+
+
+class HookError(angr.errors.SimError):
+    """A user-written Python hook raised; the message carries what and where."""
+
+
+class CompiledHook:
+    """
+    A replacement written in Python by the user or by an agent over MCP:
+
+        def hook(ctx, path, flags):     # parameters after ctx receive the call's arguments
+            ctx.log("open", ctx.string(path))
+            return 3                    # the return value; None means 0
+
+    See HookContext for what ctx offers.
+    """
+
+    def __init__(self, name, code):
+        self.name = name
+        namespace = {"angr": angr, "claripy": claripy, "archinfo": archinfo,
+                     "__name__": "dfu_hook_" + re.sub(r"\W", "_", name)}
+        try:
+            exec(compile(code, "<hook %s>" % name, "exec"), namespace)  # pylint: disable=exec-used
+        except SyntaxError as exc:
+            raise SpecError("hook '%s' does not compile: %s (line %s)" % (name, exc.msg, exc.lineno)) from None
+        except Exception as exc:  # pylint: disable=broad-except
+            raise SpecError("hook '%s' failed while loading: %s: %s" % (name, type(exc).__name__, exc)) from None
+        func = namespace.get("hook")
+        if not callable(func):
+            raise SpecError("hook '%s' must define a function named hook: def hook(ctx, ...)" % name)
+        params = list(inspect.signature(func).parameters.values())
+        positional = [p for p in params
+                      if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        if not positional:
+            raise SpecError("hook '%s': hook() must take the context as its first parameter" % name)
+        self.func = func
+        self.nargs = len(positional) - 1
+        self.varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+
+
+class HookContext:
+    """What a Python hook is handed: the call's arguments and the machine state, in plain terms."""
+
+    def __init__(self, state, name, args, call):
+        self.state = state          # the angr SimState, for anything not wrapped here
+        self.name = name
+        self.args = list(args)      # raw bit-vectors, one per argument
+        self.arch = state.arch
+        self.angr = angr
+        self.claripy = claripy
+        self._call = call
+
+    # -- values --
+    def is_symbolic(self, value):
+        return hasattr(value, "symbolic") and value.symbolic
+
+    def value(self, value):
+        """A Python int for a concrete value; for a symbolic one, one value it can take."""
+        if isinstance(value, int):
+            return value
+        return self.state.solver.eval(value)
+
+    def arg(self, index):
+        """Argument as an int when concrete, as a bit-vector when symbolic."""
+        if index >= len(self.args):
+            raise IndexError("hook '%s' asked for argument %d but only %d were read; add parameters "
+                             "to hook() to read more" % (self.name, index, len(self.args)))
+        value = self.args[index]
+        return value if self.is_symbolic(value) else self.state.solver.eval(value)
+
+    def symbolic(self, name=None, bits=None):
+        """A fresh unknown value; return it to make the result unconstrained."""
+        return fresh_symbol(self.state, name or (self.name + "_ret"), bits or self.arch.bits, self.name)
+
+    def constrain(self, *conditions):
+        self.state.add_constraints(*conditions)
+
+    # -- memory --
+    def read(self, address, size):
+        data = self.state.memory.load(self.value(address), size)
+        return self.state.solver.eval(data, cast_to=bytes)
+
+    def read_int(self, address, size=None, signed=False):
+        size = size or self.arch.bytes
+        number = self.state.solver.eval(
+            self.state.memory.load(self.value(address), size, endness=self.arch.memory_endness))
+        if signed and number >> (size * 8 - 1):
+            number -= 1 << (size * 8)
+        return number
+
+    def string(self, address, limit=4096):
+        out = bytearray()
+        base = self.value(address)
+        while len(out) < limit:
+            chunk = self.read(base + len(out), 1)
+            if chunk == b"\0":
+                break
+            out += chunk
+        return out.decode("utf-8", "replace")
+
+    def write(self, address, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8") + b"\0"
+        self.state.memory.store(self.value(address), data)
+
+    def write_int(self, address, value, size=None):
+        size = size or self.arch.bytes
+        if isinstance(value, int):
+            value = claripy.BVV(value & ((1 << (size * 8)) - 1), size * 8)
+        self.state.memory.store(self.value(address), value, endness=self.arch.memory_endness)
+
+    def alloc(self, size):
+        """Fresh zeroed heap memory, as malloc would return."""
+        address = self.state.heap.allocate(size)
+        address = address if isinstance(address, int) else self.state.solver.eval(address)
+        self.state.memory.store(address, b"\0" * max(1, size))
+        return address
+
+    # -- registers --
+    def reg(self, name):
+        value = self.state.registers.load(self._call.register_name(name))
+        return value if value.symbolic else self.state.solver.eval(value)
+
+    def set_reg(self, name, value):
+        name = self._call.register_name(name)
+        bits = self.arch.registers[name][1] * 8
+        if isinstance(value, int):
+            value = claripy.BVV(value & ((1 << bits) - 1), bits)
+        self.state.registers.store(name, Call.fit(value, bits))
+
+    # -- reporting --
+    def log(self, *parts):
+        """Shows up in the call trace, in order with the calls around it."""
+        self._call.log(self.state, {"log": " ".join(str(p) for p in parts), "hook": self.name})
+
+
+def invoke_hook(hook, ctx, named):
+    try:
+        return hook.func(ctx, *named)
+    except (angr.errors.SimError, SpecError):
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        where = ""
+        tb = exc.__traceback__
+        while tb is not None:
+            if tb.tb_frame.f_code.co_filename.startswith("<hook "):
+                where = " at line %d" % tb.tb_lineno
+            tb = tb.tb_next
+        raise HookError("Python hook '%s' raised %s%s: %s" % (hook.name, type(exc).__name__, where, exc)) from None
+
+
+class PythonHook(angr.SimProcedure):
+    """Runs a CompiledHook in place of a function and returns to the caller with its result."""
+
+    # pylint: disable=arguments-differ
+    def run(self, *args, dfu_hook=None, dfu_call=None):
+        ctx = HookContext(self.state, dfu_hook.name, args, dfu_call)
+        count = len(args) if dfu_hook.varargs else dfu_hook.nargs
+        result = invoke_hook(dfu_hook, ctx, [ctx.arg(i) for i in range(min(count, len(args)))])
+        bits = self.state.arch.bits
+        if result is None:
+            return claripy.BVV(0, bits)
+        if isinstance(result, bool):
+            result = int(result)
+        if isinstance(result, int):
+            return claripy.BVV(result & ((1 << bits) - 1), bits)
+        if hasattr(result, "size"):
+            return Call.fit(result, bits)
+        raise HookError("Python hook '%s' returned %r; return an int, a bit-vector or None"
+                        % (dfu_hook.name, result))
 
 
 class Image:
@@ -207,6 +400,9 @@ class Image:
         self.region_starts = [r[0] for r in regions]
 
         self.externals = manifest.get("externals", [])
+        # Imported variables (stdout, environ, a library's globals): Ghidra gives each a slot in
+        # its EXTERNAL block, which is exported as zero memory so reading one does not fault.
+        self.external_data = manifest.get("externalData", [])
         # Imports reached through a pointer slot Ghidra never filled in (a PE import table)
         # get an address of their own for the slot to point at.
         self.synthetic = {}
@@ -291,6 +487,8 @@ class Call:
         self.known = []         # (start, end) ranges worth previewing as data
         self.hook_names = {}
         self.unmodelled = set()  # imports angr has no model for, stubbed
+        self.inline_hooks = set()
+        self.python_hooks = []
         self.unmodelled_called = set()
         self.state = None
         self.symbolic_run = False
@@ -464,7 +662,9 @@ class Call:
         spec = self.spec
         project = self.project
         overrides = spec.get("externalStubs") or {}
-        symbolic_default = self.symbolic_run
+        policy = spec.get("unmodelled")
+        symbolic_default = (policy == "symbolic") if policy else self.symbolic_run
+        by_name = {}
         for ext in self.image.externals:
             name = ext["name"]
             addrs = [h(a) for a in ext.get("addrs", [])]
@@ -472,6 +672,7 @@ class Call:
                 addrs.append(self.image.synthetic[name])
             if not addrs:
                 continue
+            by_name[name] = (ext, addrs)
             for addr in addrs:
                 project.hook(addr, self.external_procedure(ext, overrides.get(name), symbolic_default),
                              replace=True)
@@ -484,6 +685,42 @@ class Call:
                                             cc=self.image.cc, **self.stub_kwargs(stub.get("returns"))),
                          replace=True)
             self.hook_names[addr] = name
+
+        # Python replacements go on last, so they win over models and stubs alike.
+        for item in spec.get("pyHooks") or []:
+            name = item.get("name") or "hook"
+            hook = CompiledHook(name, item.get("code") or "")
+            params = -1
+            addrs = [h(a) for a in item.get("addrs") or []]
+            display = name
+            if item.get("external"):
+                if item["external"] not in by_name:
+                    self.warnings.append("Python hook '%s' targets import '%s', which this program does "
+                                         "not call through any address." % (name, item["external"]))
+                    continue
+                ext, addrs = by_name[item["external"]]
+                params = int(ext.get("params", -1))
+                display = item["external"]
+                self.unmodelled.discard(display)
+            if item.get("kind") == "inline":
+                skip = int(h(item.get("skip", 0)))
+                for addr in addrs:
+                    project.hook(addr, self.inline_hook(hook), length=skip, replace=True)
+                    self.inline_hooks.add(addr)
+                self.python_hooks.append(name)
+                continue
+            num_args = min(max(hook.nargs, params if params >= 0 else 4), 10)
+            for addr in addrs:
+                project.hook(addr, PythonHook(display_name=display, num_args=num_args, cc=self.image.cc,
+                                              dfu_hook=hook, dfu_call=self), replace=True)
+                self.hook_names[addr] = display
+            self.python_hooks.append(name)
+
+    def inline_hook(self, hook):
+        """A hook that runs at an address and then lets execution carry on (or skips bytes)."""
+        def run(state):
+            invoke_hook(hook, HookContext(state, hook.name, [], self), [])
+        return run
 
     def stub_kwargs(self, returns):
         if returns is None:
@@ -510,11 +747,14 @@ class Call:
                             dfu_symbolic=symbolic_default)
 
     def remove_hooks(self):
-        for addr in self.hook_names:
+        for addr in list(self.hook_names) + list(self.inline_hooks):
             try:
                 self.project.unhook(addr)
             except Exception:  # pylint: disable=broad-except
                 pass
+        self.hook_names.clear()
+        self.inline_hooks.clear()
+        self.python_hooks = []
 
     # ---- observation ----
 
@@ -542,8 +782,12 @@ class Call:
         except Exception:  # pylint: disable=broad-except
             return None
 
-    def string_at(self, state, addr):
-        """A printable C string at addr, for annotating pointers in traces and results."""
+    def string_at(self, state, addr, min_in_image=1):
+        """
+        A printable C string at addr, for annotating pointers in traces and results.
+        min_in_image asks for more evidence inside the program image, where a pointer to code
+        would otherwise read as a short "string" (x86-64 prologues are printable bytes).
+        """
         if addr < PAGE or not self.is_known(addr):
             return None
         end = self.known_end(addr)
@@ -556,6 +800,8 @@ class Call:
         nul = data.find(b"\0")
         text = data if nul < 0 else data[:nul]
         if not text or not printable(text):
+            return None
+        if len(text) < min_in_image and self.image.in_image(addr):
             return None
         return text_of(text) + ("" if nul >= 0 else "...")
 
@@ -629,7 +875,9 @@ class Call:
         if site is not None:
             entry["from"] = "%#x" % site
         entry["depth"] = state.globals.get("dfu_depth", 1)
-        if isinstance(proc, ExternalStub):
+        if isinstance(proc, PythonHook):
+            entry["python"] = True
+        elif isinstance(proc, ExternalStub):
             entry["stubbed"] = True
             if name in self.unmodelled:
                 self.unmodelled_called.add(name)
@@ -717,6 +965,14 @@ class Call:
             for slot in ext.get("slots", []):
                 state.memory.store(h(slot), claripy.BVV(target, self.ptr_bits),
                                    endness=arch.memory_endness)
+
+        # With unknown imports symbolic, imported variables are unknown too rather than zero.
+        if spec.get("unmodelled") == "symbolic":
+            for item in image.external_data[:256]:
+                value = fresh_symbol(state, "ext_" + str(item["name"]), self.ptr_bits, str(item["name"]))
+                state.memory.store(h(item["addr"]), value, endness=arch.memory_endness)
+            if image.external_data:
+                self.symbolic_run = True
 
         for i, arg in enumerate(spec.get("args") or []):
             label = "arg%d" % i
@@ -937,6 +1193,8 @@ class Call:
                 "angr has no model for these imports, so they did nothing and returned %s. Give them "
                 "a return value with 'stubs' if the result depends on them."
                 % ("an unconstrained value" if self.symbolic_run else "0"))
+        if self.python_hooks:
+            result["pythonHooks"] = self.python_hooks
         if self.warnings:
             result["warnings"] = self.warnings
         return result
@@ -1021,7 +1279,8 @@ class Call:
             rows = []
             for name, bv in assumed:
                 try:
-                    rows.append({"call": name, "returns": "%#x" % state.solver.eval(bv)})
+                    rows.append({"call": name, "symbol": next(iter(bv.variables), None),
+                                 "returns": "%#x" % state.solver.eval(bv)})
                 except Exception:  # pylint: disable=broad-except
                     pass
             if rows:
@@ -1185,6 +1444,641 @@ class Call:
 
 
 # -------------------------------------------------------------------------------------------
+# Debug sessions: a live state that is stepped, inspected and edited between requests
+# -------------------------------------------------------------------------------------------
+
+MAX_PATHS = 64
+MAX_DEBUG_WRITES = 2048
+STACK_WORDS = 24
+
+
+class DebugSession:
+    """
+    One debugging run of a function. It owns its own project, so its hooks can change while the
+    session lives without disturbing anything else, and a set of paths: the one being stepped,
+    plus every alternative a symbolic branch produced, parked until selected.
+    """
+
+    def __init__(self, sid, directory, spec):
+        self.sid = sid
+        self.image = Image(directory, spec.get("arch"))
+        self.project = self.image.project
+        self.arch = self.image.arch
+        self.call = Call(self.image, spec)
+        state = self.call.build_state()
+        self.call.install_hooks()
+        state.inspect.b("simprocedure", when=angr.BP_AFTER, action=self.call.on_simprocedure)
+        state.inspect.b("mem_write", when=angr.BP_AFTER, action=self.on_write)
+        self.ret_addr = self.project.simos.return_deadend
+        self.mask = ~1 if self.arch.name.startswith("ARM") else ~0
+        self.paths = {0: state}
+        self.info = {0: {"status": "paused"}}
+        self.current = 0
+        self.next_path = 1
+        self.executed = 0
+        self.breakpoints = set()
+        self.blocks = {}
+        self.shown = {}          # path -> {register: text}, to mark what the last step changed
+        self.last_stop = "start"
+        self.pending = None
+        self.stack_range = (self.arch.initial_sp - 0x800000, self.arch.initial_sp + PAGE)
+
+    # ---- observation ----
+
+    def on_write(self, state):
+        a = attrs(state)
+        addr = a.mem_write_address
+        if addr is None:
+            return
+        if hasattr(addr, "symbolic"):
+            if addr.symbolic:
+                return
+            addr = state.solver.eval(addr)
+        length = a.mem_write_length
+        if hasattr(length, "symbolic"):
+            length = None if length.symbolic else state.solver.eval(length)
+        if length is None:
+            expr = a.mem_write_expr
+            length = expr.size() // 8 if hasattr(expr, "size") else 1
+        writes = state.globals.get("dbg_writes", ())
+        if len(writes) < MAX_DEBUG_WRITES:
+            state.globals["dbg_writes"] = writes + ((addr, int(length)),)
+
+    @staticmethod
+    def depth(state):
+        return state.globals.get("dfu_depth", 0)
+
+    def block_addrs(self, pc):
+        addrs = self.blocks.get(pc)
+        if addrs is None:
+            try:
+                addrs = list(self.project.factory.block(pc).instruction_addrs)
+            except Exception:  # pylint: disable=broad-except
+                addrs = []
+            if len(self.blocks) < 20000:
+                self.blocks[pc] = addrs
+        return addrs
+
+    def is_hook(self, state, pc):
+        # A hook that ran in place hands back the same address marked "do not hook again".
+        if state.history.jumpkind == "Ijk_NoHook":
+            return False
+        return self.project.is_hooked(pc) or self.project.is_hooked(pc & self.mask)
+
+    # ---- stepping ----
+
+    def advance(self, kind, count, limit, deadline, run_to=None):
+        pid = self.current
+        info = self.info[pid]
+        if info["status"] != "paused":
+            raise SpecError("This path has finished (%s). Select another path or restart the session."
+                            % info["status"])
+        if kind not in ("into", "over", "out", "continue", "resume"):
+            raise SpecError("unknown step kind %r" % kind)
+        state = self.paths[pid]
+        start_depth = self.depth(state)
+        done = 0
+        phase = kind
+        first = True
+        pending = self.pending if self.pending and self.pending["path"] == pid else None
+        self.pending = None
+        if kind == "resume":
+            if pending:
+                # Carry on with the step that ran out of time, exactly where it was.
+                phase, start_depth, done, count, run_to = (pending["phase"], pending["depth"],
+                                                           pending["done"], pending["count"], pending["runTo"])
+                first = False
+            else:
+                phase = "continue"
+        else:
+            state.globals["dbg_writes"] = ()
+        stops = set(self.breakpoints)
+        if run_to is not None:
+            stops.add(run_to & self.mask)
+        executed = 0
+        stop = None
+
+        while True:
+            try:
+                pc = state.addr
+            except Exception:  # pylint: disable=broad-except
+                info["status"] = "symbolic_jump"
+                stop = "symbolic_jump"
+                break
+            if pc == self.ret_addr:
+                info["status"] = "returned"
+                stop = "returned"
+                break
+            if not first and (pc & self.mask) in stops:
+                stop = "breakpoint"
+                break
+            if executed >= limit:
+                stop = "max_steps"
+                break
+            if time.time() >= deadline:
+                stop = "timeout"
+                break
+
+            hooked = self.is_hook(state, pc)
+            single = phase in ("into", "over")
+            if hooked:
+                size = None
+                ran = 1
+            elif single:
+                size = 1
+                ran = 1
+            else:
+                addrs = self.block_addrs(pc)
+                size = None
+                ran = max(1, len(addrs))
+                for i, addr in enumerate(addrs[1:], 1):
+                    if (addr & self.mask) in stops:
+                        size = ran = i  # stop on the breakpoint inside this block
+                        break
+            try:
+                successors = self.successors(state, size)
+            except Exception as exc:  # pylint: disable=broad-except
+                if size is None and not hooked:
+                    # Find the instruction that failed rather than report the block it was in.
+                    state, more = self.replay_to_fault(state)
+                    executed += more
+                info["status"] = "fault"
+                info["fault"] = self.call.fault_report(exc)
+                stop = "fault"
+                break
+            executed += ran
+            flat = list(successors.flat_successors)
+            if not flat:
+                if successors.unconstrained_successors:
+                    info["status"] = "symbolic_jump"
+                    stop = "symbolic_jump"
+                else:
+                    info["status"] = "exited"
+                    stop = "exited"
+                break
+            self.call.note_transfers(flat)
+            state = flat[0]
+            first = False
+            if len(flat) > 1:
+                # A branch on an unknown value: stay on one side, park the others, and stop so
+                # whoever is driving decides which to follow.
+                info["guard"] = self.guard_text(flat[0])
+                for other in flat[1:]:
+                    if len(self.paths) >= MAX_PATHS:
+                        self.call.warnings.append("More than %d paths; further forks were dropped." % MAX_PATHS)
+                        break
+                    new_id = self.next_path
+                    self.next_path += 1
+                    other.globals["dbg_writes"] = ()
+                    self.paths[new_id] = other
+                    self.info[new_id] = {"status": "paused", "forkedAt": "%#x" % pc,
+                                         "guard": self.guard_text(other), "parent": pid}
+                info["forkedAt"] = "%#x" % pc
+                stop = "fork"
+                break
+
+            if phase == "into":
+                done += 1
+                if done >= count:
+                    stop = "step"
+                    break
+            elif phase == "over":
+                if self.depth(state) > start_depth:
+                    phase = "finish_over"  # entered a call: run until it comes back
+                else:
+                    done += 1
+                    if done >= count:
+                        stop = "step"
+                        break
+            elif phase == "finish_over":
+                if self.depth(state) <= start_depth:
+                    done += 1
+                    if done >= count:
+                        stop = "step"
+                        break
+                    phase = "over"
+            elif phase == "out":
+                if self.depth(state) < start_depth:
+                    stop = "step"
+                    break
+
+        if stop == "timeout":
+            self.pending = {"path": pid, "phase": phase, "depth": start_depth, "done": done,
+                            "count": count, "runTo": run_to}
+        self.paths[pid] = state
+        self.executed += executed
+        self.last_stop = stop
+        return stop
+
+    def successors(self, state, size):
+        if size is None:
+            return self.project.factory.successors(state)
+        return self.project.factory.successors(state, num_inst=size)
+
+    def replay_to_fault(self, state):
+        ran = 0
+        for _ in range(512):
+            try:
+                successors = self.project.factory.successors(state, num_inst=1)
+            except Exception:  # pylint: disable=broad-except
+                break
+            flat = successors.flat_successors
+            if len(flat) != 1:
+                break
+            state = flat[0]
+            ran += 1
+        return state, ran
+
+    @staticmethod
+    def guard_text(state):
+        try:
+            return DebugSession.expr_text(state.history.jump_guard, 160)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    # ---- rendering ----
+
+    @staticmethod
+    def expr_text(expr, limit=96):
+        text = re.sub(r"^<(BV\d+|Bool) ", "", str(expr))
+        if text.endswith(">"):
+            text = text[:-1]
+        return text if len(text) <= limit else text[:limit - 3] + "..."
+
+    def show(self, state, bv):
+        """A value for display: concrete, or symbolic with what it is and a value it can take."""
+        if not bv.symbolic:
+            return {"value": "%#x" % state.solver.eval(bv)}
+        out = {"symbolic": self.expr_text(bv)}
+        try:
+            values = state.solver.eval_upto(bv, 2)
+            if len(values) == 1:
+                out["value"] = "%#x" % values[0]
+                out["pinned"] = True  # symbolic expression, but only one value satisfies the path
+            elif values:
+                out["example"] = "%#x" % values[0]
+        except Exception as exc:  # pylint: disable=broad-except
+            out["error"] = str(exc)
+        return out
+
+    def register_names(self):
+        names = []
+        arch = self.arch
+        for offset in (arch.ip_offset, arch.sp_offset):
+            name = arch.register_names.get(offset)
+            if name and name not in names:
+                names.append(name)
+        for reg in arch.register_list:
+            if getattr(reg, "general_purpose", False) and reg.name not in names:
+                names.append(reg.name)
+        return names
+
+    def symbol_table(self, state):
+        """Every unknown the path depends on, by the name used to concretize it."""
+        table = {}
+        for name, bv, _kind in self.call.symbols:
+            table[name] = bv
+        for _origin, bv in state.globals.get("dfu_assumed", ()):
+            for name in bv.variables:
+                table.setdefault(name, bv)
+        return table
+
+    def snapshot(self, reads=None):
+        pid = self.current
+        state = self.paths[pid]
+        info = self.info[pid]
+        call = self.call
+        call.state = state
+        out = {"session": self.sid, "status": info["status"], "stop": self.last_stop, "path": pid,
+               "instructions": self.executed, "depth": self.depth(state)}
+        try:
+            out["pc"] = "%#x" % state.addr
+        except Exception:  # pylint: disable=broad-except
+            out["pc"] = None
+
+        previous = self.shown.get(pid, {})
+        current = {}
+        registers = []
+        for name in self.register_names():
+            try:
+                row = self.show(state, state.registers.load(name))
+            except Exception:  # pylint: disable=broad-except
+                continue
+            row["name"] = name
+            if "value" in row:
+                preview = call.string_at(state, int(row["value"], 16), min_in_image=4)
+                if preview is not None:
+                    row["string"] = preview
+            text = row.get("value") or row.get("symbolic")
+            current[name] = text
+            if name in previous and previous[name] != text:
+                row["changed"] = True
+            registers.append(row)
+        self.shown[pid] = current
+        out["registers"] = registers
+        flags = self.flags(state)
+        if flags:
+            out["flags"] = flags
+
+        out["stack"] = self.stack(state)
+        writes = self.writes(state)
+        if writes:
+            out["writes"] = writes
+
+        log = state.globals.get("dfu_log", ())
+        if log:
+            out["calls"] = list(log)
+        for fd, key in ((1, "stdout"), (2, "stderr")):
+            try:
+                data = state.posix.dumps(fd)
+            except Exception:  # pylint: disable=broad-except
+                data = b""
+            if data:
+                out[key] = text_of(data[-16384:]) if printable(data) else {"hex": data[-MAX_DUMP:].hex()}
+
+        symbols = []
+        for name, bv in list(self.symbol_table(state).items())[:64]:
+            row = self.show(state, bv)
+            row["name"] = name
+            row["bits"] = bv.size()
+            symbols.append(row)
+        if symbols:
+            out["symbols"] = symbols
+        out["constraints"] = len(state.solver.constraints)
+
+        if len(self.paths) > 1:
+            rows = []
+            for other in sorted(self.paths):
+                meta = self.info[other]
+                row = {"id": other, "status": meta["status"], "current": other == pid}
+                try:
+                    row["pc"] = "%#x" % self.paths[other].addr
+                except Exception:  # pylint: disable=broad-except
+                    row["pc"] = None
+                for key in ("guard", "forkedAt", "parent"):
+                    if meta.get(key) is not None:
+                        row[key] = meta[key]
+                rows.append(row)
+            out["paths"] = rows
+
+        if info["status"] == "returned":
+            loc = call.spec.get("ret")
+            if loc and "reg" in loc:
+                value = call.value_report(state, call.return_bv(state, loc))
+                if loc.get("type"):
+                    value["type"] = loc["type"]
+                out["returnValue"] = value
+        if info.get("fault"):
+            out["fault"] = info["fault"]
+
+        buffers = call.buffer_report(state)
+        if buffers:
+            out["buffers"] = buffers
+        if reads:
+            saved = call.spec.get("readMemory")
+            call.spec["readMemory"] = reads
+            try:
+                out["memory"] = call.memory_report(state)
+            finally:
+                call.spec["readMemory"] = saved
+        if call.unmodelled_called:
+            out["unmodelledExternals"] = sorted(call.unmodelled_called)
+        if call.python_hooks:
+            out["pythonHooks"] = call.python_hooks
+        if call.warnings:
+            out["warnings"] = call.warnings
+        return out
+
+    def flags(self, state):
+        if self.arch.name not in ("AMD64", "X86"):
+            return None
+        try:
+            value = state.regs.rflags if self.arch.name == "AMD64" else state.regs.eflags
+            if value.symbolic:
+                return "<symbolic>"
+            number = state.solver.eval(value)
+        except Exception:  # pylint: disable=broad-except
+            return None
+        names = ((0, "CF"), (2, "PF"), (6, "ZF"), (7, "SF"), (10, "DF"), (11, "OF"))
+        return " ".join(name for bit, name in names if number >> bit & 1) or "-"
+
+    def stack(self, state):
+        sp = state.regs.sp
+        if sp.symbolic:
+            return {"sp": "<symbolic>", "words": []}
+        base = state.solver.eval(sp)
+        size = self.arch.bytes
+        words = []
+        for i in range(STACK_WORDS):
+            addr = base + i * size
+            try:
+                bv = state.memory.load(addr, size, endness=self.arch.memory_endness,
+                                       inspect=False, disable_actions=True)
+            except Exception:  # pylint: disable=broad-except
+                break
+            row = self.show(state, bv)
+            row["address"] = "%#x" % addr
+            row["offset"] = i * size
+            if "value" in row:
+                text = self.call.string_at(state, int(row["value"], 16), min_in_image=4)
+                if text is not None:
+                    row["string"] = text
+            words.append(row)
+        return {"sp": "%#x" % base, "words": words}
+
+    def writes(self, state):
+        """Memory the last step or run changed, merged into ranges."""
+        raw = state.globals.get("dbg_writes", ())
+        if not raw:
+            return []
+        merged = []
+        for addr, length in sorted(set(raw)):
+            if merged and addr <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], addr + length)
+            else:
+                merged.append([addr, addr + length])
+        rows = []
+        for start, end in merged[:64]:
+            size = end - start
+            if self.image.in_image(start):
+                region = "program"
+            elif self.stack_range[0] <= start < self.stack_range[1]:
+                region = "stack"
+            else:
+                region = "heap"
+            row = {"address": "%#x" % start, "size": size, "region": region}
+            reported = self.call.data_report(state, start, min(size, 64))
+            row.update(reported[0] if isinstance(reported, tuple) else reported)
+            rows.append(row)
+        if len(merged) > 64:
+            rows.append({"omitted": len(merged) - 64})
+        return rows
+
+    # ---- editing ----
+
+    def target(self, state, spec):
+        """What an edit applies to: (kind, where, current value)."""
+        if spec.get("register"):
+            name = self.call.register_name(str(spec["register"]))
+            return "reg", name, state.registers.load(name)
+        if spec.get("address") is not None:
+            addr = h(spec["address"])
+            size = int(h(spec.get("size") or self.arch.bytes))
+            if size < 1 or size > 4096:
+                raise SpecError("size must be between 1 and 4096 bytes")
+            return "mem", (addr, size), state.memory.load(addr, size, endness=self.arch.memory_endness)
+        if spec.get("symbol"):
+            table = self.symbol_table(state)
+            name = str(spec["symbol"])
+            if name not in table:
+                raise SpecError("no symbol named %r on this path. Known: %s"
+                                % (name, ", ".join(sorted(table)) or "none"))
+            bv = table[name]
+            if name not in bv.variables or len(bv.variables) != 1 or bv.op != "BVS":
+                # the recorded value may be a wider expression; pick out the named leaf
+                for leaf in bv.leaf_asts():
+                    if leaf.op == "BVS" and name in leaf.variables:
+                        bv = leaf
+                        break
+            return "sym", name, bv
+        raise SpecError("say what to act on: 'register', 'address' (+ 'size'), or 'symbol'")
+
+    def store(self, state, kind, where, value):
+        if kind == "reg":
+            state.registers.store(where, value)
+        elif kind == "mem":
+            state.memory.store(where[0], value, endness=self.arch.memory_endness)
+
+    def edit(self, request):
+        action = request.get("action")
+        if action == "select":
+            pid = int(h(request.get("path")))
+            if pid not in self.paths:
+                raise SpecError("no path %d; paths are %s" % (pid, sorted(self.paths)))
+            self.current = pid
+            self.last_stop = "selected"
+            return
+        if action == "drop":
+            pid = int(h(request.get("path")))
+            if pid not in self.paths:
+                raise SpecError("no path %d" % pid)
+            if len(self.paths) == 1:
+                raise SpecError("the last path cannot be dropped; stop the session instead")
+            del self.paths[pid]
+            del self.info[pid]
+            self.shown.pop(pid, None)
+            if self.current == pid:
+                self.current = sorted(self.paths)[0]
+            return
+
+        state = self.paths[self.current]
+        self.call.state = state
+        if action == "concretize":
+            if request.get("all"):
+                # One consistent model for everything: fix each unknown in turn.
+                for _name, bv in self.symbol_table(state).items():
+                    state.add_constraints(bv == state.solver.eval(bv))
+                return
+            kind, where, bv = self.target(state, request)
+            if not bv.symbolic and request.get("value") is None:
+                return
+            if request.get("value") is None:
+                number = state.solver.eval(bv)
+            else:
+                number = h(request["value"]) & ((1 << bv.size()) - 1)
+            condition = bv == number
+            if bv.symbolic:
+                if not state.solver.satisfiable(extra_constraints=[condition]):
+                    raise SpecError("It cannot be %#x on this path: that contradicts the conditions "
+                                    "already taken to get here." % number)
+                state.add_constraints(condition)
+            elif state.solver.eval(bv) != number:
+                raise SpecError("It is already concrete (%#x). Use 'set' to overwrite a value."
+                                % state.solver.eval(bv))
+            # The constraint fixes the symbol; writing the number back makes what holds it concrete.
+            self.store(state, kind, where, claripy.BVV(number, bv.size()))
+        elif action == "symbolize":
+            kind, where, bv = self.target(state, request)
+            if kind == "sym":
+                raise SpecError("a symbol is already symbolic; name a register or an address")
+            label = str(request.get("name") or (where if kind == "reg" else "mem_%x" % where[0]))
+            label = re.sub(r"[^A-Za-z0-9_]", "_", label)
+            if label in self.symbol_table(state):
+                value = fresh_symbol(state, label, bv.size(), label)
+            else:
+                value = claripy.BVS(label, bv.size(), explicit_name=True)
+                state.globals["dfu_assumed"] = state.globals.get("dfu_assumed", ()) + ((label, value),)
+            self.store(state, kind, where, value)
+        elif action == "set":
+            kind, where, bv = self.target(state, request)
+            if kind == "sym":
+                raise SpecError("use 'concretize' to give a symbol a value")
+            if request.get("value") is None:
+                raise SpecError("'set' needs a value")
+            value = self.call.scalar(request["value"], bv.size(), "value")
+            self.store(state, kind, where, Call.fit(value, bv.size()))
+        else:
+            raise SpecError("unknown edit action %r" % action)
+
+    def rehook(self, spec):
+        """Swap the hook configuration of a running session; state is untouched."""
+        self.call.remove_hooks()
+        for key in ("externalStubs", "stubs", "pyHooks", "unmodelled"):
+            if key in spec:
+                self.call.spec[key] = spec[key]
+        self.call.unmodelled = set()
+        self.call.install_hooks()
+
+
+_SESSIONS = {}
+_SESSION_IDS = itertools.count(1)
+
+
+def session_of(request):
+    session = _SESSIONS.get(request.get("session"))
+    if session is None:
+        raise SpecError("no such debug session (it was closed, or its worker was restarted)")
+    return session
+
+
+def handle_debug(op, request):
+    if op == "dbg_open":
+        sid = next(_SESSION_IDS)
+        session = DebugSession(sid, request["imageDir"], request["spec"])
+        _SESSIONS[sid] = session
+        return session.snapshot(request.get("readMemory"))
+    session = session_of(request)
+    if op == "dbg_close":
+        session.call.remove_hooks()
+        _SESSIONS.pop(session.sid, None)
+        return {"closed": True}
+    if op == "dbg_step":
+        if "breakpoints" in request:
+            session.breakpoints = {h(a) & session.mask for a in request["breakpoints"] or []}
+        deadline = time.time() + int(request.get("timeoutMs") or 2000) / 1000.0
+        run_to = h(request["runTo"]) if request.get("runTo") is not None else None
+        session.advance(request.get("kind", "into"), max(1, int(request.get("count") or 1)),
+                        int(request.get("maxSteps") or 1000000), deadline, run_to)
+    elif op == "dbg_edit":
+        session.edit(request)
+    elif op == "dbg_hooks":
+        session.rehook(request.get("spec") or {})
+    elif op != "dbg_state":
+        raise SpecError("unknown op %r" % op)
+    return session.snapshot(request.get("readMemory"))
+
+
+def describe_imports(image):
+    """How each import would be handled with no stubs or hooks in play."""
+    rows = []
+    for ext in image.externals:
+        cls = find_simprocedure(ext["name"])
+        rows.append({"name": ext["name"], "library": ext.get("library"),
+                     "model": cls.__name__ if cls is not None else None})
+    return rows
+
+
+# -------------------------------------------------------------------------------------------
 # Request loop
 # -------------------------------------------------------------------------------------------
 
@@ -1214,6 +2108,14 @@ def handle(request):
             _IMAGES.pop(cache_key, None)
             _IMAGE_ORDER.remove(cache_key)
         return {"dropped": True}
+    if op == "check_hook":
+        hook = CompiledHook(request.get("name") or "hook", request.get("code") or "")
+        return {"ok": True, "parameters": hook.nargs, "varargs": hook.varargs}
+    if op == "imports":
+        return {"imports": describe_imports(get_image(request["imageKey"], request["imageDir"],
+                                                      request.get("arch")))}
+    if isinstance(op, str) and op.startswith("dbg_"):
+        return handle_debug(op, request)
     if op == "call":
         spec = request["spec"]
         loaded = (request["imageKey"], spec.get("arch") or "") in _IMAGES
