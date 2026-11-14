@@ -21,6 +21,10 @@ MCP server's two HTTP transports.
 | `extlink/libtestdep.so.1`, `extlink/testmain` | Committed ELF pair. `testmain` carries `DT_NEEDED [libtestdep.so.1]` plus `UND` dynsym entries; the library defines and exports them. |
 | `scripts/ResolveExternalsHeadlessTest.java` | Exercises `ghidra_resolve_externals`: puts every import back into `<EXTERNAL>`, clears the library association, then checks the tool re-attributes both and stores the exporting address. Independent of whether this Ghidra's own External Symbol Resolver works. |
 | `scripts/BacklinkImportsHeadlessTest.java` | Exercises `ghidra_backlink_imports`: clickable `{@program ...}` back-links and bookmarks written into the library, block replacement on re-run, coexistence with another importer's block, and removal. |
+| `scripts/CrossModuleAnalyzerHeadlessTest.java` | Exercises the `Cross-Module Import Linker` analyzer: that auto-analysis alone leaves the library back-linked, the one-shot path used by Analysis > One Shot, idempotence, and each analysis option. |
+| `angr/angr_demo.c`, `angr/libangrdemo.so` | Source and committed ELF of the `ghidra_angr_emulate` fixture: small functions with one obvious behaviour each (stack arguments, out-parameters, structs, globals, libc calls, an import nothing models, a loop). Rebuild with `angr/build.ps1` (needs clang + lld). |
+| `scripts/AngrEmulateHeadlessTest.java` | Exercises `ghidra_angr_emulate` by calling the fixture's functions by name: argument forms, results, the call trace, faults on missing pointers, stubs, solving for inputs, limits, error messages, and a Ghidra signature changing placement and typing. |
+| `run_angr_test.ps1` | Build -> install -> run for the angr test. Needs a Python with angr (`tools/setup-angr.ps1`). |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
 | `build_binary.ps1` | Recompile `test_vuln.o` (only needed if you edit `test_vuln.c`; requires clang). |
@@ -180,3 +184,24 @@ Three things it has to get right, each of which produced a confusing failure:
   Point it at a drive with room when the system drive is tight. Both runners now
   delete their scratch afterwards; before that, every run left an extracted copy
   of the extension behind.
+
+The analyzer has its own script over the same pair. It needs `-Analyze`, since
+what it checks is what auto-analysis leaves behind:
+
+```powershell
+.\tests\run_resolve_externals_test.ps1 -Script CrossModuleAnalyzerHeadlessTest.java -Analyze
+```
+
+## angr emulation test
+
+```powershell
+.\tools\setup-angr.ps1          # once: a private Python environment with angr
+.\tests\run_angr_test.ps1
+```
+
+The runner uses the interpreter the extension itself would find (the one
+`setup-angr.ps1` recorded) unless `-Python` names another, and exits 2 rather
+than failing when there is none. It starts a real worker process, so it also
+covers the export of Ghidra's memory image, the JSON protocol, worker reuse
+between calls (the second call must be fast) and re-export after the program
+changes.

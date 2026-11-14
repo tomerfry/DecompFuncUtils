@@ -230,6 +230,44 @@ non-overlapping base and re-point the PLT thunks with `setThunkedFunction`.
 Incoming References then works natively and the decompiler follows calls into
 library code, at the cost of a single merged database with no module separation.
 
+### Cross-module linking as an analyzer
+
+Both directions above also run inside Ghidra's own analysis, as the
+**Cross-Module Import Linker** analyzer, so a program that is imported into a
+project next to its libraries comes out of auto-analysis already linked, with no
+tool call:
+
+- It is on by default and appears in **Analysis → Auto Analyze…** with its
+  options. It is offered only for programs that name at least one library.
+- It runs last (`LOW_PRIORITY`), after disassembly, function creation and
+  reference analysis have settled, because the back-link half needs the call
+  sites those passes create.
+- **To invoke it after analysis**, use **Analysis → One Shot → Cross-Module
+  Import Linker**. That is the way to pick up a library imported into the
+  project *after* this program was analyzed: the analyzer links what is in the
+  project when it runs, and it runs on the importing program.
+- Everything it does is idempotent. Links already made are left alone and each
+  back-link block is replaced in place.
+
+| Option | Default | Effect |
+|---|---|---|
+| Link imports to project libraries | on | Attribute `<EXTERNAL>` functions to the library that exports them |
+| Store target addresses | on | Also store the exporting address in each external location it links |
+| Search project for unassociated libraries | on | Find a library by file name when the program has no path for it |
+| Write back-links into libraries | on | Write the `{@program}` call-site block and bookmark into each library |
+| Back-link call sites per function | 25 | Links listed before `... and N more` |
+| Save modified libraries | on | Save each library after writing into it |
+
+The back-link half edits and saves the **library** programs. Turn *Write
+back-links into libraries* off if analysis of one program must not touch
+another. Headless analysis runs the analyzer too; problems (a read-only
+library, a library that could not be saved) are reported in the analysis log,
+routine results in the application log.
+
+The analyzer, `ghidra_resolve_externals` and `ghidra_backlink_imports` share one
+implementation (`decompfuncutils.crossmodule.CrossModuleLinker`), so they report
+and do the same thing.
+
 ### Function and stack-local refinement
 
 Use `ghidra_set_function_no_return` to set or clear a function's non-returning
@@ -472,6 +510,119 @@ The emulator also reports what a run silently depended on, and bounds it:
   `callReturnValues` supplies the value each skipped call returns, in execution
   order. This replays a witness that `ghidra_explore_paths` found with
   `callPolicy: "skip"`, and lets one function be run in isolation.
+
+### Calling a function with angr
+
+`ghidra_angr_emulate` runs a function of the open program under
+[angr](https://angr.io) and reports what it did. Where `ghidra_emulate_function`
+starts from raw machine state - registers, a stack pointer, a return sentinel,
+hex buffers at addresses you pick - this one is called like the function itself:
+
+```json
+{"function": "check_password", "args": ["letmein"]}
+```
+
+```json
+{
+  "function": "check_password @ 001019a0",
+  "called": "1 argument(s), __stdcall (Ghidra has no signature for this function); arguments in RDI; result from RAX",
+  "outcome": "returned",
+  "returnValue": {"hex": "0x0", "signed": 0},
+  "calls": [{"call": "strcmp", "args": ["0x620000000100 \"letmein\"", "0x100660 \"hunter2\""],
+             "returned": "0x1", "from": "0x1019b7 (check_password+0x17)", "depth": 1}]
+}
+```
+
+Ghidra contributes what it already knows and angr does the executing:
+
+- **The function** is given by name or address.
+- **Argument and result locations come from Ghidra** - the function's own
+  parameter storage where it has a signature, the calling convention's
+  assignment where it does not - so stack arguments, Windows x64, `thiscall`
+  and custom storage behave the way the decompiler shows them. `called` states
+  what was assumed. The stack and return address are set up for you.
+- **The memory image is Ghidra's**, exported as-is. Addresses in results are
+  Ghidra addresses, patches and relocations applied in Ghidra are in effect,
+  and anything Ghidra can load can be run; the original file is never opened.
+- **Imports run as angr's models** (`malloc`, `strlen`, `memcpy`, `printf`, ...),
+  hooked at the thunk addresses Ghidra resolved. An import angr has no model
+  for does nothing, returns 0, and is listed in `unmodelledExternals`.
+- **Each call starts from the program's own memory.** Nothing carries over
+  between calls.
+
+Arguments are written as plain values:
+
+| Form | Meaning |
+|---|---|
+| `5`, `-1`, `"0x1F"` | integer (a string that reads as a hex literal is the integer) |
+| `"text"` | pointer to that NUL-terminated string (`{"string": "0x1F"}` for text that looks like hex) |
+| `{"bytes": "deadbeef"}` | pointer to those bytes |
+| `{"buffer": 64}` | pointer to 64 zero bytes, for an out-parameter |
+| `{"struct": [3, 4, "label"]}` | pointer to a packed struct: integers are 4 bytes unless `{"int": v, "size": n}`, strings/buffers/structs become pointer fields, `{"pad": n}` and `{"raw": "hex"}` control layout |
+| `{"symbolicBytes": 16}`, `{"symbolicInt": 32}` | unknown input, to be solved for (below) |
+
+What comes back, when present: `returnValue` (hex, signed, and the string it
+points at if it is one), `stdout`/`stderr`, `buffers` (final contents of every
+pointer argument, with `changed`), `globalWrites` (writes into the program's own
+data, with the symbol), `calls` (nested by `depth`; library calls with their
+arguments and result, strings shown inline), and `memory` for `readMemory`
+ranges. `memory` seeds data before the call and takes a symbol name as the
+address, e.g. `[{"address": "g_config", "int": 1, "size": 4}]`; `registers` sets
+anything that is not an ordinary argument; `stubs` gives any function, internal
+or imported, a fixed result: `{"check_license": 1, "getuid": 0}`.
+
+A pointer the function follows but nobody supplied is a **fault**, not a
+silent zero:
+
+```json
+{"outcome": "fault",
+ "fault": {"type": "SimSegfaultException", "address": "0x0", "inBlockAt": "0x101b40 (deref)",
+           "hint": "A NULL (or near-NULL) pointer was dereferenced. An argument, struct field or global the function follows was left zero - pass a buffer or seed it with 'memory'."}}
+```
+
+Pass `strictMemory: false` for firmware that touches addresses Ghidra has no
+block for; those reads then return zero.
+
+**Solving for inputs.** Make an argument unknown and say what you want:
+
+```json
+{"function": "check_password", "args": [{"symbolicBytes": 8, "name": "pw"}], "wantReturn": "1"}
+```
+
+returns `"inputs": {"pw": {"string": "hunter2", "unique": true}}`. `find` takes
+addresses or function names to reach instead, `avoid` prunes. With neither, the
+result lists one example input per distinct path with its return value - a
+quick answer to "what can this function return, and for which inputs?".
+`symbolic: true` explores even without symbolic arguments; unmodelled imports
+then return an unknown value and `assumedReturns` reports what they had to
+return.
+
+Limits and their defaults: `maxSteps` 100000 basic blocks, `timeoutMs` 30000,
+`maxPaths` 8. A run that hits one reports `stopReason` and where it stopped.
+angr interprets VEX in Python at roughly a thousand basic blocks a second, so
+for long concrete loops `ghidra_emulate_function` is the faster tool; this one
+is for calling things conveniently and for anything involving library calls or
+unknown inputs. Integer and pointer arguments only - no floating point.
+Architectures are those angr lifts (x86, x86-64, ARM, AArch64, MIPS, PowerPC);
+only x86-64 is covered by the regression test. Pass `arch` when the automatic
+choice is wrong.
+
+**Setup.** angr is not bundled; it runs in a Python of your choosing, in a
+helper process the extension starts on first use and keeps warm (one per
+program, stopped after ten idle minutes). angr pins a large dependency tree, so
+give it an environment of its own:
+
+```powershell
+.\tools\setup-angr.ps1                          # ~450 MB under ~/.decompfuncutils
+.\tools\setup-angr.ps1 -Path D:\tools\angr-venv  # somewhere with more room
+```
+
+(`tools/setup-angr.sh` on Linux/macOS.) The script records the interpreter in
+`~/.decompfuncutils/angr-python`, which the extension reads on the next call -
+no Ghidra restart. Alternatively set `DFU_ANGR_PYTHON`, or **Edit → Tool
+Options → MCP Server → angr Python Interpreter**, to any Python that can
+`import angr`. Without one, the tool's error says exactly this. Exported images
+go to the system temp directory; set `DFU_ANGR_TMP` to move them.
 
 ### Bounded symbolic path exploration
 

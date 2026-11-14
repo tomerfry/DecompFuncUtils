@@ -251,6 +251,11 @@ public class McpServerPlugin extends ProgramPlugin
             "Bearer token for authentication (leave empty to disable)");
         options.registerOption(OPTION_AUTO_START, DEFAULT_AUTO_START, null,
             "Automatically start the MCP server when a program is opened");
+        // Read by ghidra_angr_emulate on every call, so a change takes effect without a restart.
+        options.registerOption(AngrEmulateTool.OPTION_PYTHON, "", null,
+            "Python interpreter that can 'import angr', used by the ghidra_angr_emulate tool. Leave " +
+            "empty to use the environment created by tools/setup-angr.ps1 (or DFU_ANGR_PYTHON, or " +
+            "python on the PATH).");
 
         port = options.getInt(OPTION_PORT, DEFAULT_PORT);
         authToken = options.getString(OPTION_AUTH_TOKEN, DEFAULT_AUTH_TOKEN);
@@ -418,6 +423,7 @@ public class McpServerPlugin extends ProgramPlugin
 
         // Emulation
         toolRegistry.register(new EmulateFunctionTool(decompPool));
+        toolRegistry.register(new AngrEmulateTool());
         toolRegistry.register(new ExplorePathsTool());
 
         // Constraint / symbolic-lite analysis
