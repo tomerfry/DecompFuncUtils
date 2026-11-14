@@ -22,6 +22,8 @@ Requests:
   {"id": n, "op": "dbg_open", "imageDir": "...", "spec": {...}}      -> a live session
   {"id": n, "op": "dbg_step", "session": s, "kind": "into|over|out|continue", ...}
   {"id": n, "op": "dbg_state", "session": s}
+  {"id": n, "op": "dbg_seek", "session": s, "destinations": [...], "avoid": [...], "nonReach": [[lo, hi], ...]}
+  {"id": n, "op": "dbg_ledger", "session": s}                        -> the path's ledger
   {"id": n, "op": "dbg_edit", "session": s, "action": "concretize|symbolize|set|select|drop", ...}
   {"id": n, "op": "dbg_hooks", "session": s, "spec": {...}}          -> re-install hooks
   {"id": n, "op": "dbg_close", "session": s}
@@ -180,7 +182,7 @@ class ExternalStub(angr.SimProcedure):
     """
 
     # pylint: disable=arguments-differ
-    def run(self, *args, dfu_value=None, dfu_symbolic=False, dfu_noreturn=False):
+    def run(self, *args, dfu_value=None, dfu_symbolic=False, dfu_noreturn=False, dfu_what=None):
         bits = self.state.arch.bits
         if dfu_noreturn:
             self.exit(0)
@@ -188,24 +190,61 @@ class ExternalStub(angr.SimProcedure):
         if dfu_value is not None:
             return claripy.BVV(dfu_value & ((1 << bits) - 1), bits)
         if dfu_symbolic:
-            return fresh_symbol(self.state, str(self.display_name) + "_ret", bits, str(self.display_name))
+            # Code that is not there is not a reason to stop: its result stays unknown, and the
+            # ledger shows what the rest of the path then requires of it.
+            name = str(self.display_name)
+            return fresh_symbol(self.state, name + "_ret", bits, name,
+                                dfu_what or "%s() is not modelled; its return value is unknown" % name)
         return claripy.BVV(0, bits)
 
 
 _SYMBOL_COUNTER = itertools.count(1)
 
 
-def fresh_symbol(state, base, bits, origin=None):
+MAX_NOTES = 2000
+
+
+def note(state, entry):
+    """
+    Writes a line into the path's ledger: something that happened on the way which is not a
+    branch - an unknown value appearing, the user fixing one. It is filed under the point of the
+    path it happened at, so the ledger reads in order.
+    """
+    notes = state.globals.get("dfu_notes", ())
+    if len(notes) < MAX_NOTES:
+        state.globals["dfu_notes"] = notes + ((state.history.depth, entry),)
+
+
+def fresh_symbol(state, base, bits, origin=None, what=None, ledger=True):
     """
     A new unconstrained value with a name a person can type back (to concretize it), recorded on
     the state so results can say what value it had to take.
+
+    :param what: how it came to be, for the ledger ("daemonize() returned an unknown value")
     """
     name = "%s_%d" % (re.sub(r"[^A-Za-z0-9_]", "_", base), next(_SYMBOL_COUNTER))
     value = claripy.BVS(name, bits, explicit_name=True)
     assumed = state.globals.get("dfu_assumed", ())
     if len(assumed) < MAX_LOG_ENTRIES:
         state.globals["dfu_assumed"] = assumed + ((origin or name, value),)
+    if ledger:
+        entry = {"kind": "unknown", "symbol": name, "bits": bits,
+                 "text": what or "%s is an unknown value" % (origin or name)}
+        if origin:
+            entry["call"] = origin
+        site = state.globals.get("dfu_site")
+        if site is not None:
+            entry["at"] = "%#x" % site
+        note(state, entry)
     return value
+
+
+def expr_text(expr, limit=96):
+    """A condition or value the way a person would write it, cut to a readable length."""
+    text = re.sub(r"^<(BV\d+|Bool) ", "", str(expr))
+    if text.endswith(">"):
+        text = text[:-1]
+    return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
 class HookError(angr.errors.SimError):
@@ -278,10 +317,15 @@ class HookContext:
 
     def symbolic(self, name=None, bits=None):
         """A fresh unknown value; return it to make the result unconstrained."""
-        return fresh_symbol(self.state, name or (self.name + "_ret"), bits or self.arch.bits, self.name)
+        return fresh_symbol(self.state, name or (self.name + "_ret"), bits or self.arch.bits, self.name,
+                            "the Python hook '%s' produced an unknown value" % self.name)
 
     def constrain(self, *conditions):
         self.state.add_constraints(*conditions)
+        for condition in conditions:
+            note(self.state, {"kind": "constraint", "by": self.name, "condition": expr_text(condition, 220),
+                              "symbols": sorted(getattr(condition, "variables", ())),
+                              "text": "required by the Python hook '%s'" % self.name})
 
     # -- memory --
     def read(self, address, size):
@@ -1297,6 +1341,11 @@ class Call:
         except Exception:  # pylint: disable=broad-except
             out["stoppedAt"] = None
 
+        if outcome == "found" or (outcome == "returned" and self.spec.get("wantReturn") is not None):
+            try:
+                out["ledger"] = build_ledger(self, state)
+            except Exception as exc:  # pylint: disable=broad-except
+                out["ledgerError"] = "%s: %s" % (type(exc).__name__, exc)
         if outcome == "returned":
             out.pop("stoppedAt", None)
             loc = spec.get("ret")
@@ -1487,6 +1536,116 @@ class Call:
 
 
 # -------------------------------------------------------------------------------------------
+# The ledger: what a path required, in the order it required it
+# -------------------------------------------------------------------------------------------
+
+MAX_LEDGER_ENTRIES = 1000
+MAX_LEDGER_CONSTRAINTS = 200
+
+
+def build_ledger(call, state, extra_symbols=None):
+    """
+    The record of a path: every branch that depended on an unknown, with the condition under
+    which this path went the way it did, interleaved with the points where unknowns appeared (a
+    call into code that is not there returning one) and where someone fixed or changed a value.
+    Followed by what it all adds up to: for each unknown, the conditions on it and one value
+    that satisfies the whole path.
+    """
+    notes = list(state.globals.get("dfu_notes", ()))
+    entries = []
+    decisions = 0
+    index = 0
+    for node in state.history.lineage:
+        depth = node.depth
+        while index < len(notes) and notes[index][0] < depth:
+            entries.append(dict(notes[index][1]))
+            index += 1
+        guard = node.jump_guard
+        if guard is None or not getattr(guard, "symbolic", False):
+            continue
+        entry = {"kind": "branch", "condition": expr_text(guard, 220), "symbols": sorted(guard.variables)}
+        source = node.jump_source if node.jump_source is not None else node.addr
+        if source is not None:
+            entry["at"] = "%#x" % source
+        target = node.jump_target
+        if target is not None and not getattr(target, "symbolic", True):
+            entry["to"] = "%#x" % state.solver.eval(target)
+        entries.append(entry)
+        decisions += 1
+    for _depth, entry in notes[index:]:
+        entries.append(dict(entry))
+
+    out = {"decisions": decisions, "steps": state.history.depth}
+    if len(entries) > MAX_LEDGER_ENTRIES:
+        out["entriesOmitted"] = len(entries) - MAX_LEDGER_ENTRIES
+        entries = entries[-MAX_LEDGER_ENTRIES:]
+    for number, entry in enumerate(entries, 1):
+        entry["n"] = number
+    out["entries"] = entries
+
+    constraints = list(state.solver.constraints)
+    out["constraintCount"] = len(constraints)
+    out["constraints"] = [expr_text(c, 220) for c in constraints[:MAX_LEDGER_CONSTRAINTS]]
+
+    # Every unknown: where it came from, what the path requires of it, and a value that works.
+    table = {}
+    kinds = {}
+    for name, bv, kind in call.symbols:
+        table[name] = bv
+        kinds[name] = kind
+    origins = {}
+    for origin, bv in state.globals.get("dfu_assumed", ()):
+        for name in bv.variables:
+            table.setdefault(name, bv)
+            origins.setdefault(name, origin)
+    used = set()
+    for constraint in constraints:
+        used |= constraint.variables
+    for name, bv in call.external_symbols.items():
+        if name in used:
+            table.setdefault(name, bv)
+            origins.setdefault(name, "imported variable")
+    for name, bv in (extra_symbols or {}).items():
+        table.setdefault(name, bv)
+
+    model = state.copy()  # one assignment for all of them, not a value each in isolation
+    unknowns = []
+    for name, bv in list(table.items())[:96]:
+        row = {"name": name, "bits": bv.size()}
+        if name in origins:
+            row["from"] = origins[name]
+        elif name in kinds:
+            row["from"] = "input"
+        requires = [expr_text(c, 220) for c in constraints if name in c.variables]
+        if requires:
+            row["requires"] = requires[:12]
+            if len(requires) > 12:
+                row["requiresOmitted"] = len(requires) - 12
+        else:
+            row["free"] = True  # nothing on this path depends on it
+        try:
+            if kinds.get(name) == "bytes":
+                data = model.solver.eval(bv, cast_to=bytes)
+                row["value"] = data.hex()
+                nul = data.find(b"\0")
+                text = data if nul < 0 else data[:nul]
+                if text and printable(text):
+                    row["string"] = text_of(text)
+                model.add_constraints(bv == claripy.BVV(data))
+            else:
+                number = model.solver.eval(bv)
+                row["value"] = "%#x" % number
+                model.add_constraints(bv == number)
+            if bv.size() <= 512:
+                row["unique"] = len(state.solver.eval_upto(bv, 2)) == 1
+        except Exception as exc:  # pylint: disable=broad-except
+            row["error"] = "%s: %s" % (type(exc).__name__, exc)
+        unknowns.append(row)
+    out["unknowns"] = unknowns
+    return out
+
+
+# -------------------------------------------------------------------------------------------
 # Debug sessions: a live state that is stepped, inspected and edited between requests
 # -------------------------------------------------------------------------------------------
 
@@ -1524,6 +1683,9 @@ class DebugSession:
         self.shown = {}          # path -> {register: text}, to mark what the last step changed
         self.last_stop = "start"
         self.pending = None
+        self.search = None        # the open frontier of a seek, kept so it can be resumed
+        self.seek_report = None   # how the last seek went
+        self.unknown_call_addr = None
         self.stack_range = (self.arch.initial_sp - 0x800000, self.arch.initial_sp + PAGE)
 
     # ---- observation ----
@@ -1579,6 +1741,8 @@ class DebugSession:
         if kind not in ("into", "over", "out", "continue", "resume"):
             raise SpecError("unknown step kind %r" % kind)
         state = self.paths[pid]
+        self.search = None
+        self.seek_report = None
         start_depth = self.depth(state)
         done = 0
         phase = kind
@@ -1650,7 +1814,7 @@ class DebugSession:
                 stop = "fault"
                 break
             executed += ran
-            flat = list(successors.flat_successors)
+            flat = self.next_states(successors)
             if not flat:
                 if successors.unconstrained_successors:
                     info["status"] = "symbolic_jump"
@@ -1659,7 +1823,6 @@ class DebugSession:
                     info["status"] = "exited"
                     stop = "exited"
                 break
-            self.call.note_transfers(flat)
             state = flat[0]
             first = False
             if len(flat) > 1:
@@ -1713,6 +1876,195 @@ class DebugSession:
         self.last_stop = stop
         return stop
 
+    # ---- where a step leads ----
+
+    def next_states(self, successors):
+        """
+        The states a step produced, with calls and returns noted. A call whose target is itself
+        unknown (a function pointer nobody set) does not end the path: it is treated as a call
+        into code that is not there - skipped, with an unknown return value.
+        """
+        flat = list(successors.flat_successors)
+        self.call.note_transfers(flat)
+        for state in successors.unconstrained_successors:
+            if state.history.jumpkind == "Ijk_Call":
+                flat.extend(self.skip_unknown_call(state))
+        return flat
+
+    def skip_unknown_call(self, state):
+        if self.unknown_call_addr is None:
+            self.unknown_call_addr = self.project.loader.extern_object.allocate()
+        target = expr_text(state.regs.ip, 120)
+        self.call.note_transfers([state])  # a call: one level deeper, and where from
+        site = state.globals.get("dfu_site")
+        state.regs.ip = claripy.BVV(self.unknown_call_addr, self.arch.bits)
+        stub = ExternalStub(display_name="indirect_call", num_args=0, cc=self.image.cc, dfu_symbolic=True,
+                            dfu_what="a call through %s, which is unknown, was skipped; "
+                                     "its return value is unknown" % target)
+        try:
+            returned = list(self.project.factory.successors(state, procedure=stub).flat_successors)
+        except Exception:  # pylint: disable=broad-except
+            return []
+        self.call.note_transfers(returned)
+        for result in returned:
+            entry = {"call": "<unknown target>", "target": target, "returned": "<symbolic>",
+                     "depth": self.depth(result) + 1, "stubbed": True}
+            if site is not None:
+                entry["from"] = "%#x" % site
+            self.call.log(result, entry)
+        return returned
+
+    # ---- seeking a destination ----
+
+    def seek(self, destinations, avoid, non_reach, limit, deadline, max_live):
+        """
+        Explores from the current path until some path reaches a destination, and makes that
+        path the current one.
+
+        Unlike Continue, a branch on an unknown does not stop it: both sides are followed, and
+        so is every later fork, breadth first. Paths in blocks from which Ghidra's control-flow
+        graph says the destination cannot be reached are set aside and only taken up again when
+        nothing else is left, so the search leans toward the destination without ever ruling a
+        path out on the strength of static analysis alone.
+
+        A search that runs out of time or budget keeps its frontier; asking again resumes it.
+        """
+        pid = self.current
+        info = self.info[pid]
+        frontier = self.search
+        resumed = bool(frontier and frontier["anchor"] == pid and frontier["destinations"] == destinations
+                       and frontier["avoid"] == avoid)
+        self.pending = None
+        if not resumed:
+            if info["status"] != "paused":
+                raise SpecError("This path has finished (%s). Select another path or restart the session."
+                                % info["status"])
+            start = self.paths[pid]
+            if (start.addr & self.mask) in destinations:
+                raise SpecError("Execution is already at the destination. Step on from here, or set "
+                                "another destination.")
+            frontier = {"anchor": pid, "origin": pid, "destinations": destinations, "avoid": avoid,
+                        "active": [start], "deferred": [], "blocks": 0, "expanded": 0, "ended": {},
+                        "found": 0}
+        self.search = None
+        ranges = sorted(non_reach)
+        range_starts = [r[0] for r in ranges]
+
+        def cannot_reach(addr):
+            i = bisect.bisect_right(range_starts, addr) - 1
+            return i >= 0 and addr <= ranges[i][1]
+
+        def ended(kind):
+            frontier["ended"][kind] = frontier["ended"].get(kind, 0) + 1
+
+        stops = destinations | avoid
+        active = frontier["active"]
+        deferred = frontier["deferred"]
+        found = None
+        stop = None
+        budget = frontier["blocks"] + limit
+        while found is None:
+            if not active:
+                if not deferred:
+                    stop = "seek_exhausted"
+                    break
+                # Nothing promising is left: take up what static analysis had written off.
+                active.extend(deferred[:16])
+                del deferred[:16]
+            if frontier["blocks"] >= budget:
+                stop = "seek_budget"
+                break
+            if time.time() >= deadline:
+                stop = "timeout"
+                break
+            state = active.pop(0)
+            pc = state.addr
+            hooked = self.is_hook(state, pc)
+            size = None
+            ran = 1
+            if not hooked:
+                addrs = self.block_addrs(pc)
+                ran = max(1, len(addrs))
+                for i, addr in enumerate(addrs[1:], 1):
+                    if (addr & self.mask) in stops:
+                        size = ran = i  # the destination is inside this block: stop on it
+                        break
+            try:
+                successors = self.successors(state, size)
+            except Exception as exc:  # pylint: disable=broad-except
+                ended("faulted")
+                frontier["lastFault"] = "%s at %#x: %s" % (type(exc).__name__, pc, expr_text(exc, 120))
+                continue
+            frontier["blocks"] += ran
+            frontier["expanded"] += 1
+            self.executed += ran
+            following = self.next_states(successors)
+            if not following:
+                ended("symbolicJump" if successors.unconstrained_successors else "exited")
+                continue
+            for nxt in following:
+                try:
+                    addr = nxt.addr
+                except Exception:  # pylint: disable=broad-except
+                    ended("symbolicJump")
+                    continue
+                key = addr & self.mask
+                if found is None and key in destinations:
+                    found = nxt
+                elif key in avoid:
+                    ended("avoided")
+                elif addr == self.ret_addr:
+                    ended("returned")
+                elif cannot_reach(key):
+                    deferred.append(nxt)
+                else:
+                    active.append(nxt)
+            overflow = len(active) + len(deferred) - max_live
+            if overflow > 0:
+                # Bounded memory beats completeness; say so in the report.
+                dropped = min(overflow, len(deferred))
+                del deferred[len(deferred) - dropped:]
+                if overflow > dropped:
+                    del active[len(active) - (overflow - dropped):]
+                frontier["ended"]["dropped"] = frontier["ended"].get("dropped", 0) + overflow
+
+        if found is not None:
+            stop = "destination"
+            new_id = self.next_path
+            self.next_path += 1
+            found.globals["dbg_writes"] = ()
+            self.paths[new_id] = found
+            self.info[new_id] = {"status": "paused", "parent": frontier["origin"], "via": "seek"}
+            self.current = new_id
+            frontier["anchor"] = new_id  # asking again from here looks for another way in
+            frontier["found"] += 1
+        if stop != "seek_exhausted":
+            self.search = frontier
+        self.seek_report = {
+            "result": {"destination": "reached", "seek_exhausted": "unreachable", "seek_budget": "budget",
+                       "timeout": "timeout"}[stop],
+            "blocks": frontier["blocks"], "statesExpanded": frontier["expanded"],
+            "open": len(active) + len(deferred), "setAside": len(deferred),
+            "ended": dict(frontier["ended"]), "routesFound": frontier["found"],
+            "guided": bool(ranges), "from": frontier["origin"],
+        }
+        if frontier.get("lastFault"):
+            self.seek_report["lastFault"] = frontier["lastFault"]
+        self.last_stop = stop
+        return stop
+
+    def ledger(self):
+        state = self.paths[self.current]
+        self.call.state = state
+        out = build_ledger(self.call, state)
+        out["path"] = self.current
+        out["status"] = self.info[self.current]["status"]
+        try:
+            out["pc"] = "%#x" % state.addr
+        except Exception:  # pylint: disable=broad-except
+            out["pc"] = None
+        return out
+
     def successors(self, state, size):
         if size is None:
             return self.project.factory.successors(state)
@@ -1743,10 +2095,7 @@ class DebugSession:
 
     @staticmethod
     def expr_text(expr, limit=96):
-        text = re.sub(r"^<(BV\d+|Bool) ", "", str(expr))
-        if text.endswith(">"):
-            text = text[:-1]
-        return text if len(text) <= limit else text[:limit - 3] + "..."
+        return expr_text(expr, limit)
 
     def show(self, state, bv):
         """A value for display: concrete, or symbolic with what it is and a value it can take."""
@@ -1878,6 +2227,10 @@ class DebugSession:
                 rows.append(row)
             out["paths"] = rows
 
+        if self.seek_report is not None:
+            out["seek"] = self.seek_report
+        if info.get("via"):
+            out["via"] = info["via"]
         if info["status"] == "returned":
             loc = call.spec.get("ret")
             if loc and "reg" in loc:
@@ -2008,6 +2361,8 @@ class DebugSession:
 
     def edit(self, request):
         action = request.get("action")
+        self.search = None
+        self.seek_report = None
         if action == "select":
             pid = int(h(request.get("path")))
             if pid not in self.paths:
@@ -2034,7 +2389,10 @@ class DebugSession:
             if request.get("all"):
                 # One consistent model for everything: fix each unknown in turn.
                 for _name, bv in self.symbol_table(state).items():
-                    state.add_constraints(bv == state.solver.eval(bv))
+                    condition = bv == state.solver.eval(bv)
+                    state.add_constraints(condition)
+                    note(state, {"kind": "concretize", "condition": expr_text(condition, 220),
+                                 "symbols": sorted(bv.variables), "text": "fixed by hand (all at once)"})
                 return
             kind, where, bv = self.target(state, request)
             if not bv.symbolic and request.get("value") is None:
@@ -2049,6 +2407,8 @@ class DebugSession:
                     raise SpecError("It cannot be %#x on this path: that contradicts the conditions "
                                     "already taken to get here." % number)
                 state.add_constraints(condition)
+                note(state, {"kind": "concretize", "condition": expr_text(condition, 220),
+                             "symbols": sorted(bv.variables), "text": "fixed by hand"})
             elif state.solver.eval(bv) != number:
                 raise SpecError("It is already concrete (%#x). Use 'set' to overwrite a value."
                                 % state.solver.eval(bv))
@@ -2061,11 +2421,14 @@ class DebugSession:
             label = str(request.get("name") or (where if kind == "reg" else "mem_%x" % where[0]))
             label = re.sub(r"[^A-Za-z0-9_]", "_", label)
             if label in self.symbol_table(state):
-                value = fresh_symbol(state, label, bv.size(), label)
+                value = fresh_symbol(state, label, bv.size(), label, ledger=False)
             else:
                 value = claripy.BVS(label, bv.size(), explicit_name=True)
                 state.globals["dfu_assumed"] = state.globals.get("dfu_assumed", ()) + ((label, value),)
             self.store(state, kind, where, value)
+            holder = where if kind == "reg" else "%d bytes at %#x" % (where[1], where[0])
+            note(state, {"kind": "symbolize", "symbol": next(iter(value.variables)), "bits": bv.size(),
+                         "text": "%s was made unknown by hand" % holder})
         elif action == "set":
             kind, where, bv = self.target(state, request)
             if kind == "sym":
@@ -2074,6 +2437,9 @@ class DebugSession:
                 raise SpecError("'set' needs a value")
             value = self.call.scalar(request["value"], bv.size(), "value")
             self.store(state, kind, where, Call.fit(value, bv.size()))
+            holder = where if kind == "reg" else "%d bytes at %#x" % (where[1], where[0])
+            note(state, {"kind": "set", "text": "%s was set to %s by hand"
+                                               % (holder, expr_text(Call.fit(value, bv.size()), 80))})
         else:
             raise SpecError("unknown edit action %r" % action)
 
@@ -2116,6 +2482,17 @@ def handle_debug(op, request):
         run_to = h(request["runTo"]) if request.get("runTo") is not None else None
         session.advance(request.get("kind", "into"), max(1, int(request.get("count") or 1)),
                         int(request.get("maxSteps") or 1000000), deadline, run_to)
+    elif op == "dbg_seek":
+        destinations = {h(a) & session.mask for a in request.get("destinations") or []}
+        if not destinations:
+            raise SpecError("no destination is set")
+        avoid = {h(a) & session.mask for a in request.get("avoid") or []}
+        non_reach = [(h(lo), h(hi)) for lo, hi in request.get("nonReach") or []]
+        deadline = time.time() + int(request.get("timeoutMs") or 2000) / 1000.0
+        session.seek(destinations, avoid, non_reach, int(request.get("maxSteps") or 2000000), deadline,
+                     int(request.get("maxLive") or 512))
+    elif op == "dbg_ledger":
+        return session.ledger()
     elif op == "dbg_edit":
         session.edit(request)
     elif op == "dbg_hooks":

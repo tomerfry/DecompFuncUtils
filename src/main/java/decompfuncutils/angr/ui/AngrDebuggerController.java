@@ -45,6 +45,12 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
         /** The interpreter set in Tool Options, or null. */
         String configuredPython();
+
+        /**
+         * Whether anyone is looking at the Ledger. Reading it asks the solver about every
+         * unknown, so it is kept up to date only while it is on screen.
+         */
+        boolean ledgerVisible();
     }
 
     /** A step from the panel may run until the user pauses it. */
@@ -146,6 +152,12 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
         Program program = programSupplier.get();
         AngrDebugSession session = program == null ? null : AngrDebugger.session(program);
         panel.showState(session == null ? null : session.snapshot(), session != null && session.isRunning());
+        Address destination = program == null ? null : AngrDebugger.destination(program);
+        panel.showDestination(destination == null ? null
+            : AngrCallSpec.codeLabel(program, AngrImage.hex(destination.getOffset())));
+        if (session == null) {
+            panel.showLedger(null);
+        }
         if (program != null) {
             host.positionChanged(program, session);
         }
@@ -261,12 +273,56 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     @Override
     public void step(String kind) {
-        background(program -> session(program).step(kind, 1, null, RUN_BUDGET_MILLIS, TaskMonitor.DUMMY));
+        background(program -> {
+            session(program).step(kind, 1, null, RUN_BUDGET_MILLIS, TaskMonitor.DUMMY);
+            ledger(program, false);
+        });
+    }
+
+    // ---- the destination and the ledger ----
+
+    /** @param address the new destination, or null for none */
+    public void setDestination(Program program, Address address) {
+        AngrDebugger.setDestination(program, address);
+    }
+
+    @Override
+    public void seek() {
+        background(program -> {
+            session(program).seek(List.of(), true, RUN_BUDGET_MILLIS, TaskMonitor.DUMMY);
+            ledger(program, true);
+        });
+    }
+
+    @Override
+    public void refreshLedger() {
+        background(program -> ledger(program, true));
+    }
+
+    @Override
+    public String ledgerMarkdown() {
+        Program program = programSupplier.get();
+        AngrDebugSession session = program == null ? null : AngrDebugger.session(program);
+        return session == null || session.lastLedger() == null ? null
+            : decompfuncutils.angr.AngrLedger.toMarkdown(session.lastLedger());
+    }
+
+    /** Reads the current path's ledger and shows it; unless forced, only while it is on screen. */
+    private void ledger(Program program, boolean force) throws Exception {
+        AngrDebugSession session = AngrDebugger.session(program);
+        if (session == null || session.isRunning() || !(force || host.ledgerVisible())) {
+            return;
+        }
+        Map<String, Object> ledger = session.ledger(TaskMonitor.DUMMY);
+        SwingUtilities.invokeLater(() -> panel.showLedger(ledger));
     }
 
     /** Runs to an address once, as "Run to Cursor" does. */
     public void runTo(Address address) {
-        background(program -> session(program).step("continue", 1, address, RUN_BUDGET_MILLIS, TaskMonitor.DUMMY));
+        background(program -> {
+            session(program).step("continue", 1, address, RUN_BUDGET_MILLIS, TaskMonitor.DUMMY);
+            ledger(program, false);
+        });
     }
 
     @Override
@@ -294,7 +350,10 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
     // ---- paths, symbols, values ----
 
     private void edit(Map<String, Object> action) {
-        background(program -> session(program).edit(action, TaskMonitor.DUMMY));
+        background(program -> {
+            session(program).edit(action, TaskMonitor.DUMMY);
+            ledger(program, false);
+        });
     }
 
     @Override

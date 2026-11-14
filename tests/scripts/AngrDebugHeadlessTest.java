@@ -234,13 +234,16 @@ public class AngrDebugHeadlessTest extends GhidraScript {
         s = dbg("step_into");
         check("the session is still steppable afterwards", num(s.get("instructions")) == before + 1, s);
 
+        destinations();
+
         // --- hooks: the import list, templates, saving, effect, reload, removal ---
         Map<String, Object> imports = hook("imports");
         String importText = String.valueOf(imports.get("imports"));
         check("imports says how each one is handled",
             importText.contains("name=mystery_device_read") && importText.contains("handledBy=stub")
                 && importText.contains("handledBy=angr model"), imports);
-        check("stubs are counted", num(imports.get("stubbed")) == 1, imports.get("stubbed"));
+        check("stubs are counted (mystery_device_read, cfg_mode, cfg_level)", num(imports.get("stubbed")) == 3,
+            imports.get("stubbed"));
 
         Map<String, Object> template = hook("template", "target", "mystery_device_read");
         check("a template is offered", String.valueOf(template.get("code")).contains("def hook(ctx"),
@@ -308,6 +311,130 @@ public class AngrDebugHeadlessTest extends GhidraScript {
         check("stopping twice is harmless", "no_session".equals(dbg("stop").get("status")), null);
         AngrDebugSession gone = AngrDebugger.session(currentProgram);
         check("no session is left behind", gone == null, gone);
+    }
+
+    /** A destination to get to, the search for a way there, and the ledger of what it took. */
+    @SuppressWarnings("unchecked")
+    private void destinations() throws Exception {
+        check("seek without a destination is explained",
+            dbgError("seek").contains("No destination is set") || dbgError("seek").contains("No debug session"),
+            dbgError("seek"));
+        Map<String, Object> set = dbg("set_destination", "address", "unlock");
+        check("a destination is set by function name", String.valueOf(set.get("destination")).contains("(unlock)"), set);
+
+        // gate() reaches unlock() only if cfg_mode() == 2, cfg_level() >= 10 and key*3 + level == 100,
+        // where both functions are imports nothing models.
+        dbg("start", "function", "gate", "args", List.of(Map.of("symbolicInt", 32.0, "name", "key")));
+        Map<String, Object> s = dbg("seek");
+        println("SEEK " + s);
+        Map<String, Object> seek = (Map<String, Object>) s.getOrDefault("seek", Map.of());
+        check("seek arrives at the destination", "destination".equals(s.get("stop"))
+            && "unlock".equals(s.get("location")) && "reached".equals(seek.get("result")), s);
+        check("the search was guided by Ghidra's control-flow graph", Boolean.TRUE.equals(seek.get("guided"))
+            && String.valueOf(s.get("seekGuide")).contains("control-flow graph"), s.get("seekGuide"));
+        check("arriving is explained", String.valueOf(s.get("hint")).contains("Reached the destination"), s.get("hint"));
+        check("the path it took became the current one, the start is kept",
+            num(s.get("path")) != 0 && ((List<?>) s.getOrDefault("paths", List.of())).size() == 2, s.get("paths"));
+
+        Map<String, Object> ledger = (Map<String, Object>) s.getOrDefault("ledger", Map.of());
+        List<Map<String, Object>> entries = (List<Map<String, Object>>) ledger.getOrDefault("entries", List.of());
+        List<String> kinds = new ArrayList<>();
+        for (Map<String, Object> entry : entries) {
+            kinds.add(String.valueOf(entry.get("kind")));
+        }
+        check("the ledger records the way in order: unknown, branch, unknown, branch, branch",
+            kinds.equals(List.of("unknown", "branch", "unknown", "branch", "branch")), kinds);
+        check("a call into code that is not there is kept symbolic and noted",
+            entries.size() == 5 && String.valueOf(entries.get(0).get("text")).contains("cfg_mode() is not modelled")
+                && String.valueOf(entries.get(0).get("symbol")).startsWith("cfg_mode_ret"), entries);
+        check("each branch carries the condition this path took",
+            entries.size() == 5 && String.valueOf(entries.get(1).get("condition")).contains("== 0x2")
+                && String.valueOf(entries.get(4).get("condition")).contains("key"), entries);
+        check("ledger addresses carry Ghidra's names", entries.size() == 5
+            && String.valueOf(entries.get(1).get("where")).startsWith("gate+"), entries);
+        check("it counts the decisions and the constraints", num(ledger.get("decisions")) == 3
+            && num(ledger.get("constraintCount")) == 3, ledger.get("decisions") + " / " + ledger.get("constraintCount"));
+
+        Map<String, Long> values = new HashMap<>();
+        Map<String, String> requires = new HashMap<>();
+        for (Map<String, Object> unknown : (List<Map<String, Object>>) ledger.getOrDefault("unknowns", List.of())) {
+            String name = String.valueOf(unknown.get("name"));
+            String key = name.startsWith("cfg_mode") ? "mode" : name.startsWith("cfg_level") ? "level" : name;
+            values.put(key, Long.decode(String.valueOf(unknown.get("value"))));
+            requires.put(key, String.valueOf(unknown.get("requires")));
+        }
+        check("the ledger states what the path requires of the unknown return value",
+            String.valueOf(requires.get("mode")).contains("== 0x2")
+                && String.valueOf(requires.get("level")).contains(">=s 0xa"), requires);
+        boolean satisfies = values.size() == 3 && (int) (long) values.get("mode") == 2
+            && (int) (long) values.get("level") >= 10
+            && (int) (values.get("key") * 3 + values.get("level")) == 100;
+        check("the values it gives satisfy the whole path together", satisfies, values);
+
+        Object markdown = debug.execute(args("action", "ledger", "format", "markdown"), currentProgram, null);
+        check("the ledger can be had as a Markdown document", markdown instanceof String text
+            && text.contains("## On the way") && text.contains("cfg_mode_ret")
+            && text.contains("What the path requires of each unknown") && text.contains("reached"), markdown);
+
+        s = dbg("continue");
+        check("stepping on from the destination works", "returned".equals(s.get("status"))
+            && num(ret(s).get("signed")) == 1, s);
+
+        // With the argument fixed, the unknown has to make up for it: 5*3 + level == 100.
+        dbg("start", "function", "gate", "args", List.of(5.0));
+        s = dbg("seek");
+        String fixed = String.valueOf(((Map<String, Object>) s.getOrDefault("ledger", Map.of())).get("unknowns"));
+        check("with a concrete argument the unknown is solved for", "destination".equals(s.get("stop"))
+            && fixed.contains("value=0x55"), fixed);
+
+        // A call through a pointer nobody set: the target itself is unknown.
+        dbg("start", "function", "via_callback", "args", List.of(3.0));
+        s = dbg("seek");
+        String callbackLedger = String.valueOf(s.get("ledger"));
+        check("a call to an unknown target is skipped, not a dead end", "destination".equals(s.get("stop")), s);
+        check("and its return value is constrained in the ledger",
+            callbackLedger.contains("a call through") && callbackLedger.contains("indirect_call_ret")
+                && callbackLedger.contains("== 0x7"), callbackLedger);
+
+        // Nowhere to go: classify() never calls unlock().
+        dbg("start", "function", "classify", "args", List.of(Map.of("symbolicInt", 32.0, "name", "v")));
+        s = dbg("seek");
+        check("an unreachable destination is reported as such", "seek_exhausted".equals(s.get("stop"))
+            && "unreachable".equals(((Map<String, Object>) s.get("seek")).get("result"))
+            && String.valueOf(s.get("hint")).contains("none reaches"), s);
+        check("and says how the paths ended", String.valueOf(((Map<String, Object>) s.get("seek")).get("ended"))
+            .contains("returned=3"), s.get("seek"));
+
+        // A search that cannot finish stops on time, keeps what it explored, and resumes.
+        dbg("start", "function", "spin", "args", List.of(1.0));
+        s = dbg("seek", "timeoutMs", 600.0);
+        long explored = num(((Map<String, Object>) s.getOrDefault("seek", Map.of())).get("blocks"));
+        check("seek honours timeoutMs", "timeout".equals(s.get("stop")) && "paused".equals(s.get("status"))
+            && explored > 10, s);
+        s = dbg("seek", "timeoutMs", 400.0);
+        check("seeking again resumes the same search",
+            num(((Map<String, Object>) s.getOrDefault("seek", Map.of())).get("blocks")) > explored, s.get("seek"));
+
+        // The ledger is kept while stepping by hand too, and records what was fixed by hand.
+        dbg("clear_destination");
+        dbg("start", "function", "needs_device", "args", List.of());
+        s = dbg("continue");
+        String symbol = String.valueOf(((List<Map<String, Object>>) s.get("symbols")).get(0).get("name"));
+        dbg("concretize", "symbol", symbol);
+        Map<String, Object> byHand = dbg("ledger");
+        String handKinds = String.valueOf(byHand.get("entries"));
+        check("stepping by hand keeps a ledger: the unknown, the branch, the fix",
+            handKinds.contains("kind=unknown") && handKinds.contains("kind=branch")
+                && handKinds.contains("fixed by hand"), handKinds);
+        check("with no destination the ledger says nothing of one", byHand.get("destination") == null, byHand);
+
+        // The one-shot emulator's 'find' carries the ledger as well.
+        Map<String, Object> found = (Map<String, Object>) emulate.execute(args("function", "gate",
+            "args", List.of(Map.of("symbolicInt", 32.0, "name", "key")), "find", List.of("unlock"),
+            "symbolic", true), currentProgram, null);
+        check("ghidra_angr_emulate find returns the ledger of the path it found",
+            "found".equals(found.get("outcome")) && found.get("ledger") instanceof Map<?, ?> m
+                && ((List<?>) m.get("entries")).size() == 5, found.get("ledger"));
     }
 
     @SuppressWarnings("unchecked")

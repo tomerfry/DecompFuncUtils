@@ -68,11 +68,13 @@ public class AngrDebuggerPlugin extends ProgramPlugin
     private static final String MENU = "angr";
     private static final String PC_MARKERS = "angr Debugger PC";
     private static final String BREAKPOINT_MARKERS = "angr Debugger Breakpoints";
+    private static final String DESTINATION_MARKERS = "angr Debugger Destination";
 
     private final AngrDebuggerController controller;
     private final Map<String, ViewProvider> providers = new LinkedHashMap<>();
     private final Map<Program, MarkerSet> pcMarkers = new HashMap<>();
     private final Map<Program, MarkerSet> breakpointMarkers = new HashMap<>();
+    private final Map<Program, MarkerSet> destinationMarkers = new HashMap<>();
     private final List<DockingAction> actions = new ArrayList<>();
     private ToggleDockingAction followAction;
     private Address lastShown;
@@ -89,7 +91,7 @@ public class AngrDebuggerPlugin extends ProgramPlugin
         provider("Registers", panel.view("Registers"), WindowPosition.RIGHT, "angr.state", WindowPosition.STACK);
         provider("Stack", panel.view("Stack"), WindowPosition.RIGHT, "angr.state", WindowPosition.BOTTOM);
         provider("Calls", panel.view("Calls"), WindowPosition.BOTTOM, "angr.trace", WindowPosition.STACK);
-        for (String view : List.of("Memory", "Output", "Paths", "Symbols", "Imports & Hooks")) {
+        for (String view : List.of("Memory", "Output", "Paths", "Symbols", "Ledger", "Imports & Hooks")) {
             provider(view, panel.view(view), WindowPosition.BOTTOM, "angr.trace", WindowPosition.STACK);
         }
         createActions();
@@ -258,6 +260,51 @@ public class AngrDebuggerPlugin extends ProgramPlugin
         toggleBreakpoint.setPopupMenuData(
             new MenuData(new String[] { "angr Debugger", "Toggle Breakpoint" }, null, "angr"));
 
+        DockingAction seek = new DockingAction("angr Seek Destination", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                controller.seek();
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                return steppable() && AngrDebugger.destination(getCurrentProgram()) != null;
+            }
+        };
+        seek.setKeyBindingData(new KeyBindingData(KeyEvent.VK_F9, 0));
+        menu(seek, "Seek Destination", "1",
+            "Find a way to the destination through every branch on an unknown, and record it in the Ledger");
+
+        DockingAction setDestination = new DockingAction("angr Set Destination", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                controller.setDestination(getCurrentProgram(), addressOf(context));
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                Address address = addressOf(context);
+                return address != null && address.isMemoryAddress();
+            }
+        };
+        menu(setDestination, "Set Destination at Cursor", "3",
+            "Make the address at the cursor the place Seek Destination tries to get to");
+        setDestination.setPopupMenuData(
+            new MenuData(new String[] { "angr Debugger", "Set Destination" }, null, "angr"));
+
+        DockingAction clearDestination = new DockingAction("angr Clear Destination", getName()) {
+            @Override
+            public void actionPerformed(ActionContext context) {
+                controller.setDestination(getCurrentProgram(), null);
+            }
+
+            @Override
+            public boolean isEnabledForContext(ActionContext context) {
+                return getCurrentProgram() != null && AngrDebugger.destination(getCurrentProgram()) != null;
+            }
+        };
+        menu(clearDestination, "Clear Destination", "3", "Have no destination");
+
         DockingAction clearBreakpoints = new DockingAction("angr Clear Breakpoints", getName()) {
             @Override
             public void actionPerformed(ActionContext context) {
@@ -343,6 +390,12 @@ public class AngrDebuggerPlugin extends ProgramPlugin
     }
 
     @Override
+    public boolean ledgerVisible() {
+        ViewProvider ledger = providers.get("Ledger");
+        return ledger != null && ledger.isVisible() && ledger.getComponent().isShowing();
+    }
+
+    @Override
     public void positionChanged(Program program, AngrDebugSession session) {
         if (program.isClosed()) {
             return;
@@ -356,6 +409,14 @@ public class AngrDebuggerPlugin extends ProgramPlugin
             breakpoints.clearAll();
             for (Address address : AngrDebugger.breakpoints(program)) {
                 breakpoints.add(address);
+            }
+            MarkerSet destinations = destinationMarkers.computeIfAbsent(program, p ->
+                markers.createPointMarker(DESTINATION_MARKERS, "Where the angr Debugger is trying to get to", p,
+                    MarkerService.BREAKPOINT_PRIORITY + 2, true, true, true, destinationColor(), destinationIcon()));
+            destinations.clearAll();
+            Address destination = AngrDebugger.destination(program);
+            if (destination != null && program.getMemory().contains(destination)) {
+                destinations.add(destination);
             }
             MarkerSet pc = pcMarkers.computeIfAbsent(program, p ->
                 markers.createPointMarker(PC_MARKERS, "Where the angr Debugger is stopped", p,
@@ -373,9 +434,10 @@ public class AngrDebuggerPlugin extends ProgramPlugin
         tool.contextChanged(providers.get(CONTROL_VIEW));
     }
 
-    /** The marker sets, by kind ("pc" or "breakpoints"); for the tool preview and tests. */
+    /** The marker sets, by kind ("pc", "breakpoints" or "destination"); for the tool preview and tests. */
     public MarkerSet markers(Program program, String kind) {
-        return "pc".equals(kind) ? pcMarkers.get(program) : breakpointMarkers.get(program);
+        return "pc".equals(kind) ? pcMarkers.get(program)
+            : "destination".equals(kind) ? destinationMarkers.get(program) : breakpointMarkers.get(program);
     }
 
     // ---- program lifecycle ----
@@ -403,7 +465,11 @@ public class AngrDebuggerPlugin extends ProgramPlugin
         MarkerService markers = tool.getService(MarkerService.class);
         MarkerSet pc = pcMarkers.remove(program);
         MarkerSet breakpoints = breakpointMarkers.remove(program);
+        MarkerSet destinations = destinationMarkers.remove(program);
         if (markers != null) {
+            if (destinations != null) {
+                markers.removeMarker(destinations, program);
+            }
             if (pc != null) {
                 markers.removeMarker(pc, program);
             }
@@ -442,6 +508,23 @@ public class AngrDebuggerPlugin extends ProgramPlugin
 
     private static Color breakpointColor() {
         return darkTheme() ? new Color(0x6B2D2D) : new Color(0xF6CFCB);
+    }
+
+    private static Color destinationColor() {
+        return darkTheme() ? new Color(0x2C4A73) : new Color(0xCFE0F7);
+    }
+
+    /** A flag: somewhere to get to. */
+    private static Icon destinationIcon() {
+        BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = image.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setColor(new Color(0x1E5FB4));
+        g.setStroke(new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        g.drawLine(4, 2, 4, 14);
+        g.fillPolygon(new int[] { 5, 13, 5 }, new int[] { 2, 5, 9 }, 3);
+        g.dispose();
+        return new ImageIcon(image);
     }
 
     private static Icon pcIcon() {

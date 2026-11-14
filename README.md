@@ -694,7 +694,7 @@ brings it back). It is also listed under Tools → Import Default Tools.
 The window is laid out for debugging: the control strip across the top, the
 Symbol Tree, Listing and Decompiler in the middle with **Registers** and
 **Stack** beside them, and **Calls / Memory / Output / Paths / Symbols /
-Imports & Hooks** as tabs along the bottom. Everything is an ordinary Ghidra
+Ledger / Imports & Hooks** as tabs along the bottom. Everything is an ordinary Ghidra
 window, so it can be moved, stacked, closed and reopened from the Window menu,
 and the rest of Ghidra (renaming, retyping, comments, search) works as usual
 while you debug.
@@ -705,7 +705,8 @@ while you debug.
   function in.
 - **Step.** The buttons in the control strip, the **angr** menu, or the keys
   Ghidra's own Debugger uses: **F5** Continue, **F8** Step Into, **F10** Step
-  Over, **F12** Step Out. **Pause** interrupts a run; **Stop** ends the session.
+  Over, **F12** Step Out, **F9** Seek Destination. **Pause** interrupts a run;
+  **Stop** ends the session.
 - **The banner** says in a sentence what just happened and what to do about it.
   Refusals ("that value contradicts the path") appear there, not in dialogs.
 - **In the Listing** the current instruction is marked and followed, and
@@ -727,8 +728,9 @@ any other tool through File → Configure.
 **Over MCP**, `ghidra_angr_debug` takes an `action`: `start` (with `function`
 and `args` exactly as `ghidra_angr_emulate` takes them), `step_into`,
 `step_over`, `step_out`, `continue`, `run_to`, `add_breakpoint`,
-`remove_breakpoint`, `clear_breakpoints`, `state`, `select_path`, `drop_path`,
-`concretize`, `symbolize`, `set`, `reload_hooks`, `stop`. Each response gives
+`remove_breakpoint`, `clear_breakpoints`, `set_destination`, `clear_destination`,
+`seek`, `ledger`, `state`, `select_path`, `drop_path`, `concretize`, `symbolize`,
+`set`, `reload_hooks`, `stop`. Each response gives
 where execution is, why it stopped, the registers that changed, new calls and
 memory writes, and a `hint` when there is a decision to make; `detail: "full"`
 adds every register and the stack.
@@ -786,6 +788,63 @@ The reverse is **symbolize** (right-click a register → Make Symbolic, or
 to see what the code does with every value of it. `set` simply overwrites a
 register or memory - with a number, or with `"text"` / `{"buffer": 64}` to point
 it at fresh memory.
+
+#### Getting to a destination, and the ledger
+
+A breakpoint is somewhere to stop if execution happens to arrive. A
+**destination** is somewhere to arrive: you say where, and the debugger looks
+for the way.
+
+![Seeking a destination: the path taken, written down in the Ledger](docs/angr-debugger-destination.png)
+
+Right-click an instruction → **angr Debugger → Set Destination** (it gets a flag
+marker in the Listing), start a session, and press **Seek Destination** (F9).
+Where Continue stops at the first branch on an unknown value and asks you to
+choose, Seek follows *every* side of every such branch until one path arrives,
+and makes that path the current one - the Listing is at the destination, the
+registers and stack are that path's.
+
+- **Guided by Ghidra.** Before searching, Ghidra's call graph and control-flow
+  graph are read backwards from the destination: which functions lead to it, and
+  in each of them which blocks cannot. Paths in those blocks are set aside and
+  taken up again only when nothing else is left, so the search leans toward the
+  destination without static analysis ever ruling a path out.
+- **Code that is not there does not stop it.** A call into an import nothing
+  models returns an unknown value and execution carries on; so does a call
+  through a pointer that is itself unknown (a callback nobody set), which is
+  skipped the same way. What the rest of the path then demands of that return
+  value is what the ledger records.
+- **It can be interrupted and resumed.** Pause it, or let its time run out:
+  what it explored is kept, and seeking again carries on. Seeking again after
+  arriving looks for *another* way in. When every path has been followed to its
+  end and none arrives, it says so, and how they ended.
+
+The **Ledger** is the record of the path, in order:
+
+| # | Where | What | Condition |
+|---|---|---|---|
+| 1 | `gate+0xb` | `cfg_mode()` is not modelled; its return value is unknown: `cfg_mode_ret_1` | |
+| 2 | `gate+0x17` | branch to `gate+0x22` | `cfg_mode_ret_1[31:0] == 0x2` |
+| 3 | `gate+0x22` | `cfg_level()` is not modelled; its return value is unknown: `cfg_level_ret_2` | |
+| 4 | `gate+0x2e` | branch to `gate+0x39` | `cfg_level_ret_2[31:0] >=s 0xa` |
+| 5 | `gate+0x43` | branch to `gate+0x4e` | `key * 0x3 + cfg_level_ret_2[31:0] == 0x64` |
+
+and under it, for every unknown, **what the path requires of it** and one value
+that works - the values are a single assignment that satisfies the whole path
+together (`key = 0x1e`, `cfg_level` returns `0xa`, `cfg_mode` returns `0x2`), not
+a value each in isolation. Values fixed or changed by hand (Concretize, Make
+Symbolic, Set Value) and constraints a Python hook added appear in the ledger at
+the point they happened.
+
+The ledger is not only for seeking: it is kept for every path, however it was
+driven, and the Ledger window follows the current path while it is open.
+**Copy Ledger** and **Save Ledger...** write it out as a Markdown document.
+
+Over MCP: `set_destination` (an address or a function name), `seek` (with
+`timeoutMs`, `avoid: [...]` to rule addresses out, `guided: false` to search
+blind), and `ledger` (`format: "markdown"` for the document). The `seek`
+response carries the ledger of the path it found, and `ghidra_angr_emulate`'s
+`find` returns one as well.
 
 #### Python hooks
 

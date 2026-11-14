@@ -39,6 +39,9 @@ public final class AngrDebugSession {
     private final List<Map<String, Object>> watches = new ArrayList<>();
 
     private volatile Map<String, Object> snapshot;
+    private volatile Map<String, Object> lastLedger;
+    private AngrReach reach;
+    private Address reachFor;
     private volatile boolean running;
     private volatile boolean pauseRequested;
     private volatile boolean closed;
@@ -182,6 +185,142 @@ public final class AngrDebugSession {
     /** Asks a run in progress to stop at the next slice boundary. */
     public void requestPause() {
         pauseRequested = true;
+    }
+
+    // ---- seeking the destination ----
+
+    /**
+     * Looks for a way from the current path to the program's destination
+     * ({@link AngrDebugger#destination}) and, when it finds one, makes that path the current one
+     * and reads its ledger.
+     *
+     * <p>Unlike {@link #step}, forks do not stop it: every side of every branch on an unknown is
+     * followed. With {@code guided}, Ghidra's control-flow graph tells the search which blocks
+     * cannot lead to the destination, and those are tried last. A search that runs out of time
+     * keeps what it has explored; calling again resumes it, and calling again after it arrived
+     * looks for another way in.
+     *
+     * @param avoid addresses no path may pass through
+     */
+    public synchronized Map<String, Object> seek(List<Address> avoid, boolean guided, long budgetMillis,
+            TaskMonitor monitor) throws Exception {
+        ensureOpen();
+        Address destination = AngrDebugger.destination(program);
+        if (destination == null) {
+            throw new IllegalStateException("No destination is set. Set one first: an address or a function "
+                + "to get to.");
+        }
+        running = true;
+        pauseRequested = false;
+        AngrDebugger.fire(program);
+        try {
+            AngrReach guide = null;
+            if (guided) {
+                if (!destination.equals(reachFor)) {
+                    monitor.setMessage("Reading the control-flow graph towards the destination");
+                    reach = AngrReach.compute(program, call.function, destination, monitor);
+                    reachFor = destination;
+                }
+                guide = reach;
+            }
+            List<List<String>> nonReach = new ArrayList<>();
+            if (guide != null) {
+                for (long[] range : guide.nonReach) {
+                    nonReach.add(List.of(AngrImage.hex(range[0]), AngrImage.hex(range[1])));
+                }
+            }
+            List<String> avoided = new ArrayList<>();
+            for (Address address : avoid) {
+                avoided.add(AngrImage.hex(address.getOffset()));
+            }
+            long deadline = System.currentTimeMillis() + budgetMillis;
+            Map<String, Object> result;
+            while (true) {
+                long slice = Math.max(50, Math.min(SLICE_MILLIS, deadline - System.currentTimeMillis()));
+                Map<String, Object> request = base("dbg_seek");
+                request.put("destinations", List.of(AngrImage.hex(destination.getOffset())));
+                request.put("avoid", avoided);
+                request.put("nonReach", nonReach);
+                request.put("timeoutMs", slice);
+                result = send(request, slice + QUICK_MILLIS, monitor);
+                if (!"timeout".equals(result.get("stop"))) {
+                    break;
+                }
+                if (pauseRequested) {
+                    result.put("stop", "paused");
+                    break;
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    break;
+                }
+            }
+            if (guide != null) {
+                result.put("seekGuide", guide.describe());
+            }
+            if ("destination".equals(result.get("stop"))) {
+                result.put("ledger", fetchLedger(monitor));
+            }
+            return snapshot;
+        }
+        finally {
+            running = false;
+            AngrDebugger.fire(program);
+        }
+    }
+
+    /**
+     * The current path's ledger: every branch that depended on an unknown with the condition
+     * this path took, the points where unknowns appeared and where values were fixed by hand,
+     * and what all of that requires of each unknown. Addresses carry Ghidra's names.
+     */
+    public synchronized Map<String, Object> ledger(TaskMonitor monitor) throws Exception {
+        ensureOpen();
+        return fetchLedger(monitor);
+    }
+
+    /** The ledger as last read, or null. */
+    public Map<String, Object> lastLedger() {
+        return lastLedger;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> fetchLedger(TaskMonitor monitor) throws Exception {
+        Map<String, Object> ledger = GSON.fromJson(
+            AngrWorkers.resultOf(worker.request(base("dbg_ledger"), QUICK_MILLIS, monitor)), Map.class);
+        AngrCallSpec.tidyNumbers(ledger);
+        ledger.put("function", call.title);
+        ledger.put("program", program.getName());
+        if (ledger.get("pc") instanceof String pc) {
+            String label = label(pc);
+            if (label != null) {
+                ledger.put("location", label);
+            }
+        }
+        Address destination = AngrDebugger.destination(program);
+        if (destination != null) {
+            String hex = AngrImage.hex(destination.getOffset());
+            String label = label(hex);
+            ledger.put("destination", label == null ? hex : hex + " (" + label + ")");
+            ledger.put("atDestination", destination.equals(address(ledger.get("pc"))));
+        }
+        if (ledger.get("entries") instanceof List<?> entries) {
+            for (Object o : entries) {
+                if (!(o instanceof Map<?, ?> m)) {
+                    continue;
+                }
+                Map<String, Object> entry = (Map<String, Object>) m;
+                if (entry.get("at") instanceof String at) {
+                    String label = label(at);
+                    entry.put("where", label == null ? at : label);
+                }
+                if (entry.get("to") instanceof String to) {
+                    String label = label(to);
+                    entry.put("toWhere", label == null ? to : label);
+                }
+            }
+        }
+        lastLedger = ledger;
+        return ledger;
     }
 
     /** Fetches the state again, for instance after the watch list changed. */

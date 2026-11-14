@@ -191,7 +191,7 @@ public class AngrDebuggerToolPreview implements GhidraLaunchable {
         Element registers = tabs(0, take(infos, angr, "Registers", true));
         Element stack = tabs(0, take(infos, angr, "Stack", true));
         List<Element> bottom = new ArrayList<>();
-        for (String view : List.of("Calls", "Memory", "Output", "Paths", "Symbols", "Imports & Hooks")) {
+        for (String view : List.of("Calls", "Memory", "Output", "Paths", "Symbols", "Ledger", "Imports & Hooks")) {
             bottom.add(take(infos, angr, view, true));
         }
         for (Element rest : new ArrayList<>(infos.values())) {
@@ -335,7 +335,7 @@ public class AngrDebuggerToolPreview implements GhidraLaunchable {
 
         List<String> missing = new ArrayList<>();
         for (String view : List.of(AngrDebuggerPlugin.CONTROL_VIEW, "Registers", "Stack", "Calls", "Memory",
-                "Output", "Paths", "Symbols", "Imports & Hooks", "Listing", "Decompiler")) {
+                "Output", "Paths", "Symbols", "Ledger", "Imports & Hooks", "Listing", "Decompiler")) {
             ComponentProvider provider = tool.getComponentProvider(view);
             if (provider == null || !tool.isVisible(provider)) {
                 missing.add(view);
@@ -354,7 +354,8 @@ public class AngrDebuggerToolPreview implements GhidraLaunchable {
         }
         check("the angr menu actions are registered", actions.containsAll(List.of("angr Continue",
             "angr Step Into", "angr Step Over", "angr Step Out", "angr Pause", "angr Stop",
-            "angr Run to Cursor", "angr Toggle Breakpoint", "Debug Function with angr")), actions);
+            "angr Run to Cursor", "angr Toggle Breakpoint", "Debug Function with angr",
+            "angr Seek Destination", "angr Set Destination", "angr Clear Destination")), actions);
         check("stepping has the Debugger tool's keys (F5, F8, F10, F12) and K for breakpoints",
             keys.size() >= 5 && String.valueOf(keys).contains("F10"), keys);
 
@@ -430,6 +431,37 @@ public class AngrDebuggerToolPreview implements GhidraLaunchable {
         check("the Paths window is brought forward", tool.isVisible(tool.getComponentProvider("Paths"))
             && tool.getComponentProvider("Paths").getComponent().isShowing(), null);
         screenshot(new File(directory, "_angr_tool_2_forked.png"));
+
+        // --- a destination: marked in the Listing, sought, and the way there written down ---
+        Address unlock = program.getListing().getGlobalFunctions("unlock").get(0).getEntryPoint();
+        Swing.runNow(() -> {
+            controller.setDestination(program, unlock);
+            panel.setFunction("gate");
+            panel.setArguments("{\"symbolicInt\": 32, \"name\": \"key\"}");
+            panel.button("Start").doClick();
+        });
+        controller.await();
+        settle();
+        MarkerSet destinationMarker = debugger.markers(program, "destination");
+        check("the destination is marked in the Listing", destinationMarker != null
+            && destinationMarker.contains(unlock), unlock);
+        check("Seek Destination is offered once there is a destination and a session",
+            panel.button("Seek Destination").isEnabled(), null);
+        Swing.runNow(() -> panel.button("Seek Destination").doClick());
+        controller.await();
+        settle();
+        check("seeking arrives at the destination", panel.bannerTitle().startsWith("Reached the destination")
+            && unlock.equals(AngrDebugger.session(program).pc()), panel.bannerTitle() + " | " + controller.lastError());
+        check("the Listing is at the destination", unlock.equals(listing.getCurrentLocation().getAddress()),
+            listing.getCurrentLocation().getAddress());
+        check("the Ledger window comes forward with the way there",
+            tool.getComponentProvider("Ledger").getComponent().isShowing()
+                && panel.table("ledger").getRowCount() >= 5 && panel.table("unknowns").getRowCount() == 3,
+            panel.table("ledger").getRowCount() + " entries, " + panel.table("unknowns").getRowCount() + " unknowns");
+        screenshot(new File(directory, "_angr_tool_4_destination.png"));
+        Swing.runNow(() -> controller.setDestination(program, null));
+        settle();
+        check("clearing the destination removes its marker", !destinationMarker.contains(unlock), null);
 
         Swing.runNow(() -> tool.showComponentProvider(tool.getComponentProvider("Imports & Hooks"), true));
         Swing.runNow(() -> tool.getComponentProvider("Imports & Hooks").toFront());
