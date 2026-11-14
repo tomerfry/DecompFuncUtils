@@ -87,6 +87,10 @@ try {
 finally {
     if ($null -eq $prevXdg) { Remove-Item Env:\XDG_CONFIG_HOME -ErrorAction SilentlyContinue }
     else { $env:XDG_CONFIG_HOME = $prevXdg }
+    # Reclaim the throwaway settings tree and project. Without this every run leaves an
+    # extracted copy of the extension behind in TEMP, which is how a disk fills up.
+    Remove-Item -Recurse -Force $settingsRoot -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $proj -ErrorAction SilentlyContinue
 }
 $ErrorActionPreference = $prevEAP
 

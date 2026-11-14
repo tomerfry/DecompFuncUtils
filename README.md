@@ -120,6 +120,116 @@ transports, because different clients speak different ones:
 requested version when it is one of `2024-11-05`, `2025-03-26`, `2025-06-18`,
 and otherwise answers with the newest it supports.
 
+### Linking imports to their shared objects
+
+`ghidra_resolve_externals` attributes dangling `<EXTERNAL>` function symbols to
+the project library that actually exports them, and stores the exporting address
+in each external location so a call navigates straight into the library program.
+(On Ghidra 12.3 `Library` is no longer a `Namespace`, so the attribution lives on
+the external location and the symbol's parent namespace stays `Global`.)
+
+```json
+{"dryRun": true, "listSymbols": true}
+```
+
+```
+{"program":"afpd","unresolvedBefore":337,"resolved":160,"withTargetAddress":160,
+ "unresolvedAfter":177,
+ "libraries":[{"name":"libatalk.so.18","path":"/pwnable.tw/CVE-2018-1160/libatalk.so.18",
+               "status":"searched","resolved":160}]}
+```
+
+The `setAddress` half is still needed on current Ghidra: the stock resolver
+attributes a namespace and never stores a target address, so even a successful
+resolve leaves you unable to navigate from a call into the library.
+
+The namespace half was needed because Ghidra's own **External Symbol Resolver**
+was broken in 12.2 development builds before 17 Sep 2026 (fixed upstream, and in
+the official 12.2 release). In `ExternalSymbolResolver.resolveSymbolsToLibrary`
+it asked `isExportedSymbol(program, name)` where `program` is the binary being
+repaired rather than the library — and `ExtLibInfo` never carried the library's
+`Program` at all, because `getLibsToSearch` opened it only to record whether it
+opens. The question asked was therefore "does `afpd` export `dsi_getsession`?",
+which for an `UND` import is always no. On an affected build the import log
+shows the libraries linking correctly and then resolving nothing:
+
+```
+  [libatalk.so.18] -> [/.../libatalk.so.18] (previously imported)
+Resolving External Symbols of [/afpd] - Summary
+	0 external symbols resolved, 338 remain unresolved
+	[libatalk.so.18] -> /.../libatalk.so.18, 0 new symbols resolved
+```
+
+No import option changed this, since every option feeds the same predicate.
+`tests/run_resolve_externals_test.ps1` reproduces it on a two-symbol ELF pair
+and guards the behaviour either way.
+
+Options: `dryRun` reports without changing anything; `setAddress` (default true)
+stores the exporting address — Ghidra's own resolver does not, so even a working
+resolve leaves you without cross-program navigation; `searchProject` (default
+true) looks a library up in the project by file name when the import left it
+unassociated, trying an exact name and then a prefix, which links a `DT_NEEDED`
+of `libfoo.so.1` to a file imported as `libfoo.so.1.2.3`; `libraries` restricts
+the work; `listSymbols` names what moved and what is left. It is idempotent —
+re-run it as further dependencies are imported.
+
+Prototypes are still not propagated: a resolved thunk reads
+`undefined dsi_getsession()` until you give the external function a signature.
+Ghidra does not carry signatures across programs in either direction.
+
+### Cross-module references: seeing a library's callers
+
+`ghidra_backlink_imports` makes an import navigable in **both** directions. Run
+it on the importing program after `ghidra_resolve_externals`:
+
+```json
+{"dryRun": true, "listFunctions": true}
+```
+
+For every external function attributed to a project library it annotates the
+exporting function *inside that library* with this program's call sites, and
+bookmarks it under category `imported-by:<program>`:
+
+```
+[imported-by: afpd]
+3 call sites in afpd (click to navigate):
+  {@program /pwnable.tw/CVE-2018-1160/afpd@0010b2f4 afp_opensession+0x24}
+  {@program /pwnable.tw/CVE-2018-1160/afpd@0010c110 dsi_stream_read+0x10}
+[/imported-by: afpd]
+```
+
+**Why it is a comment and not an xref.** A Ghidra `Reference` is a from-address
+and a to-address in *one* program's address factory, and the XRefs /
+"Incoming References" field is built from that per-program table. There is no
+cross-program reference storage, so no API can put an `afpd` call site into
+`libatalk.so.18`'s incoming references — the field will stay as it is. Comment
+annotations are the one link Ghidra does follow across programs:
+`ProgramAnnotatedStringHandler` opens another project program and navigates to a
+symbol or, failing that, a raw address. Any word after the target becomes the
+rendered label, which is why a link reads `afp_opensession+0x24` rather than a
+path. The bookmarks give the same set as one filterable list in the Bookmarks
+window.
+
+Call sites are found through the thunk chain — a call reaches a PLT thunk, which
+thunks a stub in the synthetic `EXTERNAL` block, which thunks the external
+location — so every thunk entry point is asked for its references, and the
+thunk-to-thunk hops are filtered back out. Targets come from the external
+location's stored address, or a name lookup in the library when no address was
+stored (which is what the stock resolver leaves behind).
+
+Each importing program owns a delimited block, so re-runs replace rather than
+append and several importers of one library coexist; `remove` takes a block and
+its bookmark out again. Options: `dryRun`, `remove`, `libraries`, `comments`,
+`bookmarks`, `includeDataRefs` (link where the address is taken rather than
+called), `maxCallSites` (default 25), `save`, `listFunctions`. Note that this
+writes to and saves the **library** programs, not the current one.
+
+If you would rather have real xrefs than annotations, the only way is one
+program: import the executable, then File → Add To Program the library at a
+non-overlapping base and re-point the PLT thunks with `setThunkedFunction`.
+Incoming References then works natively and the decompiler follows calls into
+library code, at the cost of a single merged database with no module separation.
+
 ### Function and stack-local refinement
 
 Use `ghidra_set_function_no_return` to set or clear a function's non-returning
