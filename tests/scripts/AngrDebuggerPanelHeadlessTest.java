@@ -72,6 +72,11 @@ public class AngrDebuggerPanelHeadlessTest extends GhidraScript {
                 public String configuredPython() {
                     return null;
                 }
+
+                @Override
+                public boolean ledgerVisible() {
+                    return true;
+                }
             });
             panel = controller.panel();
         });
@@ -180,6 +185,41 @@ public class AngrDebuggerPanelHeadlessTest extends GhidraScript {
             && panel.bannerDetail().contains("contradicts"), panel.bannerDetail());
         click("Continue");
         check("the chosen path runs to its return", panel.bannerTitle().startsWith("Returned"), panel.bannerTitle());
+
+        // --- a destination, the search for it, and the ledger ---
+        check("Seek Destination is off without a destination", !panel.button("Seek Destination").isEnabled(), null);
+        Address unlock = currentProgram.getListing().getGlobalFunctions("unlock").get(0).getEntryPoint();
+        onEdt(() -> {
+            controller.setDestination(currentProgram, unlock);
+            panel.setFunction("gate");
+            panel.setArguments("{\"symbolicInt\": 32, \"name\": \"key\"}");
+        });
+        click("Start");
+        check("with a destination and a session it is on", panel.button("Seek Destination").isEnabled(), null);
+        click("Seek Destination");
+        check("seeking arrives and says so", panel.bannerTitle().startsWith("Reached the destination")
+            && panel.bannerTitle().contains("unlock") && panel.bannerDetail().contains("Ledger"),
+            panel.bannerTitle() + " | " + panel.bannerDetail());
+        check("the Ledger tab opens and lists the way", panel.table("ledger").getRowCount() == 5
+            && panel.tabs().getTitleAt(panel.tabs().getSelectedIndex()).equals("Ledger (5)"),
+            panel.tabs().getTitleAt(panel.tabs().getSelectedIndex()) + " " + cells("ledger"));
+        check("each line says where, what and under which condition",
+            cells("ledger").contains("gate+") && cells("ledger").contains("cfg_mode() is not modelled")
+                && cells("ledger").contains("branch to") && cells("ledger").contains("== 0x2"), cells("ledger"));
+        check("the unknowns are listed with what is required of them and a value that works",
+            panel.table("unknowns").getRowCount() == 3 && cells("unknowns").contains("cfg_level")
+                && cells("unknowns").contains(">=s 0xa") && cells("unknowns").contains("key"), cells("unknowns"));
+        String document = controller.ledgerMarkdown();
+        check("the ledger can be copied out as Markdown", document != null && document.contains("# Path ledger")
+            && document.contains("Destination:") && document.contains("reached"), document);
+        shot("ledger");
+        onEdt(() -> controller.setDestination(currentProgram, null));
+        controller.await();
+        check("clearing the destination turns Seek off again", !panel.button("Seek Destination").isEnabled(), null);
+        onEdt(() -> {
+            panel.setFunction("needs_device");
+            panel.setArguments("");
+        });
 
         // --- imports and hooks ---
         onEdt(() -> panel.selectTab("Imports & Hooks"));

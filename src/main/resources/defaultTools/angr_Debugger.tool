@@ -12,10 +12,10 @@
                 </WRAPPED_OPTION>
             </CATEGORY>
         </OPTIONS>
+        <PACKAGE NAME="angr Debugger" />
         <PACKAGE NAME="Ghidra Core">
             <INCLUDE CLASS="ghidra.app.plugin.core.interpreter.InterpreterPanelPlugin" />
         </PACKAGE>
-        <PACKAGE NAME="angr Debugger" />
         <PLUGIN_STATE CLASS="ghidra.app.plugin.core.navigation.GoToAddressLabelPlugin">
             <STATE NAME="CASE_SENSITIVE" TYPE="boolean" VALUE="false" />
             <ARRAY NAME="GO_TO_HISTORY" TYPE="string" />
@@ -536,67 +536,68 @@
         <ROOT_NODE X_POS="80" Y_POS="40" WIDTH="1680" HEIGHT="1000" EX_STATE="0" FOCUSED_OWNER="CodeBrowserPlugin" FOCUSED_NAME="Listing" FOCUSED_TITLE="Listing: ">
             <SPLIT_NODE WIDTH="1664" HEIGHT="890" DIVIDER_LOCATION="165" ORIENTATION="VERTICAL">
                 <COMPONENT_NODE TOP_INFO="0">
-                    <COMPONENT_INFO NAME="angr Debugger" OWNER="AngrDebuggerPlugin" TITLE="angr Debugger" ACTIVE="true" GROUP="angr.control" INSTANCE_ID="3763653291497200057" />
+                    <COMPONENT_INFO NAME="angr Debugger" OWNER="AngrDebuggerPlugin" TITLE="angr Debugger" ACTIVE="true" GROUP="angr.control" INSTANCE_ID="3763713238851908281" />
                 </COMPONENT_NODE>
                 <SPLIT_NODE WIDTH="1664" HEIGHT="765" DIVIDER_LOCATION="660" ORIENTATION="VERTICAL">
                     <SPLIT_NODE WIDTH="1664" HEIGHT="505" DIVIDER_LOCATION="160" ORIENTATION="HORIZONTAL">
                         <COMPONENT_NODE TOP_INFO="0">
-                            <COMPONENT_INFO NAME="Symbol Tree" OWNER="SymbolTreePlugin" TITLE="Symbol Tree" ACTIVE="true" GROUP="Default" INSTANCE_ID="3763653291497200053" />
-                            <COMPONENT_INFO NAME="Program Tree" OWNER="ProgramTreePlugin" TITLE="Program Trees" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573219" />
-                            <COMPONENT_INFO NAME="DataTypes Provider" OWNER="DataTypeManagerPlugin" TITLE="Data Type Manager" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653294108154295" />
+                            <COMPONENT_INFO NAME="Symbol Tree" OWNER="SymbolTreePlugin" TITLE="Symbol Tree" ACTIVE="true" GROUP="Default" INSTANCE_ID="3763713238851908277" />
+                            <COMPONENT_INFO NAME="Program Tree" OWNER="ProgramTreePlugin" TITLE="Program Trees" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515940" />
+                            <COMPONENT_INFO NAME="DataTypes Provider" OWNER="DataTypeManagerPlugin" TITLE="Data Type Manager" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241498514104" />
                         </COMPONENT_NODE>
                         <SPLIT_NODE WIDTH="1397" HEIGHT="505" DIVIDER_LOCATION="740" ORIENTATION="HORIZONTAL">
                             <SPLIT_NODE WIDTH="1031" HEIGHT="505" DIVIDER_LOCATION="560" ORIENTATION="HORIZONTAL">
                                 <COMPONENT_NODE TOP_INFO="0">
-                                    <COMPONENT_INFO NAME="Listing" OWNER="CodeBrowserPlugin" TITLE="Listing: " ACTIVE="true" GROUP="Core" INSTANCE_ID="3763653293210573228" />
+                                    <COMPONENT_INFO NAME="Listing" OWNER="CodeBrowserPlugin" TITLE="Listing: " ACTIVE="true" GROUP="Core" INSTANCE_ID="3763713240613515949" />
                                 </COMPONENT_NODE>
                                 <COMPONENT_NODE TOP_INFO="0">
-                                    <COMPONENT_INFO NAME="Decompiler" OWNER="DecompilePlugin" TITLE="Decompile" ACTIVE="true" GROUP="Default" INSTANCE_ID="3763653293210573220" />
+                                    <COMPONENT_INFO NAME="Decompiler" OWNER="DecompilePlugin" TITLE="Decompile" ACTIVE="true" GROUP="Default" INSTANCE_ID="3763713240613515941" />
                                 </COMPONENT_NODE>
                             </SPLIT_NODE>
                             <SPLIT_NODE WIDTH="366" HEIGHT="505" DIVIDER_LOCATION="520" ORIENTATION="VERTICAL">
                                 <COMPONENT_NODE TOP_INFO="0">
-                                    <COMPONENT_INFO NAME="Registers" OWNER="AngrDebuggerPlugin" TITLE="Registers" ACTIVE="true" GROUP="angr.state" INSTANCE_ID="3763653291497200058" />
+                                    <COMPONENT_INFO NAME="Registers" OWNER="AngrDebuggerPlugin" TITLE="Registers" ACTIVE="true" GROUP="angr.state" INSTANCE_ID="3763713238851908282" />
                                 </COMPONENT_NODE>
                                 <COMPONENT_NODE TOP_INFO="0">
-                                    <COMPONENT_INFO NAME="Stack" OWNER="AngrDebuggerPlugin" TITLE="Stack" ACTIVE="true" GROUP="angr.state" INSTANCE_ID="3763653291497200059" />
+                                    <COMPONENT_INFO NAME="Stack" OWNER="AngrDebuggerPlugin" TITLE="Stack" ACTIVE="true" GROUP="angr.state" INSTANCE_ID="3763713238851908283" />
                                 </COMPONENT_NODE>
                             </SPLIT_NODE>
                         </SPLIT_NODE>
                     </SPLIT_NODE>
                     <COMPONENT_NODE TOP_INFO="0">
-                        <COMPONENT_INFO NAME="Calls" OWNER="AngrDebuggerPlugin" TITLE="Calls" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763653291497200060" />
-                        <COMPONENT_INFO NAME="Memory" OWNER="AngrDebuggerPlugin" TITLE="Memory" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763653291497200061" />
-                        <COMPONENT_INFO NAME="Output" OWNER="AngrDebuggerPlugin" TITLE="Output" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763653291497200062" />
-                        <COMPONENT_INFO NAME="Paths" OWNER="AngrDebuggerPlugin" TITLE="Paths" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763653291497200063" />
-                        <COMPONENT_INFO NAME="Symbols" OWNER="AngrDebuggerPlugin" TITLE="Symbols" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763653293210573216" />
-                        <COMPONENT_INFO NAME="Imports &amp; Hooks" OWNER="AngrDebuggerPlugin" TITLE="Imports &amp; Hooks" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763653293210573217" />
-                        <COMPONENT_INFO NAME="Function Call Trees" OWNER="CallTreePlugin" TITLE="Function Call Trees" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653291497200054" />
-                        <COMPONENT_INFO NAME="Bookmarks" OWNER="BookmarkPlugin" TITLE="Bookmarks" ACTIVE="false" GROUP="Core.Bookmarks" INSTANCE_ID="3763653293210573218" />
-                        <COMPONENT_INFO NAME="Console" OWNER="ConsolePlugin" TITLE="Console" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573221" />
-                        <COMPONENT_INFO NAME="Virtual Disassembler - Current Instruction" OWNER="DisassembledViewPlugin" TITLE="Disassembled View" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573225" />
-                        <COMPONENT_INFO NAME="Memory Map" OWNER="MemoryMapPlugin" TITLE="Memory Map" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653291497200036" />
-                        <COMPONENT_INFO NAME="Bundle Manager" OWNER="GhidraScriptMgrPlugin" TITLE="Bundle Manager" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653291497200056" />
-                        <COMPONENT_INFO NAME="Script Manager" OWNER="GhidraScriptMgrPlugin" TITLE="Script Manager" ACTIVE="false" GROUP="Script Group" INSTANCE_ID="3763653291497200055" />
-                        <COMPONENT_INFO NAME="Bytes" OWNER="ByteViewerPlugin" TITLE="Bytes: No Program" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573222" />
-                        <COMPONENT_INFO NAME="Equates Table" OWNER="EquateTablePlugin" TITLE="Equates Table" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573226" />
-                        <COMPONENT_INFO NAME="Checksum Generator" OWNER="ComputeChecksumsPlugin" TITLE="Checksum Generator" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573227" />
-                        <COMPONENT_INFO NAME="External Programs" OWNER="ReferencesPlugin" TITLE="External Programs" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573230" />
-                        <COMPONENT_INFO NAME="Source Files and Transforms" OWNER="SourceFilesTablePlugin" TITLE="Source Files and Transforms" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573231" />
-                        <COMPONENT_INFO NAME="Register Manager" OWNER="RegisterPlugin" TITLE="Register Manager" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573232" />
-                        <COMPONENT_INFO NAME="Functions Window" OWNER="FunctionWindowPlugin" TITLE="Functions" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293210573233" />
-                        <COMPONENT_INFO NAME="Data Type Preview" OWNER="DataTypePreviewPlugin" TITLE="Data Type Preview" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653293978130859" />
-                        <COMPONENT_INFO NAME="Function Call Graph" OWNER="FunctionCallGraphPlugin" TITLE="Function Call Graph" ACTIVE="false" GROUP="Function Call Graph" INSTANCE_ID="3763653293978130860" />
-                        <COMPONENT_INFO NAME="Data Types Table" OWNER="DataTypeManagerPlugin" TITLE="Data Types Table" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653294108154296" />
-                        <COMPONENT_INFO NAME="Function Tags" OWNER="FunctionTagPlugin" TITLE="Function Tags" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653294108154297" />
-                        <COMPONENT_INFO NAME="PyGhidra" OWNER="PyGhidra" TITLE="PyGhidra" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653294223497636" />
-                        <COMPONENT_INFO NAME="Comment Window" OWNER="CommentWindowPlugin" TITLE="Comments" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653294223497637" />
-                        <COMPONENT_INFO NAME="Data Window" OWNER="DataWindowPlugin" TITLE="Defined Data" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653294223497638" />
-                        <COMPONENT_INFO NAME="Symbol Table" OWNER="SymbolTablePlugin" TITLE="Symbol Table" ACTIVE="false" GROUP="symbolTable" INSTANCE_ID="3763653294223497639" />
-                        <COMPONENT_INFO NAME="Symbol References" OWNER="SymbolTablePlugin" TITLE="Symbol References" ACTIVE="false" GROUP="symbolTable" INSTANCE_ID="3763653294223497640" />
-                        <COMPONENT_INFO NAME="Defined Strings" OWNER="DefinedStringsPlugin" TITLE="Defined Strings" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653294223497641" />
-                        <COMPONENT_INFO NAME="Relocation Table" OWNER="RelocationTablePlugin" TITLE="Relocation Table" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763653294223497642" />
-                        <COMPONENT_INFO NAME="Function Graph" OWNER="FunctionGraphPlugin" TITLE="Function Graph" ACTIVE="false" GROUP="Function Graph" INSTANCE_ID="3763653294223497644" />
+                        <COMPONENT_INFO NAME="Calls" OWNER="AngrDebuggerPlugin" TITLE="Calls" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763713238851908284" />
+                        <COMPONENT_INFO NAME="Memory" OWNER="AngrDebuggerPlugin" TITLE="Memory" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763713238851908285" />
+                        <COMPONENT_INFO NAME="Output" OWNER="AngrDebuggerPlugin" TITLE="Output" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763713238851908286" />
+                        <COMPONENT_INFO NAME="Paths" OWNER="AngrDebuggerPlugin" TITLE="Paths" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763713238851908287" />
+                        <COMPONENT_INFO NAME="Symbols" OWNER="AngrDebuggerPlugin" TITLE="Symbols" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763713240613515936" />
+                        <COMPONENT_INFO NAME="Ledger" OWNER="AngrDebuggerPlugin" TITLE="Ledger" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763713240613515937" />
+                        <COMPONENT_INFO NAME="Imports &amp; Hooks" OWNER="AngrDebuggerPlugin" TITLE="Imports &amp; Hooks" ACTIVE="true" GROUP="angr.trace" INSTANCE_ID="3763713240613515938" />
+                        <COMPONENT_INFO NAME="Function Call Trees" OWNER="CallTreePlugin" TITLE="Function Call Trees" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713238851908278" />
+                        <COMPONENT_INFO NAME="Bookmarks" OWNER="BookmarkPlugin" TITLE="Bookmarks" ACTIVE="false" GROUP="Core.Bookmarks" INSTANCE_ID="3763713240613515939" />
+                        <COMPONENT_INFO NAME="Console" OWNER="ConsolePlugin" TITLE="Console" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515942" />
+                        <COMPONENT_INFO NAME="Virtual Disassembler - Current Instruction" OWNER="DisassembledViewPlugin" TITLE="Disassembled View" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515946" />
+                        <COMPONENT_INFO NAME="Memory Map" OWNER="MemoryMapPlugin" TITLE="Memory Map" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713238851908260" />
+                        <COMPONENT_INFO NAME="Bundle Manager" OWNER="GhidraScriptMgrPlugin" TITLE="Bundle Manager" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713238851908280" />
+                        <COMPONENT_INFO NAME="Script Manager" OWNER="GhidraScriptMgrPlugin" TITLE="Script Manager" ACTIVE="false" GROUP="Script Group" INSTANCE_ID="3763713238851908279" />
+                        <COMPONENT_INFO NAME="Bytes" OWNER="ByteViewerPlugin" TITLE="Bytes: No Program" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515943" />
+                        <COMPONENT_INFO NAME="Equates Table" OWNER="EquateTablePlugin" TITLE="Equates Table" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515947" />
+                        <COMPONENT_INFO NAME="Checksum Generator" OWNER="ComputeChecksumsPlugin" TITLE="Checksum Generator" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515948" />
+                        <COMPONENT_INFO NAME="External Programs" OWNER="ReferencesPlugin" TITLE="External Programs" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515951" />
+                        <COMPONENT_INFO NAME="Source Files and Transforms" OWNER="SourceFilesTablePlugin" TITLE="Source Files and Transforms" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515952" />
+                        <COMPONENT_INFO NAME="Register Manager" OWNER="RegisterPlugin" TITLE="Register Manager" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515953" />
+                        <COMPONENT_INFO NAME="Functions Window" OWNER="FunctionWindowPlugin" TITLE="Functions" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713240613515954" />
+                        <COMPONENT_INFO NAME="Data Type Preview" OWNER="DataTypePreviewPlugin" TITLE="Data Type Preview" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241362199212" />
+                        <COMPONENT_INFO NAME="Function Call Graph" OWNER="FunctionCallGraphPlugin" TITLE="Function Call Graph" ACTIVE="false" GROUP="Function Call Graph" INSTANCE_ID="3763713241362199213" />
+                        <COMPONENT_INFO NAME="Data Types Table" OWNER="DataTypeManagerPlugin" TITLE="Data Types Table" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241498514105" />
+                        <COMPONENT_INFO NAME="Function Tags" OWNER="FunctionTagPlugin" TITLE="Function Tags" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241498514106" />
+                        <COMPONENT_INFO NAME="PyGhidra" OWNER="PyGhidra" TITLE="PyGhidra" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241599177381" />
+                        <COMPONENT_INFO NAME="Comment Window" OWNER="CommentWindowPlugin" TITLE="Comments" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241599177382" />
+                        <COMPONENT_INFO NAME="Data Window" OWNER="DataWindowPlugin" TITLE="Defined Data" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241599177383" />
+                        <COMPONENT_INFO NAME="Symbol Table" OWNER="SymbolTablePlugin" TITLE="Symbol Table" ACTIVE="false" GROUP="symbolTable" INSTANCE_ID="3763713241599177384" />
+                        <COMPONENT_INFO NAME="Symbol References" OWNER="SymbolTablePlugin" TITLE="Symbol References" ACTIVE="false" GROUP="symbolTable" INSTANCE_ID="3763713241599177385" />
+                        <COMPONENT_INFO NAME="Defined Strings" OWNER="DefinedStringsPlugin" TITLE="Defined Strings" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241599177386" />
+                        <COMPONENT_INFO NAME="Relocation Table" OWNER="RelocationTablePlugin" TITLE="Relocation Table" ACTIVE="false" GROUP="Default" INSTANCE_ID="3763713241599177387" />
+                        <COMPONENT_INFO NAME="Function Graph" OWNER="FunctionGraphPlugin" TITLE="Function Graph" ACTIVE="false" GROUP="Function Graph" INSTANCE_ID="3763713241599177389" />
                     </COMPONENT_NODE>
                 </SPLIT_NODE>
             </SPLIT_NODE>
@@ -606,17 +607,18 @@
         </PREFERENCES>
         <EXTENSIONS>
             <EXTENSION NAME="DecompFuncUtils">
-                <PLUGIN CLASS="decompfuncutils.DataflowDecompilerHoverPlugin" />
+                <PLUGIN CLASS="decompfuncutils.mcp.McpSessionManagerPlugin" />
                 <PLUGIN CLASS="decompfuncutils.SparseTaintMatrixPlugin" />
                 <PLUGIN CLASS="decompfuncutils.mcp.McpServerPlugin" />
-                <PLUGIN CLASS="decompfuncutils.flowrecorder.FlowRecorderPlugin" />
-                <PLUGIN CLASS="decompfuncutils.angr.ui.AngrDebuggerPlugin" />
                 <PLUGIN CLASS="decompfuncutils.angr.ui.AngrDebuggerToolChestPlugin" />
-                <PLUGIN CLASS="decompfuncutils.VTableHandlerPlugin" />
-                <PLUGIN CLASS="decompfuncutils.MemoryToStructPlugin" />
-                <PLUGIN CLASS="decompfuncutils.StructFieldNavigationPlugin" />
-                <PLUGIN CLASS="decompfuncutils.mcp.McpSessionManagerPlugin" />
+                <PLUGIN CLASS="decompfuncutils.angr.ui.AngrDebuggerPlugin" />
                 <PLUGIN CLASS="decompfuncutils.FlowLauncherPlugin" />
+                <PLUGIN CLASS="decompfuncutils.refine.ui.RefinedDecompilerPlugin" />
+                <PLUGIN CLASS="decompfuncutils.flowrecorder.FlowRecorderPlugin" />
+                <PLUGIN CLASS="decompfuncutils.MemoryToStructPlugin" />
+                <PLUGIN CLASS="decompfuncutils.DataflowDecompilerHoverPlugin" />
+                <PLUGIN CLASS="decompfuncutils.VTableHandlerPlugin" />
+                <PLUGIN CLASS="decompfuncutils.StructFieldNavigationPlugin" />
                 <PLUGIN CLASS="decompfuncutils.LibAFLFuzzerGeneratorPlugin" />
             </EXTENSION>
         </EXTENSIONS>

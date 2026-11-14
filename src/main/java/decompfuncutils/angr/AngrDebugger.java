@@ -24,6 +24,7 @@ public final class AngrDebugger {
 
     private static final Map<Program, AngrDebugSession> SESSIONS = new HashMap<>();
     private static final Map<Program, TreeSet<Address>> BREAKPOINTS = new HashMap<>();
+    private static final Map<Program, Address> DESTINATIONS = new HashMap<>();
     private static final List<Listener> LISTENERS = new CopyOnWriteArrayList<>();
 
     private AngrDebugger() {
@@ -106,7 +107,34 @@ public final class AngrDebugger {
         stop(program);
         synchronized (BREAKPOINTS) {
             BREAKPOINTS.remove(program);
+            DESTINATIONS.remove(program);
         }
+    }
+
+    // ---- the destination ----
+
+    /**
+     * Where the program's sessions are trying to get to, or null. A breakpoint is somewhere to
+     * stop if execution happens to arrive; the destination is somewhere to arrive, and
+     * {@link AngrDebugSession#seek} goes looking for the way.
+     */
+    public static Address destination(Program program) {
+        synchronized (BREAKPOINTS) {
+            return DESTINATIONS.get(program);
+        }
+    }
+
+    /** @param address the new destination, or null to have none */
+    public static void setDestination(Program program, Address address) {
+        synchronized (BREAKPOINTS) {
+            if (address == null) {
+                DESTINATIONS.remove(program);
+            }
+            else {
+                DESTINATIONS.put(program, address);
+            }
+        }
+        fire(program);
     }
 
     // ---- breakpoints ----

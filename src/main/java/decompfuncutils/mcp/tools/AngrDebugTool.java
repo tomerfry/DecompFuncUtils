@@ -24,6 +24,7 @@ public class AngrDebugTool implements McpTool {
     private static final List<String> ACTIONS = List.of(
         "start", "state", "step_into", "step_over", "step_out", "continue", "run_to",
         "add_breakpoint", "remove_breakpoint", "clear_breakpoints",
+        "set_destination", "clear_destination", "seek", "ledger",
         "select_path", "drop_path", "concretize", "symbolize", "set", "reload_hooks", "stop");
 
     private static final int DEFAULT_RUN_MS = 30_000;
@@ -56,6 +57,17 @@ public class AngrDebugTool implements McpTool {
             "symbolize makes a 'register' or 'address' unknown ('name' it). set overwrites a " +
             "'register' or 'address' with 'value' (a number, or a string/bytes/buffer object to point " +
             "it at new memory).\n" +
+            "To get somewhere rather than step there: set_destination ('address': hex or a function), " +
+            "then seek. seek explores every side of every branch on an unknown until a path arrives, " +
+            "leaning on Ghidra's control-flow graph to try the promising ones first ('guided':false to " +
+            "turn that off, 'avoid':[addresses] to rule places out), and makes that path current. Code " +
+            "that is not there does not stop it: a call into an unmodelled import, or through an unknown " +
+            "pointer, is skipped with an unknown return value. The response carries the path's LEDGER: " +
+            "in order, each point where an unknown appeared and each branch that depended on one with " +
+            "the condition taken, then for every unknown the conditions on it and one set of values " +
+            "that satisfies the whole path. If time runs out, seek again resumes; after arriving, seek " +
+            "again looks for another way in. action=ledger returns the ledger of the current path at " +
+            "any time ('format':'markdown' for a document).\n" +
             "Each response gives pc, why it stopped, the registers that changed, new calls and memory " +
             "writes; pass 'detail':'full' for every register and the stack.";
     }
@@ -98,6 +110,12 @@ public class AngrDebugTool implements McpTool {
         props.put("value", Map.of("description", "concretize: the value to fix (optional). set: the new value."));
         props.put("name", Map.of("type", "string", "description", "symbolize: name for the new unknown"));
         props.put("path", Map.of("type", "integer", "description", "select_path / drop_path: a path id"));
+        props.put("avoid", Map.of("type", "array", "items", Map.of("type", "string"),
+            "description", "seek: addresses or functions no path may pass through"));
+        props.put("guided", Map.of("type", "boolean",
+            "description", "seek: use Ghidra's control-flow graph to try promising paths first (default true)"));
+        props.put("format", Map.of("type", "string", "enum", List.of("json", "markdown"),
+            "description", "ledger: 'json' (default) or 'markdown' for a document"));
         props.put("watch", Map.of("type", "array", "items", Map.of("type", "string"),
             "description", "Memory to include after every stop: symbol or address, optionally ':length'. " +
                 "Replaces the previous list."));
@@ -149,6 +167,19 @@ public class AngrDebugTool implements McpTool {
             case "clear_breakpoints":
                 AngrDebugger.clearBreakpoints(program);
                 return breakpointList(program);
+            case "set_destination": {
+                Address address = AngrCallSpec.resolveCode(program, required(arguments, "address"), "address");
+                AngrDebugger.setDestination(program, address);
+                Map<String, Object> set = new LinkedHashMap<>();
+                set.put("destination", AngrCallSpec.codeLabel(program, "0x" + Long.toHexString(address.getOffset())));
+                set.put("next", AngrDebugger.session(program) == null
+                    ? "Start a session (action=start), then action=seek."
+                    : "action=seek looks for a way there from the current path.");
+                return set;
+            }
+            case "clear_destination":
+                AngrDebugger.setDestination(program, null);
+                return Map.of("destination", "none");
             default:
                 break;
         }
@@ -206,6 +237,23 @@ public class AngrDebugTool implements McpTool {
             case "reload_hooks":
                 session.reloadHooks(monitor);
                 break;
+            case "seek": {
+                List<Address> avoid = new ArrayList<>();
+                if (arguments.get("avoid") instanceof List<?> list) {
+                    for (Object item : list) {
+                        avoid.add(AngrCallSpec.resolveCode(program, String.valueOf(item), "avoid"));
+                    }
+                }
+                session.seek(avoid, !Boolean.FALSE.equals(arguments.get("guided")), budget, monitor);
+                break;
+            }
+            case "ledger": {
+                Map<String, Object> ledger = session.ledger(monitor);
+                if ("markdown".equals(arguments.get("format"))) {
+                    return decompfuncutils.angr.AngrLedger.toMarkdown(ledger);
+                }
+                return ledger;
+            }
             default:
                 throw new IllegalArgumentException("Unhandled action " + action);
         }
@@ -258,7 +306,12 @@ public class AngrDebugTool implements McpTool {
         if (hint != null) {
             out.put("hint", hint);
         }
-        for (String key : List.of("returnValue", "fault", "paths", "symbols")) {
+        Address destination = AngrDebugger.destination(session.program);
+        if (destination != null) {
+            out.put("destination",
+                AngrCallSpec.codeLabel(session.program, "0x" + Long.toHexString(destination.getOffset())));
+        }
+        for (String key : List.of("seek", "seekGuide", "ledger", "returnValue", "fault", "paths", "symbols")) {
             if (snapshot.get(key) != null) {
                 out.put(key, snapshot.get(key));
             }
@@ -343,6 +396,16 @@ public class AngrDebugTool implements McpTool {
                     + "or raise timeoutMs.";
             case "breakpoint":
                 return "Stopped at a breakpoint.";
+            case "destination":
+                return "Reached the destination; this path is now the current one. 'ledger' lists, in order, "
+                    + "what it took to get here and one set of values that satisfies it. seek again looks for "
+                    + "another way in.";
+            case "seek_exhausted":
+                return "Every path was followed to its end and none reaches the destination from here under "
+                    + "the conditions already taken. 'seek' says how they ended.";
+            case "seek_budget":
+                return "The search used its budget without arriving; what it explored is kept. seek again "
+                    + "to continue, or narrow it with 'avoid' or by concretizing unknowns.";
             default:
                 return null;
         }

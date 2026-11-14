@@ -52,6 +52,15 @@ public class AngrDebuggerPanel extends JPanel {
 
         void refreshImports();
 
+        /** Look for a way from the current path to the destination. */
+        void seek();
+
+        /** Read the current path's ledger again. */
+        void refreshLedger();
+
+        /** The ledger on screen as a Markdown document, or null when there is none. */
+        String ledgerMarkdown();
+
         void saveHook(AngrHooks.Hook hook);
 
         void deleteHook(String name);
@@ -84,6 +93,9 @@ public class AngrDebuggerPanel extends JPanel {
     private final JTextArea output = new JTextArea();
     private final JTextField watchField = new JTextField(30);
     private final JLabel importsNote = new JLabel(" ");
+    private final JLabel destinationLabel = new JLabel("Destination: none");
+    private final JLabel ledgerNote = new JLabel(" ");
+    private String destination;
 
     private Map<String, Object> snapshot;
     private boolean running;
@@ -190,6 +202,9 @@ public class AngrDebuggerPanel extends JPanel {
         steps.add(button("Step Out", "Run until the current function returns (F12)", () -> actions.step("out")));
         steps.add(button("Continue", "Run to the next breakpoint, fork, return or fault (F5)",
             () -> actions.step("continue")));
+        steps.add(button("Seek Destination", "<html>Find a way to the destination (F9): follow every side of "
+            + "every branch on an unknown value<br>until a path arrives, then show what it took in the Ledger."
+            + "<br>Set the destination by right-clicking an instruction in the Listing.</html>", actions::seek));
         steps.add(Box.createHorizontalStrut(10));
         steps.add(button("Pause", "Interrupt a run", actions::pause));
         steps.add(button("Stop", "End the session", actions::stop));
@@ -209,6 +224,10 @@ public class AngrDebuggerPanel extends JPanel {
 
         // The hint takes whatever width is left and is cut short, not wrapped, when there is
         // little; its tooltip always has all of it.
+        destinationLabel.setToolTipText("<html>Where Seek Destination tries to get to. Right-click an "
+            + "instruction in the Listing or Decompiler<br>and choose angr Debugger > Set Destination.</html>");
+        destinationLabel.setForeground(palette.muted);
+        options.add(destinationLabel);
         JPanel right = new JPanel(new BorderLayout(8, 0));
         right.add(options, BorderLayout.WEST);
         right.add(hintLabel, BorderLayout.CENTER);
@@ -360,6 +379,8 @@ public class AngrDebuggerPanel extends JPanel {
         symbolsPanel.add(new JScrollPane(symbols), BorderLayout.CENTER);
         addView("Symbols", symbolsPanel);
 
+        addView("Ledger", ledgerPane());
+
         JTable imports = table("imports", "Target", "Library", "In project", "Handled by");
         imports.getColumnModel().getColumn(0).setPreferredWidth(190);
         imports.getColumnModel().getColumn(3).setPreferredWidth(230);
@@ -411,6 +432,120 @@ public class AngrDebuggerPanel extends JPanel {
             });
         }
         return tabs;
+    }
+
+    /**
+     * The path's ledger: on top, in order, where unknowns appeared and each branch that depended
+     * on one; below, what all of that requires of each unknown and a value that satisfies it.
+     */
+    private JComponent ledgerPane() {
+        JTable ledger = table("ledger", "#", "Where", "What", "Condition");
+        ledger.getColumnModel().getColumn(0).setMaxWidth(40);
+        ledger.getColumnModel().getColumn(1).setPreferredWidth(150);
+        ledger.getColumnModel().getColumn(2).setPreferredWidth(330);
+        ledger.getColumnModel().getColumn(3).setPreferredWidth(330);
+        onDoubleClick(ledger, "ledger", "at");
+        JTable unknowns = table("unknowns", "Unknown", "From", "A value that works", "Required of it");
+        unknowns.getColumnModel().getColumn(0).setPreferredWidth(170);
+        unknowns.getColumnModel().getColumn(1).setPreferredWidth(110);
+        unknowns.getColumnModel().getColumn(2).setPreferredWidth(130);
+        unknowns.getColumnModel().getColumn(3).setPreferredWidth(430);
+
+        JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 3));
+        bar.add(button("Copy Ledger", "Copy the ledger as a Markdown document", () -> {
+            String text = actions.ledgerMarkdown();
+            if (text == null) {
+                showMessage("There is no ledger yet: start a session first.", false);
+                return;
+            }
+            try {
+                Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .setContents(new java.awt.datatransfer.StringSelection(text), null);
+                showMessage("The ledger was copied as Markdown.", false);
+            }
+            catch (RuntimeException e) {
+                showMessage("The clipboard is not available: " + e.getMessage(), true);
+            }
+        }));
+        bar.add(button("Save Ledger...", "Write the ledger to a Markdown file", () -> {
+            String text = actions.ledgerMarkdown();
+            if (text == null) {
+                showMessage("There is no ledger yet: start a session first.", false);
+                return;
+            }
+            JFileChooser chooser = new JFileChooser();
+            chooser.setSelectedFile(new java.io.File("ledger.md"));
+            if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+                try {
+                    java.nio.file.Files.writeString(chooser.getSelectedFile().toPath(), text);
+                    showMessage("The ledger was written to " + chooser.getSelectedFile() + ".", false);
+                }
+                catch (java.io.IOException e) {
+                    showMessage("Could not write the ledger: " + e.getMessage(), true);
+                }
+            }
+        }));
+        bar.add(button("Refresh Ledger", "Read the current path's ledger again", actions::refreshLedger));
+        ledgerNote.setForeground(palette.muted);
+        bar.add(ledgerNote);
+
+        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(ledger),
+            new JScrollPane(unknowns));
+        split.setResizeWeight(0.6);
+        split.setBorder(null);
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.add(bar, BorderLayout.NORTH);
+        panel.add(split, BorderLayout.CENTER);
+        return panel;
+    }
+
+    /** Where Seek Destination is headed ("0x1020c0 (unlock)"), or null for nowhere. */
+    public void showDestination(String where) {
+        destination = where;
+        destinationLabel.setText("Destination: " + (where == null ? "none" : where));
+        refreshSeekButton();
+    }
+
+    private void refreshSeekButton() {
+        boolean steppable = snapshot != null && !running && "paused".equals(text(snapshot.get("status")));
+        buttons.get("Seek Destination").setEnabled(steppable && destination != null);
+    }
+
+    /** Shows a path's ledger, or clears the view when there is none. */
+    @SuppressWarnings("unchecked")
+    public void showLedger(Map<String, Object> ledger) {
+        List<Map<String, Object>> entries = ledger != null && ledger.get("entries") instanceof List<?> l
+            ? (List<Map<String, Object>>) l : List.of();
+        List<Object[]> cells = new ArrayList<>();
+        for (Map<String, Object> entry : entries) {
+            cells.add(new Object[] { entry.get("n"), decompfuncutils.angr.AngrLedger.where(entry),
+                decompfuncutils.angr.AngrLedger.what(entry), text(entry.get("condition")) });
+        }
+        fill("ledger", entries, cells);
+
+        List<Map<String, Object>> unknowns = ledger != null && ledger.get("unknowns") instanceof List<?> l
+            ? (List<Map<String, Object>>) l : List.of();
+        List<Object[]> rowsOut = new ArrayList<>();
+        for (Map<String, Object> unknown : unknowns) {
+            String value = text(unknown.get("value"))
+                + (unknown.get("string") != null ? "  \"" + unknown.get("string") + "\"" : "")
+                + (Boolean.TRUE.equals(unknown.get("unique")) ? "  (only one)" : "");
+            String requires = unknown.get("requires") instanceof List<?> list
+                ? String.join("   and   ", list.stream().map(String::valueOf).toList())
+                : "nothing on this path depends on it";
+            rowsOut.add(new Object[] { unknown.get("name"), text(unknown.get("from")), value, requires });
+        }
+        fill("unknowns", unknowns, rowsOut);
+
+        if (ledger == null) {
+            ledgerNote.setText(" ");
+        }
+        else {
+            ledgerNote.setText("Path " + ledger.get("path") + ": " + ledger.get("decisions")
+                + " decision(s) on unknown values, " + ledger.get("constraintCount") + " constraint(s)"
+                + (Boolean.TRUE.equals(ledger.get("atDestination")) ? " - at the destination" : ""));
+        }
+        retitle();
     }
 
     private void addView(String name, JComponent component) {
@@ -623,16 +758,19 @@ public class AngrDebuggerPanel extends JPanel {
         buttons.get("Stop").setEnabled(session);
         buttons.get("Start").setEnabled(!running);
         buttons.get("Start").setText(session ? "Restart" : "Start");
-        for (String name : List.of("Switch to Path", "Drop Path", "Concretize...", "Concretize All", "Apply Watches")) {
+        for (String name : List.of("Switch to Path", "Drop Path", "Concretize...", "Concretize All", "Apply Watches",
+                "Refresh Ledger")) {
             buttons.get(name).setEnabled(session && !running);
         }
+        refreshSeekButton();
         bannerDetail.setForeground(palette.text);
 
         if (!session) {
             setBanner(palette.muted, "No session",
                 "Enter a function and its arguments and press Start - or right-click a function in the "
                     + "Listing and choose Debug Function with angr.");
-            for (String key : List.of("registers", "stack", "calls", "memory", "paths", "symbols")) {
+            for (String key : List.of("registers", "stack", "calls", "memory", "paths", "symbols", "ledger",
+                    "unknowns")) {
                 fill(key, List.of());
             }
             output.setText("");
@@ -699,7 +837,26 @@ public class AngrDebuggerPanel extends JPanel {
                     "It depends on an unknown value. Concretize it in the Symbols tab to go on.");
                 break;
             default:
-                if ("fork".equals(stop)) {
+                Map<?, ?> seek = snapshot.get("seek") instanceof Map<?, ?> m ? m : null;
+                if ("destination".equals(stop) && seek != null) {
+                    setBanner(palette.ok, "Reached the destination at " + where,
+                        seek.get("blocks") + " blocks explored across " + seek.get("statesExpanded")
+                            + " states. The Ledger lists what it took to get here, in order, and values that "
+                            + "satisfy it. Seek again looks for another way in.");
+                    selectTab("Ledger");
+                }
+                else if ("seek_exhausted".equals(stop) && seek != null) {
+                    setBanner(palette.warn, "The destination cannot be reached from here",
+                        "Every path was followed to its end (" + seek.get("ended") + ") and none arrives under "
+                            + "the conditions already taken. Still at " + where + ".");
+                }
+                else if (seek != null && List.of("seek_budget", "timeout", "paused").contains(stop)) {
+                    setBanner(palette.info, "Not at the destination yet",
+                        seek.get("blocks") + " blocks explored, " + seek.get("open") + " path(s) still open"
+                            + (number(seek.get("setAside")) > 0 ? " (" + seek.get("setAside") + " set aside as "
+                                + "unlikely)" : "") + ". Seek again to carry on from where it stopped.");
+                }
+                else if ("fork".equals(stop)) {
                     String guard = "";
                     for (Map<String, Object> row : rows.get("paths")) {
                         if (Boolean.TRUE.equals(row.get("current")) && row.get("guard") != null) {
@@ -937,7 +1094,7 @@ public class AngrDebuggerPanel extends JPanel {
     }
 
     private void retitle() {
-        for (String name : List.of("Calls", "Paths", "Symbols", "Memory")) {
+        for (String name : List.of("Calls", "Paths", "Symbols", "Memory", "Ledger")) {
             int count = rows.get(name.toLowerCase()) == null ? 0 : rows.get(name.toLowerCase()).size();
             if (!detached) {
                 tabs.setTitleAt(indexOfBase(name), count > 0 ? name + " (" + count + ")" : name);

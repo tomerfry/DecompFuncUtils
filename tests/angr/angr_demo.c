@@ -149,6 +149,45 @@ int classify(int v) {
     return 1;
 }
 
+/*
+ * Seeking a destination. gate() reaches unlock() only through three decisions, two of them on
+ * values that come from functions nothing models, and the last one relating such a value to the
+ * argument - so the way in is a set of constraints, which is what the ledger has to show.
+ */
+extern int cfg_mode(void);
+extern int cfg_level(void);
+
+int unlock(int key) {
+    g_counter = key;
+    return 1;
+}
+
+int gate(int key) {
+    int mode = cfg_mode();
+    if (mode != 2) {
+        return -1;
+    }
+    int level = cfg_level();
+    if (level < 10) {
+        return -2;
+    }
+    if (key * 3 + level != 100) {
+        return -3;
+    }
+    return unlock(key);
+}
+
+/* A call through an imported function pointer: the target itself is unknown. */
+extern int (*ext_callback)(int);
+
+int via_callback(int v) {
+    int r = ext_callback(v);
+    if (r == 7) {
+        return unlock(v);
+    }
+    return 0;
+}
+
 /* Never returns; exercises the step and time limits. */
 int spin(int x) {
     volatile int v = x;
