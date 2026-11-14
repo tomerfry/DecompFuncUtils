@@ -21,6 +21,13 @@ MCP server's two HTTP transports.
 | `extlink/libtestdep.so.1`, `extlink/testmain` | Committed ELF pair. `testmain` carries `DT_NEEDED [libtestdep.so.1]` plus `UND` dynsym entries; the library defines and exports them. |
 | `scripts/ResolveExternalsHeadlessTest.java` | Exercises `ghidra_resolve_externals`: puts every import back into `<EXTERNAL>`, clears the library association, then checks the tool re-attributes both and stores the exporting address. Independent of whether this Ghidra's own External Symbol Resolver works. |
 | `scripts/BacklinkImportsHeadlessTest.java` | Exercises `ghidra_backlink_imports`: clickable `{@program ...}` back-links and bookmarks written into the library, block replacement on re-run, coexistence with another importer's block, and removal. |
+| `scripts/CrossModuleAnalyzerHeadlessTest.java` | Exercises the `Cross-Module Import Linker` analyzer: that auto-analysis alone leaves the library back-linked, the one-shot path used by Analysis > One Shot, idempotence, and each analysis option. |
+| `angr/angr_demo.c`, `angr/libangrdemo.so` | Source and committed ELF of the `ghidra_angr_emulate` fixture: small functions with one obvious behaviour each (stack arguments, out-parameters, structs, globals, libc calls, an import nothing models, a loop). Rebuild with `angr/build.ps1` (needs clang + lld). |
+| `scripts/AngrEmulateHeadlessTest.java` | Exercises `ghidra_angr_emulate` by calling the fixture's functions by name: argument forms, results, the call trace, faults on missing pointers, stubs, solving for inputs, limits, error messages, and a Ghidra signature changing placement and typing. |
+| `scripts/AngrDebugHeadlessTest.java` | Exercises `ghidra_angr_debug` and `ghidra_angr_hook`, and through them the session layer the panel shares: stepping, breakpoints, forks on an unknown import, paths, concretize / symbolize / set, faults, watches, time limits, and Python hooks (compile check, effect, live reload into a running session, inline hooks, a hook that raises). |
+| `scripts/AngrDebuggerPanelHeadlessTest.java` | Builds the angr Debugger panel without a tool window, drives it by clicking its real buttons against real sessions, checks its tables and banner, and paints it off-screen to `tests/_angr_debugger_*.png`. |
+| `run_angr_tool_test.ps1` | Opens the angr Debugger tool in a real (off-screen) Ghidra window and checks it; `-Export` regenerates the shipped tool file. |
+| `run_angr_test.ps1` | Build -> install -> run for the angr test. Needs a Python with angr (`tools/setup-angr.ps1`). |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
 | `build_binary.ps1` | Recompile `test_vuln.o` (only needed if you edit `test_vuln.c`; requires clang). |
@@ -180,3 +187,74 @@ Three things it has to get right, each of which produced a confusing failure:
   Point it at a drive with room when the system drive is tight. Both runners now
   delete their scratch afterwards; before that, every run left an extracted copy
   of the extension behind.
+
+The analyzer has its own script over the same pair. It needs `-Analyze`, since
+what it checks is what auto-analysis leaves behind:
+
+```powershell
+.\tests\run_resolve_externals_test.ps1 -Script CrossModuleAnalyzerHeadlessTest.java -Analyze
+```
+
+## angr emulation test
+
+```powershell
+.\tools\setup-angr.ps1          # once: a private Python environment with angr
+.\tests\run_angr_test.ps1
+```
+
+The runner uses the interpreter the extension itself would find (the one
+`setup-angr.ps1` recorded) unless `-Python` names another, and exits 2 rather
+than failing when there is none. It starts a real worker process, so it also
+covers the export of Ghidra's memory image, the JSON protocol, worker reuse
+between calls (the second call must be fast) and re-export after the program
+changes.
+
+The debugger has two more scripts on the same runner:
+
+```powershell
+.\tests\run_angr_test.ps1 -Script AngrDebugHeadlessTest.java
+.\tests\run_angr_test.ps1 -Script AngrDebuggerPanelHeadlessTest.java
+```
+
+The runner points `DFU_ANGR_HOOKS` at a scratch folder, so the hooks these
+tests save and delete are never your own. The panel test covers the panel and
+its controller - what the buttons do, what the tables and banner show - and
+leaves PNGs of it in `tests/` to look at. What needs a live Ghidra window is
+covered by the tool test below.
+
+## angr Debugger tool test (a real window)
+
+```powershell
+.\tests\run_angr_tool_test.ps1            # check the tool as shipped
+.\tests\run_angr_tool_test.ps1 -Export    # regenerate the tool file first
+```
+
+This one is not headless. It starts
+`decompfuncutils.angr.ui.AngrDebuggerToolPreview` through Ghidra's own
+`support/launch.bat`, which creates a (hidden) Project window and opens the
+**angr Debugger** tool exactly as shipped on `angr/libangrdemo.so`. The tool
+window is placed off-screen and never takes focus; it is painted into
+`tests/_angr_tool_*.png` rather than looked at. Checked there:
+
+- the tool file is discovered among Ghidra's default tools and the front-end
+  plugin has put it in the Tool Chest;
+- opening it raises no dialog (in particular no "New Plugins Found!"), loads
+  the Listing, the Decompiler and the debugger's plugin, and none of the
+  extension's other plugins;
+- every debugger window is open, the **angr** menu's actions exist with their
+  key bindings;
+- starting a session marks the program counter in the Listing and moves the
+  Listing to it, stepping moves both, a breakpoint gets its marker, a fork
+  brings the Paths window forward, the Imports & Hooks window fills when
+  opened, and Stop clears the marker.
+
+`-Export` rebuilds `src/main/resources/defaultTools/angr_Debugger.tool`: Ghidra
+builds the tool from its plugin packages and the preview replaces the
+improvised window arrangement with the designed one (`arrange()` in the
+preview class). Re-run it when the debugger's windows change or the extension
+gains a plugin: a tool file lists the extension plugins it already knows, and
+Ghidra greets the first launch with "New Plugins Found!" about any other - the
+"raises no dialog" check is what catches a stale list.
+
+Not covered anywhere: key presses and mouse clicks themselves (the actions are
+invoked directly), and the value-prompt and hook-editor dialogs.

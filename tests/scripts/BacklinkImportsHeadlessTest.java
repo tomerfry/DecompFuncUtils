@@ -49,6 +49,16 @@ public class BacklinkImportsHeadlessTest extends GhidraScript {
         println("RESOLVE " + resolved);
 
         BacklinkImportsTool tool = new BacklinkImportsTool();
+
+        // Auto-analysis has already been here: the Cross-Module Import Linker analyzer writes
+        // the same back-links this test is about to check the tool writes. Take them out, so
+        // every check below is about what the tool does from a clean library.
+        Map<String, Object> cleared = (Map<String, Object>) tool.execute(
+            Map.of("remove", true), currentProgram, null);
+        println("CLEARED " + cleared);
+        check("library is clean before the tool runs", plateCommentAt("dep_exported_func") == null
+            && bookmarkAt("dep_exported_func") == null, String.valueOf(plateCommentAt("dep_exported_func")));
+
         check("tool name", "ghidra_backlink_imports".equals(tool.name()), tool.name());
         check("declared mutating", tool.isMutating(), null);
         Map<String, Object> props = (Map<String, Object>) tool.inputSchema().get("properties");
