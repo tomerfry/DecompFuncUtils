@@ -44,6 +44,16 @@ public final class AngrImage {
     /** Refuse to copy more than this much initialized memory; nobody emulates a 1 GiB image by accident. */
     private static final long MAX_IMAGE_BYTES = 1L << 30;
 
+    /**
+     * What image.bin starts with. A program loaded at its image base begins with its own file
+     * header, so the raw memory would start with "\\x7fELF" or "MZ" - and CLE, even when told
+     * the file is a blob, sniffs the format to work out the object's name and parses it as that
+     * executable. A memory image is not laid out like the file, so that parse fails deep inside
+     * the ELF reader (an AssertionError on any binary with a dynamic section the layout
+     * disturbs). With this in front the file is recognisably nothing but ours.
+     */
+    static final byte[] IMAGE_HEADER = "DFU-ANGR-IMAGE\0\0".getBytes(StandardCharsets.US_ASCII);
+
     private static final Gson GSON = new Gson();
     private static final Map<Long, AngrImage> CACHE = new ConcurrentHashMap<>();
     private static volatile Path root;
@@ -100,18 +110,23 @@ public final class AngrImage {
         AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
         List<Map<String, Object>> segments = new ArrayList<>();
         List<Map<String, Object>> zero = new ArrayList<>();
-        long offset = 0;
+        long offset = IMAGE_HEADER.length;
 
         monitor.setMessage("Exporting memory image for angr");
         try (OutputStream out = Files.newOutputStream(dir.resolve("image.bin"))) {
+            out.write(IMAGE_HEADER);
             byte[] buffer = new byte[1 << 16];
             for (MemoryBlock block : program.getMemory().getBlocks()) {
                 monitor.checkCancelled();
-                // Overlays and other spaces are not part of the flat address space the code runs
-                // in, and the EXTERNAL block is Ghidra's stand-in for imports: its addresses are
-                // hook targets, not memory.
-                if (block.isOverlay() || !block.isLoaded() || block.isExternalBlock()
-                        || !block.getStart().getAddressSpace().equals(space)) {
+                // Overlays and other spaces are not part of the flat address space the code runs in.
+                if (block.isOverlay() || !block.getStart().getAddressSpace().equals(space)) {
+                    continue;
+                }
+                // The EXTERNAL block is Ghidra's stand-in for imports. Functions in it are hooked;
+                // imported variables in it are plain storage, so it goes out as zero memory and a
+                // read of 'stdout' or a missing library's global does not fault.
+                boolean external = block.isExternalBlock();
+                if (!block.isLoaded() && !external) {
                     continue;
                 }
                 Map<String, Object> entry = new LinkedHashMap<>();
@@ -121,7 +136,7 @@ public final class AngrImage {
                 entry.put("perm", (block.isRead() ? "r" : "") + (block.isWrite() ? "w" : "")
                     + (block.isExecute() ? "x" : ""));
 
-                if (!block.isInitialized()) {
+                if (!block.isInitialized() || external) {
                     zero.add(entry);
                     continue;
                 }
@@ -164,6 +179,8 @@ public final class AngrImage {
         manifest.put("zero", zero);
         List<Map<String, Object>> externals = externalsOf(program, space);
         manifest.put("externals", externals);
+        manifest.put("externalData", externalDataOf(program, space));
+        manifest.put("stdio", stdioOf(program, space));
 
         Files.writeString(dir.resolve("image.json"), GSON.toJson(manifest), StandardCharsets.UTF_8);
 
@@ -276,6 +293,62 @@ public final class AngrImage {
         return new ArrayList<>(byName.values());
     }
 
+    /**
+     * The program's stdin, stdout and stderr variables, wherever the linker put them: in the
+     * EXTERNAL block when reached through the GOT, or copied into the program's own .bss. The
+     * worker points each at a FILE object, so stdio calls on them work.
+     */
+    private static List<Map<String, Object>> stdioOf(Program program, AddressSpace space) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        String[] names = { "stdin", "stdout", "stderr" };
+        for (int fd = 0; fd < names.length; fd++) {
+            for (ghidra.program.model.symbol.Symbol symbol : program.getSymbolTable().getSymbols(names[fd])) {
+                Address address = symbol.getAddress();
+                if (symbol.isExternal() || !address.getAddressSpace().equals(space)
+                        || !program.getMemory().contains(address)
+                        || program.getFunctionManager().getFunctionAt(address) != null) {
+                    continue;
+                }
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("name", names[fd]);
+                entry.put("addr", hex(address.getOffset()));
+                entry.put("fd", fd);
+                out.add(entry);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Imported variables: labels in the EXTERNAL block that are not functions. With unknown
+     * imports symbolic, the worker makes these unknown as well.
+     */
+    private static List<Map<String, Object>> externalDataOf(Program program, AddressSpace space) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (MemoryBlock block : program.getMemory().getBlocks()) {
+            if (!block.isExternalBlock() || !block.getStart().getAddressSpace().equals(space)) {
+                continue;
+            }
+            ghidra.program.model.symbol.SymbolIterator symbols = program.getSymbolTable()
+                .getSymbolIterator(block.getStart(), true);
+            while (symbols.hasNext() && out.size() < 4096) {
+                ghidra.program.model.symbol.Symbol symbol = symbols.next();
+                Address address = symbol.getAddress();
+                if (!block.contains(address)) {
+                    break;
+                }
+                if (!symbol.isPrimary() || program.getFunctionManager().getFunctionAt(address) != null) {
+                    continue;
+                }
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("name", symbol.getName());
+                entry.put("addr", hex(address.getOffset()));
+                out.add(entry);
+            }
+        }
+        return out;
+    }
+
     @SuppressWarnings("unchecked")
     private static void merge(Map<String, Object> entry, String field, Set<String> values) {
         List<String> list = (List<String>) entry.get(field);
@@ -332,7 +405,7 @@ public final class AngrImage {
         return cleaned.length() > 40 ? cleaned.substring(0, 40) : cleaned;
     }
 
-    static String hex(long value) {
+    public static String hex(long value) {
         return "0x" + Long.toHexString(value);
     }
 }

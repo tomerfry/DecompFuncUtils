@@ -47,6 +47,9 @@ public final class AngrWorkers {
     private static final String SCRIPT_RESOURCE = "/decompfuncutils/angr/dfu_angr_worker.py";
 
     private static final Map<Long, Worker> WORKERS = new LinkedHashMap<>();
+    private static final Set<Dedicated> DEDICATED = new HashSet<>();
+    /** A debug session nobody has touched for this long is given up. */
+    private static final long SESSION_IDLE_MILLIS = TimeUnit.HOURS.toMillis(2);
     private static volatile List<String> workingCommand;
     private static volatile String engineDescription;
     private static volatile boolean hooksInstalled;
@@ -77,6 +80,94 @@ public final class AngrWorkers {
         }
     }
 
+    /**
+     * The "result" of a worker response, or an exception carrying the worker's own explanation
+     * when the request failed.
+     */
+    public static JsonObject resultOf(JsonObject response) {
+        if (response.has("ok") && response.get("ok").getAsBoolean() && response.has("result")) {
+            return response.get("result").getAsJsonObject();
+        }
+        String error = response.has("error") ? response.get("error").getAsString() : "unknown error";
+        boolean internal = response.has("kind") && "internal".equals(response.get("kind").getAsString());
+        if (!internal) {
+            throw new IllegalStateException(error);
+        }
+        // Something broke inside angr or the worker rather than in the request. The whole
+        // traceback goes to the log; the message keeps to what failed and where, which is what
+        // a banner can show and what a bug report needs first.
+        String traceback = response.has("traceback") ? response.get("traceback").getAsString().strip() : "";
+        if (!traceback.isEmpty()) {
+            Msg.error(AngrWorkers.class, "angr worker failed: " + error + "\n" + traceback);
+        }
+        String where = innermostFrames(traceback, 3);
+        throw new IllegalStateException("angr failed internally: " + error.strip()
+            + (where.isEmpty() ? "" : " [" + where + "]")
+            + (traceback.isEmpty() ? "" : ". The full Python traceback is in Ghidra's log (Help > Show Log)."));
+    }
+
+    private static final java.util.regex.Pattern FRAME =
+        java.util.regex.Pattern.compile("File \"([^\"]+)\", line (\\d+), in (\\S+)");
+
+    /** "loader.py:1304 _possible_idents <- loader.py:428 find_object <- ...", innermost first. */
+    static String innermostFrames(String traceback, int count) {
+        List<String> frames = new ArrayList<>();
+        java.util.regex.Matcher matcher = FRAME.matcher(traceback);
+        while (matcher.find()) {
+            String file = matcher.group(1).replace('\\', '/');
+            frames.add(file.substring(file.lastIndexOf('/') + 1) + ":" + matcher.group(2) + " " + matcher.group(3));
+        }
+        Collections.reverse(frames);
+        return String.join(" <- ", frames.subList(0, Math.min(count, frames.size())));
+    }
+
+    /**
+     * Starts a worker that belongs to one caller - a debug session - rather than to the pool, so
+     * its state lives exactly as long as that caller keeps it and stopping it stops nothing else.
+     */
+    public static Dedicated openDedicated(String configuredPython, TaskMonitor monitor) throws Exception {
+        installHooks();
+        Dedicated dedicated = new Dedicated(start(configuredPython, monitor));
+        synchronized (DEDICATED) {
+            DEDICATED.add(dedicated);
+        }
+        return dedicated;
+    }
+
+    /** A worker process owned by one debug session. */
+    public static final class Dedicated {
+        private final Worker worker;
+
+        private Dedicated(Worker worker) {
+            this.worker = worker;
+        }
+
+        /** Runs one request; requests on one worker are serialized. */
+        public JsonObject request(Map<String, Object> body, long timeoutMillis, TaskMonitor monitor)
+                throws Exception {
+            synchronized (worker) {
+                try {
+                    return worker.request(body, timeoutMillis + GRACE_MILLIS, monitor);
+                }
+                finally {
+                    worker.lastUsed = System.currentTimeMillis();
+                }
+            }
+        }
+
+        public boolean isAlive() {
+            return worker.isAlive();
+        }
+
+        /** Stops the process now, even in the middle of a request. */
+        public void close() {
+            synchronized (DEDICATED) {
+                DEDICATED.remove(this);
+            }
+            worker.destroy();
+        }
+    }
+
     /** "angr 10.0.7 on Python 3.12.3", once a worker has started. */
     public static String engine() {
         return engineDescription;
@@ -91,6 +182,14 @@ public final class AngrWorkers {
         }
         for (Worker w : all) {
             w.destroy();
+        }
+        List<Dedicated> owned;
+        synchronized (DEDICATED) {
+            owned = new ArrayList<>(DEDICATED);
+            DEDICATED.clear();
+        }
+        for (Dedicated d : owned) {
+            d.worker.destroy();
         }
     }
 
@@ -161,6 +260,20 @@ public final class AngrWorkers {
         }
         for (Worker w : idle) {
             w.destroy();
+        }
+        List<Dedicated> abandoned = new ArrayList<>();
+        synchronized (DEDICATED) {
+            DEDICATED.removeIf(d -> {
+                boolean stale = !d.worker.isAlive()
+                    || (!d.worker.busy && now - d.worker.lastUsed > SESSION_IDLE_MILLIS);
+                if (stale) {
+                    abandoned.add(d);
+                }
+                return stale;
+            });
+        }
+        for (Dedicated d : abandoned) {
+            d.worker.destroy();
         }
     }
 
