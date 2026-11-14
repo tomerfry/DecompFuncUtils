@@ -53,9 +53,54 @@ public class AngrEmulateHeadlessTest extends GhidraScript {
         }
     }
 
+    /**
+     * A position-independent executable with a dynamic section and DT_NEEDED entries - the shape
+     * of nearly every real Linux binary, and unlike the shared-object fixture one whose memory
+     * image used to be mistaken for an ELF file by the loader.
+     */
+    @SuppressWarnings("unchecked")
+    private void executable() throws Exception {
+        java.nio.file.Path image = decompfuncutils.angr.AngrImage.of(currentProgram, monitor)
+            .directory.resolve("image.bin");
+        byte[] head = new byte[14];
+        try (java.io.InputStream in = java.nio.file.Files.newInputStream(image)) {
+            in.read(head);
+        }
+        check("exe: the exported image does not start like an executable",
+            "DFU-ANGR-IMAGE".equals(new String(head, java.nio.charset.StandardCharsets.US_ASCII)),
+            new String(head, java.nio.charset.StandardCharsets.ISO_8859_1));
+
+        String entry = currentProgram.getListing().getGlobalFunctions("_start").isEmpty() ? "entry" : "_start";
+        Map<String, Object> result;
+        try {
+            result = call(entry, List.of());
+        }
+        catch (Exception e) {
+            check("exe: a PIE executable loads and runs", false, e.getMessage());
+            return;
+        }
+        println("EXE " + result);
+        check("exe: a PIE executable loads and runs", "returned".equals(result.get("outcome")), result);
+        String calls = String.valueOf(result.get("calls"));
+        check("exe: its import from a library that is not there is stubbed, with the argument",
+            calls.contains("dep_exported_func") && calls.contains("0x7")
+                && String.valueOf(result.get("unmodelledExternals")).contains("dep_exported_func"), result);
+        check("exe: addresses in the result are Ghidra's", String.valueOf(result.get("function")).contains(
+            currentProgram.getListing().getGlobalFunctions(entry).get(0).getEntryPoint().toString()),
+            result.get("function"));
+    }
+
     @Override
     @SuppressWarnings("unchecked")
     public void run() throws Exception {
+        if (!"libangrdemo.so".equals(currentProgram.getName())) {
+            executable();
+            // The runner fails on any FAIL line; the shared-object pass prints the summary.
+            if (failures > 0) {
+                println("HEADLESS_TEST_RESULT FAIL (" + currentProgram.getName() + ")");
+            }
+            return;
+        }
         check("tool name", "ghidra_angr_emulate".equals(tool.name()), tool.name());
         check("read-only, off the Swing thread", !tool.isMutating() && !tool.requiresEdt(), null);
         Map<String, Object> props = (Map<String, Object>) tool.inputSchema().get("properties");
@@ -165,6 +210,10 @@ public class AngrEmulateHeadlessTest extends GhidraScript {
         // --- output and heap results ---
         Map<String, Object> hello = call("say_hello", List.of("bob"));
         check("stdout is captured", "hello bob\ndone\n".equals(hello.get("stdout")), hello.get("stdout"));
+        Map<String, Object> report = call("report", List.of("disk"));
+        check("fprintf(stderr, ...) and fputs(..., stdout) work through the imported stream variables",
+            "returned".equals(report.get("outcome")) && "warning: disk\n".equals(report.get("stderr"))
+                && "reported\n".equals(report.get("stdout")), report);
         Map<String, Object> upper = call("dup_upper", List.of("mixed Case"));
         check("a returned heap string is shown", "MIXED CASE".equals(ret(upper).get("string")),
             ret(upper));

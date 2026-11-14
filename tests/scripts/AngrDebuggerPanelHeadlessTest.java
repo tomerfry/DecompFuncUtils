@@ -43,6 +43,10 @@ public class AngrDebuggerPanelHeadlessTest extends GhidraScript {
 
     @Override
     public void run() throws Exception {
+        if (!"libangrdemo.so".equals(currentProgram.getName())) {
+            println(getClass().getSimpleName() + ": skipping " + currentProgram.getName());
+            return;
+        }
         try {
             // The look Ghidra itself uses, when it is available without a display.
             UIManager.setLookAndFeel((LookAndFeel) Class.forName("com.formdev.flatlaf.FlatLightLaf")

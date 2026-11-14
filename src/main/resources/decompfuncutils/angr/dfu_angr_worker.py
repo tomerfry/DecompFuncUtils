@@ -69,6 +69,11 @@ except Exception as exc:  # pylint: disable=broad-except
           "python": sys.version.split()[0], "executable": sys.executable})
     sys.exit(2)
 
+try:  # where angr's stdio models keep the file descriptor inside a FILE
+    from cle.backends.externs.simdata.io_file import io_file_data_for_arch
+except Exception:  # pylint: disable=broad-except
+    io_file_data_for_arch = None
+
 for _name in ("angr", "cle", "pyvex", "claripy", "archinfo"):
     logging.getLogger(_name).setLevel(logging.ERROR)
 
@@ -487,6 +492,7 @@ class Call:
         self.known = []         # (start, end) ranges worth previewing as data
         self.hook_names = {}
         self.unmodelled = set()  # imports angr has no model for, stubbed
+        self.external_symbols = {}  # imported variables made unknown: symbol name -> value
         self.inline_hooks = set()
         self.python_hooks = []
         self.unmodelled_called = set()
@@ -967,12 +973,23 @@ class Call:
                                    endness=arch.memory_endness)
 
         # With unknown imports symbolic, imported variables are unknown too rather than zero.
+        # They are not announced as symbols here: a program imports many it never reads, and a
+        # debugger lists an unknown once the path depends on it (see DebugSession.symbol_table).
         if spec.get("unmodelled") == "symbolic":
+            streams = {item["addr"] for item in image.manifest.get("stdio") or []}
             for item in image.external_data[:256]:
-                value = fresh_symbol(state, "ext_" + str(item["name"]), self.ptr_bits, str(item["name"]))
+                if item["addr"] in streams:
+                    continue  # given a real FILE below
+                name = "ext_" + re.sub(r"[^A-Za-z0-9_]", "_", str(item["name"]))
+                if name in self.external_symbols:
+                    continue
+                value = claripy.BVS(name, self.ptr_bits, explicit_name=True)
+                self.external_symbols[name] = value
                 state.memory.store(h(item["addr"]), value, endness=arch.memory_endness)
-            if image.external_data:
+            if self.external_symbols:
                 self.symbolic_run = True
+
+        self.setup_stdio()
 
         for i, arg in enumerate(spec.get("args") or []):
             label = "arg%d" % i
@@ -989,6 +1006,32 @@ class Call:
             self.seed_memory(seed, "mem%d" % i)
 
         return state
+
+    def setup_stdio(self):
+        """
+        Points the program's stdin / stdout / stderr variables at FILE objects angr's stdio
+        models understand. They are imported variables, so without this they hold NULL and the
+        first fprintf(stderr, ...) - which is how most programs report anything - faults.
+        """
+        items = self.image.manifest.get("stdio") or []
+        if not items or io_file_data_for_arch is None:
+            return
+        try:
+            layout = io_file_data_for_arch(self.arch)
+        except Exception:  # pylint: disable=broad-except
+            return
+        made = {}
+        for item in items:
+            fd = int(item["fd"])
+            if fd not in made:
+                size = int(layout.get("size", 256))
+                addr = self.alloc(size)
+                self.state.memory.store(addr, b"\0" * size)
+                self.state.memory.store(addr + layout["fd"], claripy.BVV(fd, 32),
+                                        endness=self.arch.memory_endness)
+                made[fd] = addr
+            self.state.memory.store(h(item["addr"]), claripy.BVV(made[fd], self.ptr_bits),
+                                    endness=self.arch.memory_endness)
 
     def setup_thread_pointer(self):
         """Give thread-local reads (stack canaries, errno) somewhere mapped to land."""
@@ -1733,13 +1776,22 @@ class DebugSession:
                 names.append(reg.name)
         return names
 
-    def symbol_table(self, state):
-        """Every unknown the path depends on, by the name used to concretize it."""
+    def symbol_table(self, state, used=None):
+        """
+        The unknowns of a path, by the name used to concretize them: the inputs made symbolic,
+        the values unmodelled calls returned, and imported variables.
+
+        :param used: when given, imported variables are listed only if their name is in it -
+                     that is, once something on the path depends on them. None lists them all.
+        """
         table = {}
         for name, bv, _kind in self.call.symbols:
             table[name] = bv
         for _origin, bv in state.globals.get("dfu_assumed", ()):
             for name in bv.variables:
+                table.setdefault(name, bv)
+        for name, bv in self.call.external_symbols.items():
+            if used is None or name in used:
                 table.setdefault(name, bv)
         return table
 
@@ -1759,9 +1811,14 @@ class DebugSession:
         previous = self.shown.get(pid, {})
         current = {}
         registers = []
+        used = set()  # every unknown a register or a branch taken depends on
+        for constraint in state.solver.constraints:
+            used |= constraint.variables
         for name in self.register_names():
             try:
-                row = self.show(state, state.registers.load(name))
+                value = state.registers.load(name)
+                used |= value.variables
+                row = self.show(state, value)
             except Exception:  # pylint: disable=broad-except
                 continue
             row["name"] = name
@@ -1797,7 +1854,7 @@ class DebugSession:
                 out[key] = text_of(data[-16384:]) if printable(data) else {"hex": data[-MAX_DUMP:].hex()}
 
         symbols = []
-        for name, bv in list(self.symbol_table(state).items())[:64]:
+        for name, bv in list(self.symbol_table(state, used).items())[:64]:
             row = self.show(state, bv)
             row["name"] = name
             row["bits"] = bv.size()

@@ -36,6 +36,10 @@ if (-not (Test-Path $hl)) { Write-Error "analyzeHeadless not found at $hl (set G
 
 $fixture = Join-Path $repo "tests\angr\libangrdemo.so"
 if (-not (Test-Path -LiteralPath $fixture)) { Write-Error "Missing fixture $fixture - run tests\angr\build.ps1"; exit 2 }
+# A position-independent executable with DT_NEEDED entries, borrowed from the cross-module
+# fixtures: the shape of a real Linux binary, which the shared-object fixture is not.
+$executable = Join-Path $repo "tests\extlink\testmain"
+if (-not (Test-Path -LiteralPath $executable)) { Write-Error "Missing fixture $executable - run tests\extlink\build.ps1"; exit 2 }
 
 # An interpreter that can import angr, found the same way the extension finds one.
 if (-not $Python) {
@@ -109,7 +113,7 @@ $env:DFU_TEST_OUTPUT = Join-Path $repo "tests"
 $env:XDG_CONFIG_HOME = $settingsRoot
 $env:DFU_ANGR_PYTHON = $Python
 $env:DFU_ANGR_TMP = $imageTmp
-$hlArgs = @($proj, 'T', '-import', $fixture, '-scriptPath', $sp,
+$hlArgs = @($proj, 'T', '-import', $executable, '-import', $fixture, '-scriptPath', $sp,
     '-postScript', $Script, '-deleteProject')
 try {
     & $hl @hlArgs *>&1 | Out-File -FilePath $log -Encoding utf8
@@ -132,7 +136,9 @@ $lines | ForEach-Object { ($_ -replace '^INFO\s+\S+\.java>\s*', '') -replace '\s
         else                         { Write-Host $_ }
     }
 
-if (Select-String -Path $log -Pattern 'HEADLESS_TEST_RESULT PASS' -Quiet) {
+# The post-script runs once per imported program: every run has to pass.
+if ((Select-String -Path $log -Pattern 'HEADLESS_TEST_RESULT PASS' -Quiet) -and
+        -not (Select-String -Path $log -Pattern 'HEADLESS_TEST_RESULT FAIL|CHECK .*: FAIL' -Quiet)) {
     Write-Host "==> RESULT: PASS" -ForegroundColor Green; exit 0
 } else {
     Write-Host "==> RESULT: FAIL (see $log)" -ForegroundColor Red; exit 1

@@ -81,6 +81,10 @@ public class AngrDebugHeadlessTest extends GhidraScript {
     @Override
     @SuppressWarnings("unchecked")
     public void run() throws Exception {
+        if (!"libangrdemo.so".equals(currentProgram.getName())) {
+            println(getClass().getSimpleName() + ": skipping " + currentProgram.getName());
+            return;
+        }
         AtomicInteger notifications = new AtomicInteger();
         AngrDebugger.Listener listener = program -> notifications.incrementAndGet();
         AngrDebugger.addListener(listener);
