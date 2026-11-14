@@ -50,6 +50,26 @@ The search stays inside the current function, stops at the nearest named variabl
 
 Agents get the same lists from the `ghidra_get_dataflow` MCP tool (see below).
 
+### 🔷 Refined Decompiler
+A second pane beside the Decompiler that shows the function under the cursor with **compiler optimizations and inlining undone**. It is a second layer of analysis over the decompiler's output: the token markup is parsed into a typed C syntax tree, the p-code gives every node its machine width and signedness, the disassembly settles what the C cannot (was this `if` a conditional move?), Z3 proves rewrites, and the emulator runs the original instructions against the refined code.
+
+| The decompiler shows | The refined pane shows |
+|----------------------|------------------------|
+| `iVar1 = x + 7; if (-1 < x) iVar1 = x; return iVar1 >> 3;` | `return x / 8;` |
+| `if (n != 0) { do { s = s + n % 10; b = 9 < n; n = n / 10; } while (b); }` | `while (n != 0) { s = s + n % 10; n = n / 10; }` |
+| `if (a < b) b = a; return b;` | `return MIN(a, b);` |
+| `l = -1; do { p = s + 1 + l; l = l + 1; } while (*p != '\0');` | `return strlen(s);` |
+| `*p = 0x31554644; *(undefined4 *)(p + 1) = 0;` | `strncpy((char *)p, "DFU1", 12);` |
+| three lines of `(x ^ k) * 0x1000193 >> 0x13 \| (x ^ k) * 0x326000` | `return mix(mix(mix(a, 0x811c9dc5), b), c);` |
+| `if (((~x * x) & 1) == 0) { ... } else { ... }` | the branch that always runs |
+| `uVar1 = decode_key(0x1234);` | `0x4ede0af8` (the callee, emulated) |
+
+- **Every rewrite says how it was justified** — *proved* by Z3 for all inputs, *tested* by running original and replacement on the same inputs, *structural*, or *applied without a check* — and is tinted accordingly; hover it for what it replaced and the instructions behind it. A proposed rewrite that a check refutes is not applied and is listed with its counterexample.
+- **The emulator has the last word:** the function's machine code and the refined C are run on the same arguments and memory, and the status line reports whether they agree.
+- **Fully configurable, live.** Eleven passes that can be switched, reordered and tuned; built-in rule groups; and your own rewrite rules, one line each (`times3: ($x << 1) + $x => $x * 3`). The code updates as you change the configuration. A wrong rule costs time, not correctness: each match is verified where it is applied.
+
+Enable **RefinedDecompilerPlugin** in *File → Configure*, then *Window → Refined Decompiler* (or right-click in the Decompiler). Nothing in the program is modified. Agents get the same engine through the `ghidra_refine_function` MCP tool. Passes, the rule language, the configuration format and the limits are described in [docs/refined-decompiler.md](docs/refined-decompiler.md).
+
 ---
 
 ## Installation
@@ -313,6 +333,37 @@ rejected. Requested ranges must not overlap, and names must be unique and must
 not collide with unaffected variables. A failed edit rolls back the entire batch.
 Decompiler-only locals need not be committed before replacement. Re-decompile
 afterwards to check the recovered layout; this tool does not split variable lifetimes.
+
+### Refined decompilation through MCP
+
+`ghidra_refine_function` runs the [refinement engine](docs/refined-decompiler.md) on a function
+and returns the refined C, the list of rewrites with how each was justified, and the emulator's
+verdict:
+
+```json
+{ "name": "hash3" }
+```
+
+```json
+{
+  "refined": "uint hash3(uint param_1,uint param_2,uint param_3)\n\n{\n  return mix(mix(mix(param_1, 0x811c9dc5), param_2), param_3);\n}\n",
+  "summary": "8 rewrites (3 proved, 5 tested); emulator agrees on 12 runs; 36 ms",
+  "rewrites": [
+    { "pass": "rules", "rule": "rotl-mul", "status": "proven", "address": "00101ca5",
+      "before": "(((param_1 ^ 0x811c9dc5) * 0x1000193) >> 0x13) | ((param_1 ^ 0x811c9dc5) * 0x326000)",
+      "after": "rotl((param_1 ^ 0x811c9dc5) * 0x1000193, 13)", "disassembly": "..." },
+    { "pass": "inline", "rule": "inlined mix", "status": "tested", "...": "..." }
+  ],
+  "validation": { "outcome": "agrees", "trials": 12, "agreed": 12 }
+}
+```
+
+Use it instead of `ghidra_decompile_function` when the plain output is dominated by optimizer
+artifacts. `proven` rewrites and an `agrees` validation can be relied on; read `assumed` ones with
+care. The run is configurable per call — `disable` / `enable` / `only` take pass ids, `ruleGroups`
+switches rule groups, `rules` adds rewrite rules of your own, `config` takes a whole configuration
+object — and `{"describe": true}` returns the catalog of passes, parameters and rules. With
+`"trace": true` the passes also say why they left a loop or a call alone.
 
 ### Local data flow through MCP
 
