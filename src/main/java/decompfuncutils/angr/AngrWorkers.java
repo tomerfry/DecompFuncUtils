@@ -90,9 +90,35 @@ public final class AngrWorkers {
         }
         String error = response.has("error") ? response.get("error").getAsString() : "unknown error";
         boolean internal = response.has("kind") && "internal".equals(response.get("kind").getAsString());
-        String detail = internal && response.has("traceback")
-            ? " | " + response.get("traceback").getAsString().strip().replace("\n", " | ") : "";
-        throw new IllegalStateException((internal ? "angr failed: " : "") + error + detail);
+        if (!internal) {
+            throw new IllegalStateException(error);
+        }
+        // Something broke inside angr or the worker rather than in the request. The whole
+        // traceback goes to the log; the message keeps to what failed and where, which is what
+        // a banner can show and what a bug report needs first.
+        String traceback = response.has("traceback") ? response.get("traceback").getAsString().strip() : "";
+        if (!traceback.isEmpty()) {
+            Msg.error(AngrWorkers.class, "angr worker failed: " + error + "\n" + traceback);
+        }
+        String where = innermostFrames(traceback, 3);
+        throw new IllegalStateException("angr failed internally: " + error.strip()
+            + (where.isEmpty() ? "" : " [" + where + "]")
+            + (traceback.isEmpty() ? "" : ". The full Python traceback is in Ghidra's log (Help > Show Log)."));
+    }
+
+    private static final java.util.regex.Pattern FRAME =
+        java.util.regex.Pattern.compile("File \"([^\"]+)\", line (\\d+), in (\\S+)");
+
+    /** "loader.py:1304 _possible_idents <- loader.py:428 find_object <- ...", innermost first. */
+    static String innermostFrames(String traceback, int count) {
+        List<String> frames = new ArrayList<>();
+        java.util.regex.Matcher matcher = FRAME.matcher(traceback);
+        while (matcher.find()) {
+            String file = matcher.group(1).replace('\\', '/');
+            frames.add(file.substring(file.lastIndexOf('/') + 1) + ":" + matcher.group(2) + " " + matcher.group(3));
+        }
+        Collections.reverse(frames);
+        return String.join(" <- ", frames.subList(0, Math.min(count, frames.size())));
     }
 
     /**

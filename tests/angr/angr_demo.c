@@ -14,6 +14,13 @@ extern void *malloc(unsigned long);
 extern int printf(const char *, ...);
 extern int puts(const char *);
 
+/* stdio through the imported stream variables, the way programs report errors. */
+struct _IO_FILE;
+extern struct _IO_FILE *stderr;
+extern struct _IO_FILE *stdout;
+extern int fprintf(struct _IO_FILE *, const char *, ...);
+extern int fputs(const char *, struct _IO_FILE *);
+
 /* Not a libc function: nothing knows what it does, so the tool has to stub it. */
 extern int mystery_device_read(int reg);
 
@@ -93,6 +100,13 @@ int needs_device(void) {
 int say_hello(const char *name) {
     printf("hello %s\n", name);
     return puts("done");
+}
+
+/* Writes to both standard streams through the stream variables. */
+int report(const char *what) {
+    fprintf(stderr, "warning: %s\n", what);
+    fputs("reported\n", stdout);
+    return 2;
 }
 
 /* Returns heap memory. */
