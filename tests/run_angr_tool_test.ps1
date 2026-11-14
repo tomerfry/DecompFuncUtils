@@ -89,7 +89,10 @@ function Preview([string[]]$previewArgs, [string]$log) {
         # splits arguments on. A property nobody reads fits both.
         $all = @('fg', 'jdk', 'AngrDebuggerToolPreview', '2G', '-Ddfu.angr.preview',
             'decompfuncutils.angr.ui.AngrDebuggerToolPreview') + $previewArgs
-        & $launch @all *>&1 | Out-File -FilePath $log -Encoding utf8
+        # launch.bat ends with "pause" when the program fails and it believes it was
+        # double-clicked (which is how cmd looks when PowerShell starts a .bat); the run then
+        # hangs with the log locked. An empty stdin answers the pause.
+        '' | & $launch @all *>&1 | Out-File -FilePath $log -Encoding utf8
     }
     finally { $ErrorActionPreference = $prevEAP }
 }
