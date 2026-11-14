@@ -28,6 +28,13 @@ MCP server's two HTTP transports.
 | `scripts/AngrDebuggerPanelHeadlessTest.java` | Builds the angr Debugger panel without a tool window, drives it by clicking its real buttons against real sessions, checks its tables and banner, and paints it off-screen to `tests/_angr_debugger_*.png`. |
 | `run_angr_tool_test.ps1` | Opens the angr Debugger tool in a real (off-screen) Ghidra window and checks it; `-Export` regenerates the shipped tool file. |
 | `run_angr_test.ps1` | Build -> install -> run for the angr test. Needs a Python with angr (`tools/setup-angr.ps1`). |
+| `refine/refine_demo.c`, `refine/librefinedemo.so` | Source and committed ELF of the refinement-engine fixture: an **optimized** (`-O2`) build in which every function has one obvious source-level meaning the optimizer obscured (division by a constant, rotated loops, conditional moves, open-coded `strlen` / `memset` / `memcpy`, merged stores, inlined helpers, an opaque predicate, a constant-argument call). Rebuild with `refine/build.ps1` (needs clang + lld). |
+| `scripts/RefineEngineHeadlessTest.java` | Exercises the refinement engine: the syntax tree against the decompiler's output, what each pass recovers, how each rewrite is justified, configuration and rule changes, the emulator comparison, the `ghidra_refine_function` tool, and the contents of the Refined Decompiler window. |
+| `run_refine_test.ps1` | Build -> install -> run for the refinement test. `-Script` / `-Binary` / `-ScriptArgs` / `-ShowAll` also make it the runner for the diagnostic scripts below. |
+| `run_refine_gui_test.ps1` | Opens the Refined Decompiler in a real (off-screen) Ghidra tool window on the fixture, drives it, and saves pictures. See *In a real window* below. |
+| `scripts/RefineShow.java` | Diagnostic helper: refined code and rewrite log for every function of a binary (`REFINE_DUMP_OUT` = file to write, `REFINE_TRACE=1`, `REFINE_SIGS` = prototypes to apply first). |
+| `scripts/RefineDump.java` | Diagnostic helper: checks that the syntax tree reprints the decompiler's output for every function of a binary, and lists statements the parser kept as raw text. |
+| `scripts/RefineSnapshot.java` | Diagnostic helper: renders the Refined Decompiler window's contents for one function to a PNG, off screen (`REFINE_SNAPSHOT_OUT`). |
 | `scripts/DebugDecomp.java` | Diagnostic helper: dumps decompiled C and the matcher log for a few functions. |
 | `run_headless_test.ps1` | Build → install → run → report. Exits 0 on PASS, 1 on FAIL. |
 | `build_binary.ps1` | Recompile `test_vuln.o` (only needed if you edit `test_vuln.c`; requires clang). |
@@ -193,6 +200,69 @@ what it checks is what auto-analysis leaves behind:
 
 ```powershell
 .\tests\run_resolve_externals_test.ps1 -Script CrossModuleAnalyzerHeadlessTest.java -Analyze
+```
+
+## Refinement engine test
+
+```powershell
+.\tests\run_refine_test.ps1
+```
+
+Imports `refine/librefinedemo.so` with auto-analysis and runs `RefineEngineHeadlessTest`. No
+Python and no compiler are needed (the solver is the bundled Z3, the fixture is committed). What
+it checks:
+
+- **The syntax tree**: every function of the fixture reprints token for token as the decompiler
+  printed it, with no statement kept as raw text; node widths and signedness come from p-code;
+  with every pass off the engine changes nothing.
+- **Recovery**: one check per idiom in the fixture -- the expected source-level form is present
+  and the artifact is gone -- and the functions the decompiler already shows correctly are left
+  untouched.
+- **Justification**: which rewrites are proved, tested or structural; that the loop-guard
+  equivalence is a proof; that no rewrite on the fixture is unchecked or refuted; that turning
+  verification off is labelled as such.
+- **Configuration**: switching a pass, a rule group or a pass parameter changes the output as it
+  should; pass order matters; a configuration survives JSON and a stale one is repaired;
+  cancelling is reported; tracing explains a loop that was left alone.
+- **User rules**: a correct rule is applied and proved; a wrong rule is refuted with a
+  counterexample and changes nothing; a rule introducing an unknown function is applied as
+  assumed, or refused when verification is demanded; guards and `eval`; syntax errors are reported
+  with their line.
+- **Emulator comparison**: the machine code agrees with the refined code on every fixture
+  function -- and, with verification switched off and a deliberately wrong rule applied, the
+  comparison reports the disagreement.
+- **`ghidra_refine_function`** over JSON-RPC, including argument validation.
+- **The window's contents**, built off screen: text-to-rewrite mapping, tooltips, line addresses,
+  and that each configuration control edits the configuration and reports the change. The docking
+  shell around it (toolbar actions, cursor tracking in a running tool) needs a real window; that
+  is the next test.
+
+### In a real window
+
+```powershell
+.\tests\run_refine_gui_test.ps1
+```
+
+Starts `decompfuncutils.refine.ui.RefinedDecompilerPreview` through Ghidra's own launcher: a code
+browser tool window (Ghidra's core plugins, so Listing and Decompiler) on the fixture, with
+`RefinedDecompilerPlugin` added the way *File → Configure* adds it. The window is placed off
+screen and never takes focus; it is painted into `tests/_refined_gui_*.png`. It checks that
+
+- the plugin loads, registers its window and actions, and raises no dialog;
+- the window refines the function under the cursor and follows the cursor to another function;
+- clicking a refined line moves the Listing to that line's address;
+- switching a pass off, and typing a rule (a right one, then a wrong one), changes the code
+  without anything else being pressed;
+- the toolbar's *Show Decompiler Output* and *Show Configuration* do what they say;
+- renaming the function in the program refreshes the window;
+- the configuration is saved with the tool and restored;
+- a hidden window does no work and catches up when shown again.
+
+To look at what the engine does to some other binary:
+
+```powershell
+$env:REFINE_DUMP_OUT = "D:\temp\refined.txt"
+.\tests\run_refine_test.ps1 -Script RefineShow.java -Binary C:\path\to\some.exe -ShowAll
 ```
 
 ## angr emulation test

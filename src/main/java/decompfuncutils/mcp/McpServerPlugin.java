@@ -360,6 +360,7 @@ public class McpServerPlugin extends ProgramPlugin
         toolRegistry.register(new GetProgramInfoTool());
         toolRegistry.register(new ListFunctionsTool());
         toolRegistry.register(new DecompileFunctionTool(decompPool));
+        toolRegistry.register(new RefineFunctionTool());
         toolRegistry.register(new GetFunctionTool());
         toolRegistry.register(new GetXrefsToTool());
         toolRegistry.register(new GetXrefsFromTool());

@@ -1,0 +1,54 @@
+# Built-in rewrite rules of the refinement engine.
+#
+#   [group-name off] description        a group; "off" = disabled unless switched on
+#   rule-name: pattern => replacement where guard
+#
+# $x matches any expression, $c:const only a constant, $v:var only a variable; a name used twice
+# must match the same thing both times. (_)e matches a cast to any type. Operands of commutative
+# operators match in either order, and "a < b" also matches "b > a".
+#
+# Guards are integer expressions over the bound constants and: bits($x), signed($x), unsigned($x),
+# is_ptr($x), is_const($x), pure($x), sval($c), is_pow2(n), log2(n), mask(n) = 2^n - 1,
+# signed_op(), unsigned_op(). In a replacement, eval(expr) becomes the constant it evaluates to,
+# and as_signed($x) / as_unsigned($x) cast only where the signedness actually changes.
+#
+# A rule only proposes. Every instance is tested, and proved where the solver can, before it is
+# applied; a rule that is wrong for some input is refused at that site and reported.
+
+[bit-idioms] Rotates, sign extraction and absolute value written with shifts and masks
+rotl:        ($x << $a:const) | ($x >> $b:const) => rotl($x, $a)
+                 where unsigned($x) && $a + $b == bits($x)
+rotl-mul:    (($x * $c:const) >> $s:const) | ($x * $d:const) => rotl($x * $c, eval(bits($x) - $s))
+                 where unsigned($x) && $s < bits($x) && $d == (($c << (bits($x) - $s)) & mask(bits($x)))
+sign:        (_)($x != 0) | ($x >> $s:const) => ($x > 0) - ($x < 0)
+                 where signed($x) && $s == bits($x) - 1
+abs-xor:     ($x ^ ($x >> $s:const)) - ($x >> $s) => abs($x)
+                 where signed($x) && $s == bits($x) - 1
+abs-select:  ($x < 0) ? -$x : $x => abs($x)
+abs-negated: (-$x < 0) ? $x : -$x => abs($x)
+
+[division] Division and remainder the compiler replaced with shifts, adds and multiplies
+sdiv-pow2:   (($x < 0) ? $x + $m:const : $x) >> $s:const => $x / eval(1 << $s)
+                 where signed($x) && $m == mask($s)
+sdiv-pow2-b: ($x + (($x >> $t:const) & $m:const)) >> $s:const => $x / eval(1 << $s)
+                 where signed($x) && $t == bits($x) - 1 && $m == mask($s)
+mod-of-div:  $x - ($x / $d) * $d => $x % $d
+
+[range] Range checks folded into a single unsigned comparison
+in-range:    ($x - $lo:const) < $n:const => eval($lo) <= $x && $x < eval($lo + $n)
+                 where unsigned_op() && $n > 1 && $lo + $n <= mask(signed($x) ? bits($x) - 1 : bits($x))
+in-range-le: ($x - $lo:const) <= $n:const => eval($lo) <= $x && $x <= eval($lo + $n)
+                 where unsigned_op() && $n > 0 && $lo + $n <= mask(signed($x) ? bits($x) - 1 : bits($x))
+out-of-range: ($x - $lo:const) > $n:const => $x < eval($lo) || $x > eval($lo + $n)
+                 where unsigned_op() && $n > 0 && $lo + $n <= mask(signed($x) ? bits($x) - 1 : bits($x))
+
+[strength off] Shifts and repeated adds back to the multiplication they implement
+shl-to-mul:  $x << $c:const => $x * eval(1 << $c)
+                 where $c > 0 && $c < bits($x) - 1 && !is_ptr($x)
+add-self:    $x + $x => $x * 2 where pure($x)
+shl-add:     ($x << $c:const) + $x => $x * eval((1 << $c) + 1) where pure($x) && $c < bits($x) - 1
+shl-sub:     ($x << $c:const) - $x => $x * eval((1 << $c) - 1) where pure($x) && $c < bits($x) - 1
+
+[masks off] Bit masks read as arithmetic (off by default: a mask is usually meant as a mask)
+umod-pow2:   $x & $m:const => $x % eval($m + 1) where unsigned($x) && is_pow2($m + 1) && $m > 1
+udiv-pow2:   $x >> $c:const => $x / eval(1 << $c) where unsigned($x) && $c > 0 && $c < bits($x)
