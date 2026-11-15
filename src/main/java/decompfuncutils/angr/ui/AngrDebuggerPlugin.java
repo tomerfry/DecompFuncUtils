@@ -2,6 +2,7 @@ package decompfuncutils.angr.ui;
 
 import decompfuncutils.angr.AngrDebugSession;
 import decompfuncutils.angr.AngrDebugger;
+import decompfuncutils.angr.AngrModules;
 import decompfuncutils.mcp.tools.AngrEmulateTool;
 import docking.ActionContext;
 import docking.WindowPosition;
@@ -15,6 +16,7 @@ import ghidra.app.plugin.ProgramPlugin;
 import ghidra.app.services.GoToService;
 import ghidra.app.services.MarkerService;
 import ghidra.app.services.MarkerSet;
+import ghidra.app.services.ProgramManager;
 import ghidra.framework.plugintool.ComponentProviderAdapter;
 import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.PluginTool;
@@ -34,10 +36,14 @@ import java.awt.RenderingHints;
 import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The angr Debugger as a set of dockable windows: a control strip (what to debug, the step
@@ -77,7 +83,10 @@ public class AngrDebuggerPlugin extends ProgramPlugin
     private final Map<Program, MarkerSet> destinationMarkers = new HashMap<>();
     private final List<DockingAction> actions = new ArrayList<>();
     private ToggleDockingAction followAction;
-    private Address lastShown;
+    private AngrModules.Location lastShown;
+    private Program lastSubject;
+    /** The programs open in this tool belong together: a destination in one counts for the others. */
+    private final AngrDebugger.Companions companions = this::openWith;
 
     public AngrDebuggerPlugin(PluginTool tool) {
         super(tool);
@@ -95,6 +104,17 @@ public class AngrDebuggerPlugin extends ProgramPlugin
             provider(view, panel.view(view), WindowPosition.BOTTOM, "angr.trace", WindowPosition.STACK);
         }
         createActions();
+        AngrDebugger.addCompanions(companions);
+    }
+
+    private List<Program> openPrograms() {
+        ProgramManager manager = tool.getService(ProgramManager.class);
+        return manager == null ? List.of() : List.of(manager.getAllOpenPrograms());
+    }
+
+    private Collection<Program> openWith(Program program) {
+        List<Program> open = openPrograms();
+        return open.contains(program) ? open : List.of();
     }
 
     /** The controller behind the windows; for the tool preview and tests. */
@@ -231,7 +251,7 @@ public class AngrDebuggerPlugin extends ProgramPlugin
         DockingAction runToCursor = new DockingAction("angr Run to Cursor", getName()) {
             @Override
             public void actionPerformed(ActionContext context) {
-                controller.runTo(addressOf(context));
+                controller.runTo(getCurrentProgram(), addressOf(context));
             }
 
             @Override
@@ -268,7 +288,8 @@ public class AngrDebuggerPlugin extends ProgramPlugin
 
             @Override
             public boolean isEnabledForContext(ActionContext context) {
-                return steppable() && AngrDebugger.destination(getCurrentProgram()) != null;
+                AngrDebugSession session = session();
+                return steppable() && !AngrDebugger.destinations(session.program).isEmpty();
             }
         };
         seek.setKeyBindingData(new KeyBindingData(KeyEvent.VK_F9, 0));
@@ -364,9 +385,10 @@ public class AngrDebuggerPlugin extends ProgramPlugin
         return currentLocation == null ? null : currentLocation.getAddress();
     }
 
+    /** The session on screen: the current program's, or the one that has it loaded as a library. */
     private AngrDebugSession session() {
         Program program = getCurrentProgram();
-        return program == null ? null : AngrDebugger.session(program);
+        return program == null ? null : AngrDebugger.sessionShowing(program);
     }
 
     private boolean steppable() {
@@ -379,8 +401,18 @@ public class AngrDebuggerPlugin extends ProgramPlugin
     @Override
     public void goTo(Program program, Address address) {
         GoToService goTo = tool.getService(GoToService.class);
-        if (goTo != null && program == getCurrentProgram()) {
+        if (goTo == null || program.isClosed()) {
+            return;
+        }
+        if (program == getCurrentProgram()) {
             goTo.goTo(address);
+            return;
+        }
+        // Execution is in another program - a library loaded into the session: show that one.
+        ProgramManager manager = tool.getService(ProgramManager.class);
+        if (manager != null) {
+            manager.openProgram(program, ProgramManager.OPEN_CURRENT);
+            goTo.goTo(address, program);
         }
     }
 
@@ -400,38 +432,60 @@ public class AngrDebuggerPlugin extends ProgramPlugin
         if (program.isClosed()) {
             return;
         }
-        Address where = session == null || session.isRunning() ? null : session.pc();
+        AngrModules.Location where = session == null || session.isRunning() ? null : session.where();
         MarkerService markers = tool.getService(MarkerService.class);
         if (markers != null) {
-            MarkerSet breakpoints = breakpointMarkers.computeIfAbsent(program, p ->
-                markers.createPointMarker(BREAKPOINT_MARKERS, "Breakpoints of the angr Debugger", p,
-                    MarkerService.BREAKPOINT_PRIORITY, true, true, true, breakpointColor(), breakpointIcon()));
-            breakpoints.clearAll();
-            for (Address address : AngrDebugger.breakpoints(program)) {
-                breakpoints.add(address);
+            // Every program of the session that is open here gets its markers, not only the one
+            // on screen: the program counter may be in any of them.
+            List<Program> open = openPrograms();
+            Set<Program> marked = Collections.newSetFromMap(new IdentityHashMap<>());
+            marked.add(program);
+            marked.addAll(pcMarkers.keySet());
+            if (getCurrentProgram() != null) {
+                marked.add(getCurrentProgram());
             }
-            MarkerSet destinations = destinationMarkers.computeIfAbsent(program, p ->
-                markers.createPointMarker(DESTINATION_MARKERS, "Where the angr Debugger is trying to get to", p,
-                    MarkerService.BREAKPOINT_PRIORITY + 2, true, true, true, destinationColor(), destinationIcon()));
-            destinations.clearAll();
-            Address destination = AngrDebugger.destination(program);
-            if (destination != null && program.getMemory().contains(destination)) {
-                destinations.add(destination);
+            if (session != null) {
+                for (AngrModules.Module module : session.modules.modules()) {
+                    marked.add(module.program);
+                }
             }
-            MarkerSet pc = pcMarkers.computeIfAbsent(program, p ->
-                markers.createPointMarker(PC_MARKERS, "Where the angr Debugger is stopped", p,
-                    MarkerService.BREAKPOINT_PRIORITY + 1, true, true, true, pcColor(), pcIcon()));
-            pc.clearAll();
-            if (where != null && program.getMemory().contains(where)) {
-                pc.add(where);
+            for (Program shown : marked) {
+                if (shown.isClosed() || shown != program && !open.contains(shown)) {
+                    continue;
+                }
+                mark(markers, shown, where);
             }
         }
-        if (where != null && !where.equals(lastShown) && followAction.isSelected()
-                && program.getMemory().contains(where)) {
-            goTo(program, where);
+        if (where != null && !where.equals(lastShown) && followAction.isSelected()) {
+            goTo(where.program(), where.address());
         }
         lastShown = where;
         tool.contextChanged(providers.get(CONTROL_VIEW));
+    }
+
+    private void mark(MarkerService markers, Program program, AngrModules.Location where) {
+        MarkerSet breakpoints = breakpointMarkers.computeIfAbsent(program, p ->
+            markers.createPointMarker(BREAKPOINT_MARKERS, "Breakpoints of the angr Debugger", p,
+                MarkerService.BREAKPOINT_PRIORITY, true, true, true, breakpointColor(), breakpointIcon()));
+        breakpoints.clearAll();
+        for (Address address : AngrDebugger.breakpoints(program)) {
+            breakpoints.add(address);
+        }
+        MarkerSet destinations = destinationMarkers.computeIfAbsent(program, p ->
+            markers.createPointMarker(DESTINATION_MARKERS, "Where the angr Debugger is trying to get to", p,
+                MarkerService.BREAKPOINT_PRIORITY + 2, true, true, true, destinationColor(), destinationIcon()));
+        destinations.clearAll();
+        Address destination = AngrDebugger.destination(program);
+        if (destination != null && program.getMemory().contains(destination)) {
+            destinations.add(destination);
+        }
+        MarkerSet pc = pcMarkers.computeIfAbsent(program, p ->
+            markers.createPointMarker(PC_MARKERS, "Where the angr Debugger is stopped", p,
+                MarkerService.BREAKPOINT_PRIORITY + 1, true, true, true, pcColor(), pcIcon()));
+        pc.clearAll();
+        if (where != null && where.program() == program && program.getMemory().contains(where.address())) {
+            pc.add(where.address());
+        }
     }
 
     /** The marker sets, by kind ("pc", "breakpoints" or "destination"); for the tool preview and tests. */
@@ -444,9 +498,15 @@ public class AngrDebuggerPlugin extends ProgramPlugin
 
     @Override
     protected void programActivated(Program program) {
-        lastShown = null;
-        // The import list on screen belongs to the program that was active before.
-        controller.panel().forgetImports();
+        // Following execution into a library changes the program on screen but not the session:
+        // only a different session is a reason to start over.
+        Program subject = controller.subject();
+        if (subject != lastSubject) {
+            lastSubject = subject;
+            lastShown = null;
+            // The import list on screen belongs to the program that was debugged before.
+            controller.panel().forgetImports();
+        }
         controller.refresh();
     }
 
@@ -484,6 +544,7 @@ public class AngrDebuggerPlugin extends ProgramPlugin
         for (Program program : new ArrayList<>(pcMarkers.keySet())) {
             removeMarkers(program);
         }
+        AngrDebugger.removeCompanions(companions);
         controller.dispose();
         for (DockingAction action : actions) {
             tool.removeAction(action);

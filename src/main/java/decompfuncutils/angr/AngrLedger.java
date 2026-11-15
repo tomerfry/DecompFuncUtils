@@ -37,6 +37,14 @@ public final class AngrLedger {
             sb.append("\nDestination: `").append(ledger.get("destination")).append("`")
               .append(Boolean.TRUE.equals(ledger.get("atDestination")) ? " - reached.\n" : " - not reached on this path.\n");
         }
+        if (ledger.get("modules") instanceof List<?> modules && !modules.isEmpty()) {
+            // Places written library!function are in these, whose code ran where it was called.
+            sb.append("\nLoaded with the program: ");
+            for (int i = 0; i < modules.size(); i++) {
+                sb.append(i == 0 ? "`" : ", `").append(modules.get(i)).append('`');
+            }
+            sb.append(".\n");
+        }
 
         List<Map<String, Object>> entries = ledger.get("entries") instanceof List<?> l
             ? (List<Map<String, Object>>) l : List.of();

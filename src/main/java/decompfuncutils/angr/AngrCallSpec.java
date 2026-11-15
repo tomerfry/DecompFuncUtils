@@ -76,9 +76,24 @@ public final class AngrCallSpec {
      * {@code unmodelledImports} ("symbolic" or "zero") and {@code hooks} (false to leave the
      * program's saved Python hooks out).
      */
-    @SuppressWarnings("unchecked")
     public static AngrCallSpec build(Program program, Map<String, Object> arguments, TaskMonitor monitor)
             throws Exception {
+        if (program == null) {
+            throw new IllegalStateException("No program is open");
+        }
+        return build(program, arguments, AngrModules.single(program), monitor);
+    }
+
+    /**
+     * The same, with libraries of the project loaded next to the program: imports they define
+     * run their code. The function called, and every name in the arguments, is still looked up
+     * in the program itself.
+     *
+     * @param modules the program first, then what runs with it
+     */
+    @SuppressWarnings("unchecked")
+    public static AngrCallSpec build(Program program, Map<String, Object> arguments, AngrModules modules,
+            TaskMonitor monitor) throws Exception {
         if (program == null) {
             throw new IllegalStateException("No program is open");
         }
@@ -129,7 +144,7 @@ public final class AngrCallSpec {
             args.add(arg);
         }
 
-        AngrImage image = AngrImage.of(program, monitor);
+        AngrImage image = AngrImage.of(modules, monitor);
 
         Map<String, Object> spec = new LinkedHashMap<>();
         spec.put("entry", hex(entry.getOffset() | (isThumb(program, entry) ? 1 : 0)));
@@ -183,6 +198,7 @@ public final class AngrCallSpec {
         applyStubs(program, image, arguments.get("stubs"), spec);
 
         List<String> warnings = new ArrayList<>(placement.warnings);
+        warnings.addAll(image.notes);
         if (!Boolean.FALSE.equals(arguments.get("hooks"))) {
             spec.put("pyHooks", AngrHooks.toSpec(program, image, warnings));
         }
@@ -680,8 +696,13 @@ public final class AngrCallSpec {
     // Result: put Ghidra's names on the worker's addresses
     // ---------------------------------------------------------------------------------------
 
-    @SuppressWarnings("unchecked")
     public static void annotate(Program program, Map<String, Object> body) {
+        annotate(AngrModules.single(program), body);
+    }
+
+    /** The same over several programs in one address space; names outside the first say which. */
+    @SuppressWarnings("unchecked")
+    public static void annotate(AngrModules modules, Map<String, Object> body) {
         List<Map<String, Object>> paths = new ArrayList<>();
         paths.add(body);
         if (body.get("paths") instanceof List<?> list) {
@@ -693,7 +714,7 @@ public final class AngrCallSpec {
         }
         for (Map<String, Object> path : paths) {
             if (path.get("stoppedAt") instanceof String at) {
-                path.put("stoppedAt", codeLabel(program, at));
+                path.put("stoppedAt", modules.codeLabel(at));
             }
             if (path.get("fault") instanceof Map<?, ?> fault && path.get("stoppedAt") != null) {
                 ((Map<String, Object>) fault).put("inBlockAt", path.remove("stoppedAt"));
@@ -705,21 +726,20 @@ public final class AngrCallSpec {
                     }
                     Map<String, Object> call = (Map<String, Object>) m;
                     if (call.get("call") instanceof String target && target.startsWith("0x")) {
-                        Address address = tryAddress(program, target);
-                        Function f = address == null ? null : program.getFunctionManager().getFunctionAt(address);
-                        if (f != null) {
-                            call.put("call", f.getName());
+                        String name = modules.functionAt(target);
+                        if (name != null) {
+                            call.put("call", name);
                         }
                     }
                     if (call.get("from") instanceof String from) {
-                        call.put("from", codeLabel(program, from));
+                        call.put("from", modules.codeLabel(from));
                     }
                 }
             }
             if (path.get("globalWrites") instanceof List<?> writes) {
                 for (Object o : writes) {
                     if (o instanceof Map<?, ?> m && m.get("address") instanceof String address) {
-                        String label = dataLabel(program, address);
+                        String label = modules.dataLabel(address);
                         if (label != null) {
                             ((Map<String, Object>) m).put("symbol", label);
                         }

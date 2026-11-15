@@ -2,10 +2,7 @@ package decompfuncutils.angr;
 
 import com.google.gson.Gson;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.listing.Data;
-import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Program;
-import ghidra.program.model.symbol.Symbol;
 import ghidra.util.task.TaskMonitor;
 
 import java.util.*;
@@ -33,6 +30,10 @@ public final class AngrDebugSession {
     public final AngrCallSpec call;
     /** What the session was started with, so it can be started again. */
     public final Map<String, Object> launchArguments;
+    /** The programs loaded together: this one first, then libraries whose code its imports run. */
+    public final AngrModules modules;
+    /** The interpreter it was started with, so it can be started again. */
+    final String python;
 
     private final AngrWorkers.Dedicated worker;
     private final long sessionId;
@@ -41,53 +42,67 @@ public final class AngrDebugSession {
     private volatile Map<String, Object> snapshot;
     private volatile Map<String, Object> lastLedger;
     private AngrReach reach;
-    private Address reachFor;
+    private List<AngrModules.Location> reachFor;
     private volatile boolean running;
     private volatile boolean pauseRequested;
     private volatile boolean closed;
 
     private AngrDebugSession(Program program, AngrCallSpec call, Map<String, Object> launchArguments,
-            AngrWorkers.Dedicated worker, long sessionId) {
+            AngrModules modules, String python, AngrWorkers.Dedicated worker, long sessionId) {
         this.program = program;
         this.call = call;
         this.launchArguments = launchArguments;
+        this.modules = modules;
+        this.python = python;
         this.worker = worker;
         this.sessionId = sessionId;
     }
 
-    /** Starts a worker, loads the program into it and stops at the function's first instruction. */
+    /**
+     * Starts a worker, loads the program - and the libraries that go with it - into it and stops
+     * at the function's first instruction.
+     *
+     * @param modules the program first; this session lets go of them when it closes
+     */
     @SuppressWarnings("unchecked")
     static AngrDebugSession open(Program program, String python, Map<String, Object> arguments,
-            TaskMonitor monitor) throws Exception {
+            AngrModules modules, TaskMonitor monitor) throws Exception {
         Map<String, Object> launch = new LinkedHashMap<>(arguments);
         // A debugger exists to look at what is unknown: imports nothing models return unknown
         // values unless the caller says otherwise.
         launch.putIfAbsent("unmodelledImports", "symbolic");
-        AngrCallSpec call = AngrCallSpec.build(program, launch, monitor);
-
+        AngrCallSpec call;
         AngrWorkers.Dedicated worker;
         try {
+            call = AngrCallSpec.build(program, launch, modules, monitor);
             worker = AngrWorkers.openDedicated(python, monitor);
         }
         catch (AngrWorkers.AngrUnavailableException e) {
+            modules.release();
             throw new IllegalStateException(e.getMessage());
+        }
+        catch (Exception e) {
+            modules.release();
+            throw e;
         }
         try {
             Map<String, Object> request = new LinkedHashMap<>();
             request.put("op", "dbg_open");
             request.put("imageDir", call.image.directory.toString());
             request.put("spec", call.spec);
-            monitor.setMessage("Loading " + program.getName() + " into angr");
+            monitor.setMessage("Loading " + program.getName()
+                + (modules.size() > 1 ? " and " + String.join(", ", modules.libraryNames()) : "") + " into angr");
             Map<String, Object> first = GSON.fromJson(
                 AngrWorkers.resultOf(worker.request(request, QUICK_MILLIS, monitor)), Map.class);
             AngrCallSpec.tidyNumbers(first);
             long id = ((Number) first.get("session")).longValue();
-            AngrDebugSession session = new AngrDebugSession(program, call, launch, worker, id);
+            AngrDebugSession session = new AngrDebugSession(program, call, launch, modules, python, worker, id);
             session.accept(first);
             return session;
         }
         catch (Exception e) {
             worker.close();
+            modules.release();
             throw e;
         }
     }
@@ -112,17 +127,42 @@ public final class AngrDebugSession {
         return String.valueOf(snapshot.get("status"));
     }
 
-    /** The current instruction address, or null when it is not concrete. */
+    /**
+     * The current instruction when it is in this program; null when it is not concrete, or when
+     * execution is in a library ({@link #where()} says which).
+     */
     public Address pc() {
-        return address(snapshot.get("pc"));
+        AngrModules.Location location = where();
+        return location == null || location.program() != program ? null : location.address();
     }
 
-    private Address address(Object hex) {
-        if (!(hex instanceof String text)) {
+    /** The program and address execution is at, or null when the address is not concrete. */
+    public AngrModules.Location where() {
+        return location(snapshot.get("pc"));
+    }
+
+    /** True until the session has executed anything: starting it again loses nothing. */
+    boolean pristine() {
+        Object executed = snapshot.get("instructions");
+        Object paths = snapshot.get("paths");
+        return executed instanceof Number n && n.longValue() == 0
+            && (!(paths instanceof List<?> list) || list.size() <= 1);
+    }
+
+    private AngrModules.Location location(Object hex) {
+        if (!(hex instanceof String text) || !text.matches("0[xX][0-9a-fA-F]{1,16}")) {
             return null;
         }
-        Address address = AngrCallSpec.tryAddress(program, text);
-        return address == null ? null : address.getNewAddress(address.getOffset() & ~thumbBit());
+        return modules.locate(Long.parseUnsignedLong(text.substring(2), 16) & ~thumbBit());
+    }
+
+    /** The address a place in one of the loaded programs runs at, as the worker takes it. */
+    private String angr(Program in, Address address) {
+        Long value = modules.toAngr(in, address);
+        if (value == null) {
+            throw new IllegalArgumentException(AngrModules.nameOf(in) + " is not loaded in this session.");
+        }
+        return AngrImage.hex(value);
     }
 
     private long thumbBit() {
@@ -140,7 +180,15 @@ public final class AngrDebugSession {
      */
     public synchronized Map<String, Object> step(String kind, int count, Address runTo, long budgetMillis,
             TaskMonitor monitor) throws Exception {
+        return stepUntil(kind, count, runTo == null ? null : new AngrModules.Location(program, runTo), budgetMillis,
+            monitor);
+    }
+
+    /** The same, with the one-time stop anywhere in the loaded programs. */
+    public synchronized Map<String, Object> stepUntil(String kind, int count, AngrModules.Location runTo,
+            long budgetMillis, TaskMonitor monitor) throws Exception {
         ensureOpen();
+        String runToAddress = runTo == null ? null : angr(runTo.program(), runTo.address());
         running = true;
         pauseRequested = false;
         AngrDebugger.fire(program);
@@ -154,12 +202,15 @@ public final class AngrDebugSession {
                 request.put("count", Math.max(1, count));
                 request.put("timeoutMs", slice);
                 List<String> stops = new ArrayList<>();
-                for (Address breakpoint : AngrDebugger.breakpoints(program)) {
-                    stops.add(AngrImage.hex(breakpoint.getOffset()));
+                // A breakpoint in a library counts while that library is loaded.
+                for (AngrModules.Module module : modules.modules()) {
+                    for (Address breakpoint : AngrDebugger.breakpoints(module.program)) {
+                        stops.add(AngrImage.hex(module.toAngr(breakpoint)));
+                    }
                 }
                 request.put("breakpoints", stops);
-                if (runTo != null) {
-                    request.put("runTo", AngrImage.hex(runTo.getOffset()));
+                if (runToAddress != null) {
+                    request.put("runTo", runToAddress);
                 }
                 Map<String, Object> result = send(request, slice + QUICK_MILLIS, monitor);
                 if (!"timeout".equals(result.get("stop"))) {
@@ -190,9 +241,9 @@ public final class AngrDebugSession {
     // ---- seeking the destination ----
 
     /**
-     * Looks for a way from the current path to the program's destination
-     * ({@link AngrDebugger#destination}) and, when it finds one, makes that path the current one
-     * and reads its ledger.
+     * Looks for a way from the current path to a destination ({@link AngrDebugger#destinations} -
+     * in this program, or in a library loaded with it) and, when it finds one, makes that path
+     * the current one and reads its ledger.
      *
      * <p>Unlike {@link #step}, forks do not stop it: every side of every branch on an unknown is
      * followed. With {@code guided}, Ghidra's control-flow graph tells the search which blocks
@@ -205,10 +256,16 @@ public final class AngrDebugSession {
     public synchronized Map<String, Object> seek(List<Address> avoid, boolean guided, long budgetMillis,
             TaskMonitor monitor) throws Exception {
         ensureOpen();
-        Address destination = AngrDebugger.destination(program);
-        if (destination == null) {
-            throw new IllegalStateException("No destination is set. Set one first: an address or a function "
-                + "to get to.");
+        List<AngrModules.Location> destinations = destinations();
+        if (destinations.isEmpty()) {
+            List<String> elsewhere = new ArrayList<>();
+            for (AngrModules.Location other : AngrDebugger.destinations(program)) {
+                elsewhere.add(AngrModules.nameOf(other.program()));
+            }
+            throw new IllegalStateException(elsewhere.isEmpty()
+                ? "No destination is set. Set one first: an address or a function to get to."
+                : "The destination is in " + String.join(", ", elsewhere) + ", which this session did not "
+                    + "load. Start the session again: it loads the libraries on the way to a destination.");
         }
         running = true;
         pauseRequested = false;
@@ -216,10 +273,10 @@ public final class AngrDebugSession {
         try {
             AngrReach guide = null;
             if (guided) {
-                if (!destination.equals(reachFor)) {
+                if (!destinations.equals(reachFor)) {
                     monitor.setMessage("Reading the control-flow graph towards the destination");
-                    reach = AngrReach.compute(program, call.function, destination, monitor);
-                    reachFor = destination;
+                    reach = AngrReach.compute(modules, call.function, destinations, monitor);
+                    reachFor = destinations;
                 }
                 guide = reach;
             }
@@ -233,12 +290,16 @@ public final class AngrDebugSession {
             for (Address address : avoid) {
                 avoided.add(AngrImage.hex(address.getOffset()));
             }
+            List<String> targets = new ArrayList<>();
+            for (AngrModules.Location destination : destinations) {
+                targets.add(angr(destination.program(), destination.address()));
+            }
             long deadline = System.currentTimeMillis() + budgetMillis;
             Map<String, Object> result;
             while (true) {
                 long slice = Math.max(50, Math.min(SLICE_MILLIS, deadline - System.currentTimeMillis()));
                 Map<String, Object> request = base("dbg_seek");
-                request.put("destinations", List.of(AngrImage.hex(destination.getOffset())));
+                request.put("destinations", targets);
                 request.put("avoid", avoided);
                 request.put("nonReach", nonReach);
                 request.put("timeoutMs", slice);
@@ -266,6 +327,27 @@ public final class AngrDebugSession {
             running = false;
             AngrDebugger.fire(program);
         }
+    }
+
+    /** The destinations this session can get to: those in the programs it has loaded. */
+    public List<AngrModules.Location> destinations() {
+        List<AngrModules.Location> out = new ArrayList<>();
+        for (AngrModules.Location destination : AngrDebugger.destinations(program)) {
+            if (modules.contains(destination.program())) {
+                out.add(destination);
+            }
+        }
+        return out;
+    }
+
+    /** The destinations as text, "0x1019a0 (unlock)" or "libfoo.so!unlock @ 00101500"; null when there is none. */
+    public String destinationText() {
+        List<String> out = new ArrayList<>();
+        for (AngrModules.Location destination : AngrDebugger.destinations(program)) {
+            out.add(modules.contains(destination.program()) ? modules.describe(destination)
+                : AngrModules.nameOf(destination.program()) + "!" + destination.address() + " (not loaded)");
+        }
+        return out.isEmpty() ? null : String.join(", ", out);
     }
 
     /**
@@ -296,12 +378,13 @@ public final class AngrDebugSession {
                 ledger.put("location", label);
             }
         }
-        Address destination = AngrDebugger.destination(program);
+        String destination = destinationText();
         if (destination != null) {
-            String hex = AngrImage.hex(destination.getOffset());
-            String label = label(hex);
-            ledger.put("destination", label == null ? hex : hex + " (" + label + ")");
-            ledger.put("atDestination", destination.equals(address(ledger.get("pc"))));
+            ledger.put("destination", destination);
+            ledger.put("atDestination", destinations().contains(location(ledger.get("pc"))));
+        }
+        if (modules.size() > 1) {
+            ledger.put("modules", modules.libraryNames());
         }
         if (ledger.get("entries") instanceof List<?> entries) {
             for (Object o : entries) {
@@ -437,6 +520,7 @@ public final class AngrDebugSession {
         closed = true;
         running = false;
         worker.close();
+        modules.release();
     }
 
     private void ensureOpen() {
@@ -486,6 +570,16 @@ public final class AngrDebugSession {
             if (label != null) {
                 result.put("location", label);
             }
+            // In a library, and all the more in one that was moved, the address the worker runs
+            // at is not the one Ghidra shows: say which program and where in it.
+            AngrModules.Location location = location(pc);
+            if (location != null && location.program() != program) {
+                result.put("module", AngrModules.nameOf(location.program()));
+                result.put("moduleAddress", location.address().toString());
+            }
+        }
+        if (modules.size() > 1) {
+            result.put("modules", modules.libraryNames());
         }
         for (String key : List.of("registers")) {
             if (result.get(key) instanceof List<?> rows) {
@@ -521,7 +615,7 @@ public final class AngrDebugSession {
                 }
             }
         }
-        AngrCallSpec.annotate(program, result);
+        AngrCallSpec.annotate(modules, result);
         // annotate() rewrites stoppedAt/fault for the one-shot tool; a snapshot keeps pc as is.
         if (!call.warnings.isEmpty()) {
             List<Object> warnings = new ArrayList<>(call.warnings);
@@ -545,28 +639,11 @@ public final class AngrDebugSession {
         }
     }
 
-    /** "check_password+0x17" for code, "g_counter" or "g_table+0x8" for data, null otherwise. */
+    /**
+     * "check_password+0x17" for code, "g_counter" or "g_table+0x8" for data, with the module in
+     * front ("libfoo.so!parse+0x4") outside this program; null when nothing names the address.
+     */
     public String label(String hex) {
-        Address address = AngrCallSpec.tryAddress(program, hex);
-        if (address == null || !program.getMemory().contains(address)) {
-            return null;
-        }
-        Function function = program.getFunctionManager().getFunctionContaining(address);
-        if (function != null) {
-            long delta = address.subtract(function.getEntryPoint());
-            return function.getName() + (delta == 0 ? "" : "+0x" + Long.toHexString(delta));
-        }
-        Symbol symbol = program.getSymbolTable().getPrimarySymbol(address);
-        if (symbol != null) {
-            return symbol.getName();
-        }
-        Data data = program.getListing().getDataContaining(address);
-        if (data != null) {
-            Symbol base = program.getSymbolTable().getPrimarySymbol(data.getAddress());
-            if (base != null) {
-                return base.getName() + "+0x" + Long.toHexString(address.subtract(data.getAddress()));
-            }
-        }
-        return null;
+        return modules.label(hex);
     }
 }

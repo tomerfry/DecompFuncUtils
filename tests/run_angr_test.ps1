@@ -40,6 +40,13 @@ if (-not (Test-Path -LiteralPath $fixture)) { Write-Error "Missing fixture $fixt
 # fixtures: the shape of a real Linux binary, which the shared-object fixture is not.
 $executable = Join-Path $repo "tests\extlink\testmain"
 if (-not (Test-Path -LiteralPath $executable)) { Write-Error "Missing fixture $executable - run tests\extlink\build.ps1"; exit 2 }
+# A library and a module that imports from it, for destinations in another program. The library
+# goes in first, so it is in the project by the time the importer's run looks for it.
+$crossLibrary = Join-Path $repo "tests\angr\libangrxdep.so"
+$crossImporter = Join-Path $repo "tests\angr\libangrxmain.so"
+foreach ($file in @($crossLibrary, $crossImporter)) {
+    if (-not (Test-Path -LiteralPath $file)) { Write-Error "Missing fixture $file - run tests\angr\build.ps1"; exit 2 }
+}
 
 # An interpreter that can import angr, found the same way the extension finds one.
 if (-not $Python) {
@@ -113,7 +120,8 @@ $env:DFU_TEST_OUTPUT = Join-Path $repo "tests"
 $env:XDG_CONFIG_HOME = $settingsRoot
 $env:DFU_ANGR_PYTHON = $Python
 $env:DFU_ANGR_TMP = $imageTmp
-$hlArgs = @($proj, 'T', '-import', $executable, '-import', $fixture, '-scriptPath', $sp,
+$hlArgs = @($proj, 'T', '-import', $executable, '-import', $fixture, '-import', $crossLibrary,
+    '-import', $crossImporter, '-scriptPath', $sp,
     '-postScript', $Script, '-deleteProject')
 try {
     & $hl @hlArgs *>&1 | Out-File -FilePath $log -Encoding utf8
@@ -136,9 +144,10 @@ $lines | ForEach-Object { ($_ -replace '^INFO\s+\S+\.java>\s*', '') -replace '\s
         else                         { Write-Host $_ }
     }
 
-# The post-script runs once per imported program: every run has to pass.
+# The post-script runs once per imported program: every run has to pass, and a run that died
+# before printing its result is not a pass.
 if ((Select-String -Path $log -Pattern 'HEADLESS_TEST_RESULT PASS' -Quiet) -and
-        -not (Select-String -Path $log -Pattern 'HEADLESS_TEST_RESULT FAIL|CHECK .*: FAIL' -Quiet)) {
+        -not (Select-String -Path $log -Pattern 'HEADLESS_TEST_RESULT FAIL|CHECK .*: FAIL|REPORT SCRIPT ERROR' -Quiet)) {
     Write-Host "==> RESULT: PASS" -ForegroundColor Green; exit 0
 } else {
     Write-Host "==> RESULT: FAIL (see $log)" -ForegroundColor Red; exit 1

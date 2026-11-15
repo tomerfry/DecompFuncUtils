@@ -25,6 +25,7 @@ public final class AngrImports {
     public static final String HANDLED_BY_HOOK = "python hook";
     public static final String HANDLED_BY_MODEL = "angr model";
     public static final String HANDLED_BY_STUB = "stub";
+    public static final String HANDLED_BY_LIBRARY = "code in ";
 
     private AngrImports() {
     }
@@ -63,6 +64,9 @@ public final class AngrImports {
             }
         }
 
+        AngrDebugSession running = AngrDebugger.session(program);
+        Map<String, String> linked = running == null ? Map.of() : running.call.image.linkedImports;
+
         Map<String, Map<String, Object>> byName = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         for (Function ext : program.getFunctionManager().getExternalFunctions()) {
             ExternalLocation location = ext.getExternalLocation();
@@ -83,6 +87,11 @@ public final class AngrImports {
             if (hook != null) {
                 entry.put("handledBy", HANDLED_BY_HOOK);
                 entry.put("hook", hook.name);
+            }
+            else if (linked.containsKey(name)) {
+                // The library is loaded into the running session: the call runs its real code.
+                entry.put("handledBy", HANDLED_BY_LIBRARY + linked.get(name));
+                entry.put("linked", linked.get(name));
             }
             else if (models.containsKey(name)) {
                 entry.put("handledBy", HANDLED_BY_MODEL);

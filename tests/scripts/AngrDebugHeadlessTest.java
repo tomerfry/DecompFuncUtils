@@ -2,16 +2,21 @@
 // and AngrHookTool (ghidra_angr_hook), and through them the session layer the debugger panel
 // shares (AngrDebugger / AngrDebugSession) and the hook store (AngrHooks).
 //
-// Driven by tests/run_angr_test.ps1 -Script AngrDebugHeadlessTest.java over tests/angr/libangrdemo.so.
+// Driven by tests/run_angr_test.ps1 -Script AngrDebugHeadlessTest.java over tests/angr/libangrdemo.so,
+// and over tests/angr/libangrxmain.so with libangrxdep.so beside it in the project for the part
+// where the destination is in another program.
 // The runner points DFU_ANGR_HOOKS at a scratch folder, so no real hooks are touched.
 //@category Test
 import decompfuncutils.angr.AngrDebugSession;
 import decompfuncutils.angr.AngrDebugger;
 import decompfuncutils.angr.AngrHooks;
+import decompfuncutils.angr.AngrImports;
 import decompfuncutils.mcp.tools.AngrDebugTool;
 import decompfuncutils.mcp.tools.AngrEmulateTool;
 import decompfuncutils.mcp.tools.AngrHookTool;
 import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Program;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -81,6 +86,17 @@ public class AngrDebugHeadlessTest extends GhidraScript {
     @Override
     @SuppressWarnings("unchecked")
     public void run() throws Exception {
+        if ("libangrxmain.so".equals(currentProgram.getName())) {
+            try {
+                crossModule();
+            }
+            finally {
+                AngrDebugger.forget(currentProgram);
+            }
+            println("HEADLESS_TEST_SUMMARY failures=" + failures);
+            println("HEADLESS_TEST_RESULT " + (failures == 0 ? "PASS" : "FAIL"));
+            return;
+        }
         if (!"libangrdemo.so".equals(currentProgram.getName())) {
             println(getClass().getSimpleName() + ": skipping " + currentProgram.getName());
             return;
@@ -311,6 +327,154 @@ public class AngrDebugHeadlessTest extends GhidraScript {
         check("stopping twice is harmless", "no_session".equals(dbg("stop").get("status")), null);
         AngrDebugSession gone = AngrDebugger.session(currentProgram);
         check("no session is left behind", gone == null, gone);
+    }
+
+    /**
+     * A destination in another program: libangrxmain.so imports from libangrxdep.so, which sits
+     * in the same project. Both are shared objects loaded at the same base, so the library has to
+     * be moved to run next to the importer.
+     */
+    @SuppressWarnings("unchecked")
+    private void crossModule() throws Exception {
+        final String lib = "libangrxdep.so";
+
+        // Without the library in the session, its functions are what they always were: unknown.
+        dbg("start", "function", "xlocal", "args", List.of(5.0));
+        Map<String, Object> s = dbg("continue");
+        check("without the library an import of it is an unknown", "returned".equals(s.get("status"))
+            && s.get("modules") == null && String.valueOf(s.get("unmodelledExternals")).contains("xdep_apply"), s);
+
+        // Asked for by name, the library runs next to the program and the call runs its code:
+        // add_one() through a function-pointer table that had to move with the library.
+        s = dbg("start", "function", "xlocal", "args", List.of(5.0), "modules", List.of(lib));
+        check("a library named at start is loaded", String.valueOf(s.get("modules")).contains(lib)
+            && String.valueOf(s.get("hint")).contains("Loaded with it: " + lib), s);
+        s = dbg("continue", "detail", "full");
+        check("a call into it runs its real code", "returned".equals(s.get("status"))
+            && num(ret(s).get("signed")) == 6, s);
+        check("the call is shown as running in the library", String.valueOf(s.get("calls")).contains("into=" + lib), s.get("calls"));
+        List<Map<String, Object>> imports = AngrImports.describe(currentProgram, null, monitor);
+        String handled = "";
+        for (Map<String, Object> row : imports) {
+            if ("xdep_apply".equals(row.get("name"))) {
+                handled = String.valueOf(row.get("handledBy"));
+            }
+        }
+        check("the import list says where such a call runs", handled.equals("code in " + lib), handled);
+
+        // A stub still wins over the library's code.
+        dbg("start", "function", "xlocal", "args", List.of(5.0), "modules", List.of(lib),
+            "stubs", Map.of("xdep_apply", 77.0));
+        s = dbg("continue");
+        check("a stub wins over the library's code", num(ret(s).get("signed")) == 77, s);
+
+        // A breakpoint in the library stops a session of the importer.
+        Program library = AngrDebugger.pair(currentProgram, lib, null, monitor);
+        Address apply = library.getListing().getGlobalFunctions("xdep_apply").get(0).getEntryPoint();
+        Address secret = library.getListing().getGlobalFunctions("xdep_secret").get(0).getEntryPoint();
+        Address checkEntry = library.getListing().getGlobalFunctions("xdep_check").get(0).getEntryPoint();
+        check("both programs sit at the same base in Ghidra, so one has to move",
+            library.getImageBase().equals(currentProgram.getImageBase()), library.getImageBase());
+        AngrDebugger.setBreakpoint(library, apply, true);
+        dbg("start", "function", "xlocal", "args", List.of(5.0));
+        s = dbg("continue");
+        check("a breakpoint in the library stops there", "breakpoint".equals(s.get("stop"))
+            && (lib + "!xdep_apply").equals(s.get("location")) && lib.equals(s.get("module"))
+            && apply.toString().equals(s.get("moduleAddress")), s);
+        check("the address it runs at is not the one Ghidra shows for it",
+            !String.valueOf(s.get("pc")).equals("0x" + Long.toHexString(apply.getOffset())), s.get("pc"));
+        AngrDebugger.clearBreakpoints(library);
+        // Lets go of the library as well: from here on only a destination brings it back.
+        AngrDebugger.forget(currentProgram);
+
+        // ---- the destination in the library ----
+        Map<String, Object> set = dbg("set_destination", "address", "xdep_check");
+        check("naming an import means its code in the library", (lib + "!xdep_check @ " + checkEntry)
+                .equals(set.get("destination")) && String.valueOf(set.get("next")).contains("loads " + lib), set);
+        set = dbg("set_destination", "address", "xdep_secret", "program", lib);
+        check("a place in the library can be named with 'program'",
+            (lib + "!xdep_secret @ " + secret).equals(set.get("destination")), set);
+        set = dbg("set_destination", "address", lib + "!xdep_secret");
+        check("or as library!name", (lib + "!xdep_secret @ " + secret).equals(set.get("destination")), set);
+        check("a library that is not in the project is explained",
+            dbgError("set_destination", "address", "libnowhere.so!f").contains("no program named"),
+            dbgError("set_destination", "address", "libnowhere.so!f"));
+
+        // xroute() gets to xdep_secret() only if cfg_mode() == 2 (unknown import of the program),
+        // xdep_level == 3 (a variable of the library), cfg_tier() == 4 (unknown import of the
+        // library), triple(key) == 21 (the library calling back) and key + 2 == 9.
+        s = dbg("start", "function", "xroute", "args", List.of(Map.of("symbolicInt", 32.0, "name", "key")));
+        check("a session started with a destination in a library loads the library",
+            String.valueOf(s.get("modules")).contains(lib)
+                && String.valueOf(s.get("destination")).contains(lib + "!xdep_secret"), s);
+        s = dbg("seek");
+        println("XSEEK " + s);
+        Map<String, Object> seek = (Map<String, Object>) s.getOrDefault("seek", Map.of());
+        check("seek arrives in the other program", "destination".equals(s.get("stop"))
+            && "reached".equals(seek.get("result")) && (lib + "!xdep_secret").equals(s.get("location")), s);
+        check("it says where that is in the library's own terms", lib.equals(s.get("module"))
+            && secret.toString().equals(s.get("moduleAddress")), s.get("module") + " " + s.get("moduleAddress"));
+        check("the search was guided across both programs", Boolean.TRUE.equals(seek.get("guided"))
+            && String.valueOf(s.get("seekGuide")).contains("in 2 modules"), s.get("seekGuide"));
+
+        Map<String, Object> ledger = (Map<String, Object>) s.getOrDefault("ledger", Map.of());
+        List<Map<String, Object>> entries = (List<Map<String, Object>>) ledger.getOrDefault("entries", List.of());
+        List<String> unknowns = new ArrayList<>();
+        List<String> where = new ArrayList<>();
+        for (Map<String, Object> entry : entries) {
+            where.add(String.valueOf(entry.get("where")));
+            if ("unknown".equals(entry.get("kind"))) {
+                unknowns.add(String.valueOf(entry.get("symbol")).replaceAll("_ret_\\d+$", ""));
+            }
+        }
+        check("the only unknowns on the way are the two imports nothing defines",
+            unknowns.equals(List.of("cfg_mode", "cfg_tier")), unknowns + " " + entries);
+        check("the ledger names places in both programs", !where.isEmpty() && where.get(0).startsWith("xroute+")
+            && where.get(where.size() - 1).startsWith(lib + "!xdep_check+"), where);
+        check("the ledger says which destination and which library", String.valueOf(ledger.get("destination"))
+            .contains(lib + "!xdep_secret") && Boolean.TRUE.equals(ledger.get("atDestination"))
+            && String.valueOf(ledger.get("modules")).contains(lib), ledger.get("destination"));
+        Map<String, Long> values = new HashMap<>();
+        for (Map<String, Object> unknown : (List<Map<String, Object>>) ledger.getOrDefault("unknowns", List.of())) {
+            String name = String.valueOf(unknown.get("name")).replaceAll("_ret_\\d+$", "");
+            values.put(name, Long.decode(String.valueOf(unknown.get("value"))));
+        }
+        check("its values take the path through both programs",
+            values.size() == 3 && values.get("key") == 7 && (int) (long) values.get("cfg_mode") == 2
+                && (int) (long) values.get("cfg_tier") == 4, values);
+        String calls = String.valueOf(dbg("state", "detail", "full").get("calls"));
+        check("the calls show the crossing and the callback", calls.contains("call=xdep_check")
+            && calls.contains("into=" + lib) && calls.contains("call=triple"), calls);
+
+        s = dbg("continue");
+        check("execution carries on from there and returns through both", "returned".equals(s.get("status"))
+            && num(ret(s).get("signed")) == (7 ^ 0x5a), s);
+
+        // Nothing in xnever() leads to the library.
+        dbg("start", "function", "xnever", "args", List.of(1.0));
+        s = dbg("seek");
+        check("a function that never enters the library cannot get there", "seek_exhausted".equals(s.get("stop")), s);
+
+        // A destination set after the session started: started again while it has not moved...
+        AngrDebugger.forget(currentProgram);
+        s = dbg("start", "function", "xroute", "args", List.of(Map.of("symbolicInt", 32.0, "name", "key")));
+        check("with no destination the library is not loaded", s.get("modules") == null, s.get("modules"));
+        dbg("set_destination", "address", lib + "!xdep_secret");
+        s = dbg("seek");
+        check("a session that has not moved is started again to load it", "destination".equals(s.get("stop"))
+            && String.valueOf(s.get("reloaded")).contains(lib), s.get("stop") + " " + s.get("reloaded"));
+
+        // ...and refused, with the way out, once it has.
+        AngrDebugger.forget(currentProgram);
+        dbg("start", "function", "xroute", "args", List.of(Map.of("symbolicInt", 32.0, "name", "key")));
+        dbg("step_into");
+        dbg("set_destination", "address", lib + "!xdep_secret");
+        check("one that has moved says to start again", dbgError("seek").contains("did not load")
+            && dbgError("seek").contains("Start the session again"), dbgError("seek"));
+
+        check("clearing the destination clears it in the library too",
+            "none".equals(dbg("clear_destination").get("destination"))
+                && AngrDebugger.destinations(currentProgram).isEmpty(), AngrDebugger.destinations(currentProgram));
     }
 
     /** A destination to get to, the search for a way there, and the ledger of what it took. */

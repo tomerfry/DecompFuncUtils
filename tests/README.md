@@ -24,7 +24,8 @@ MCP server's two HTTP transports.
 | `scripts/CrossModuleAnalyzerHeadlessTest.java` | Exercises the `Cross-Module Import Linker` analyzer: that auto-analysis alone leaves the library back-linked, the one-shot path used by Analysis > One Shot, idempotence, and each analysis option. |
 | `angr/angr_demo.c`, `angr/libangrdemo.so` | Source and committed ELF of the `ghidra_angr_emulate` fixture: small functions with one obvious behaviour each (stack arguments, out-parameters, structs, globals, libc calls, an import nothing models, a loop). Rebuild with `angr/build.ps1` (needs clang + lld). |
 | `scripts/AngrEmulateHeadlessTest.java` | Exercises `ghidra_angr_emulate` by calling the fixture's functions by name: argument forms, results, the call trace, faults on missing pointers, stubs, solving for inputs, limits, error messages, and a Ghidra signature changing placement and typing. |
-| `scripts/AngrDebugHeadlessTest.java` | Exercises `ghidra_angr_debug` and `ghidra_angr_hook`, and through them the session layer the panel shares: stepping, breakpoints, forks on an unknown import, paths, concretize / symbolize / set, faults, watches, time limits, and Python hooks (compile check, effect, live reload into a running session, inline hooks, a hook that raises), and destinations: seeking one through branches on unmodelled imports and through a call to an unknown target, the ledger's order, conditions and values, an unreachable destination, and a search that is cut short and resumed. |
+| `scripts/AngrDebugHeadlessTest.java` | Exercises `ghidra_angr_debug` and `ghidra_angr_hook`, and through them the session layer the panel shares: stepping, breakpoints, forks on an unknown import, paths, concretize / symbolize / set, faults, watches, time limits, and Python hooks (compile check, effect, live reload into a running session, inline hooks, a hook that raises), and destinations: seeking one through branches on unmodelled imports and through a call to an unknown target, the ledger's order, conditions and values, an unreachable destination, and a search that is cut short and resumed. On `libangrxmain.so` it covers a destination in another program: the library loaded and moved next to the importer, a call running its real code (through a relocated function-pointer table), an imported variable read from the library, a callback from the library into the importer, breakpoints in the library, the three ways of naming a place in it, the ledger naming both programs, and a session restarted to load a library. |
+| `angr/angr_xmain.c`, `angr/angr_xdep.c`, `angr/libangrxmain.so`, `angr/libangrxdep.so` | The cross-module pair: a module that imports two functions and a variable from a library. Both are shared objects, so Ghidra loads them at the same image base and one has to move. Built by `angr/build.ps1`. |
 | `scripts/AngrDebuggerPanelHeadlessTest.java` | Builds the angr Debugger panel without a tool window, drives it by clicking its real buttons against real sessions, checks its tables and banner, and paints it off-screen to `tests/_angr_debugger_*.png`. |
 | `run_angr_tool_test.ps1` | Opens the angr Debugger tool in a real (off-screen) Ghidra window and checks it; `-Export` regenerates the shipped tool file. |
 | `run_angr_test.ps1` | Build -> install -> run for the angr test. Needs a Python with angr (`tools/setup-angr.ps1`). |
@@ -318,7 +319,13 @@ window is placed off-screen and never takes focus; it is painted into
   brings the Paths window forward, the Imports & Hooks window fills when
   opened, and Stop clears the marker;
 - a destination gets its marker, Seek Destination arrives there with the
-  Listing, and the Ledger window comes forward with the way taken.
+  Listing, and the Ledger window comes forward with the way taken;
+- with `angr/libangrxdep.so` and `angr/libangrxmain.so` both open: a destination
+  set in the library is marked there, a session of the importer loads the
+  library and arrives in it, the tool switches to the library with the Listing
+  and the program-counter marker at the destination while the debugger windows
+  keep the importer's session, stepping out brings the Listing back, and Set
+  Destination on an import's stub lands on its code in the library.
 
 `-Export` rebuilds `src/main/resources/defaultTools/angr_Debugger.tool`: Ghidra
 builds the tool from its plugin packages and the preview replaces the

@@ -846,6 +846,53 @@ blind), and `ledger` (`format: "markdown"` for the document). The `seek`
 response carries the ledger of the path it found, and `ghidra_angr_emulate`'s
 `find` returns one as well.
 
+#### A destination in another program
+
+The destination does not have to be in the program being debugged. When it is in
+a **library of the same project**, the session loads that library next to the
+program, and a call into it runs the library's real code instead of returning an
+unknown.
+
+![A session of libangrxmain.so arrived at a destination inside libangrxdep.so](docs/angr-debugger-cross-module.png)
+
+In the tool, open the library beside the program, right-click the place in the
+library's Listing → **angr Debugger → Set Destination**, switch back to the
+program, Start and Seek. Or stay in the program and set the destination on the
+stub of one of its imports: that means the import's code, in whichever program
+of the project defines it. When execution crosses into the library the tool
+switches to it - Listing, Decompiler and the program-counter marker follow -
+while the debugger windows keep showing the session of the program you started.
+Stepping on from there works as it does anywhere else, and stepping out brings
+the Listing back.
+
+- **One address space, Ghidra's addresses.** The program keeps the addresses
+  Ghidra shows for it. Shared objects are usually all loaded at the same image
+  base in Ghidra, so a library that would land on the program is moved out of
+  the way, and the pointers stored in it - found through Ghidra's relocation
+  table - are moved with it. Places in a library read `libfoo.so!parse+0x12`,
+  and `module` / `moduleAddress` give the address in the library's own terms,
+  which is the one its Listing shows.
+- **What gets linked.** An import runs a loaded library's code when that library
+  defines it (the library Ghidra attributes the import to, else whichever loaded
+  module exports the name). Pointers to an imported variable are pointed at the
+  library's storage. A stub or a Python hook for the import still wins. Imports
+  nobody defines stay what they were: angr's model, or an unknown.
+- **Only what is on the way.** A session loads the libraries that hold a
+  destination, with any library that lies between them and the program; nothing
+  else, so `printf` is still angr's model and not libc's code. `modules:
+  ["libfoo.so"]` at start loads a library without a destination in it.
+- **Guided across programs.** Ghidra's call graph is followed from the
+  destination back through the import into the program that calls it, so the
+  blocks of the program that cannot lead into the library are set aside too.
+- **Set the destination first.** The libraries are loaded when the session
+  starts. A session that has not executed anything yet is started again to load
+  a library whose destination was set afterwards; one that has moved says to
+  start again.
+
+Over MCP, `set_destination` takes an import's name (`"address": "afp_over_dsi"`),
+`library!name`, or `program` with `address`. Breakpoints set in a library's
+Listing count while that library is loaded.
+
 #### Python hooks
 
 A hook replaces a function with Python you write. Parameters after `ctx` receive
@@ -889,6 +936,11 @@ machine - the same trust `ghidra_run_script` already implies - so read what an
 agent wrote before leaning on it.
 
 #### Limits
+
+A library loaded next to the program is moved by rewriting the pointers Ghidra
+has relocations for; absolute addresses with no relocation (a non-PIC module) are
+not found. A variable the program holds its own copy of (an ELF copy relocation)
+is not shared with the library. Both are exercised on x86-64 ELF only.
 
 One session per program, concrete or symbolic, single-threaded code. Stepping is
 instruction-accurate; running is the same VEX interpreter as the emulator

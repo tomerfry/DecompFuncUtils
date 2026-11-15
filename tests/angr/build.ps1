@@ -16,3 +16,17 @@ $dir = $PSScriptRoot
 if ($LASTEXITCODE -ne 0) { throw "clang failed" }
 
 Write-Host "Built libangrdemo.so"
+
+# The cross-module pair: a library, and a module that imports functions and a variable from it.
+& clang -target x86_64-linux-gnu -shared -fPIC -nostdlib -fuse-ld=lld `
+    -O0 -fno-builtin -fno-stack-protector `
+    '-Wl,-soname,libangrxdep.so' `
+    (Join-Path $dir "angr_xdep.c") -o (Join-Path $dir "libangrxdep.so")
+if ($LASTEXITCODE -ne 0) { throw "clang failed" }
+& clang -target x86_64-linux-gnu -shared -fPIC -nostdlib -fuse-ld=lld `
+    -O0 -fno-builtin -fno-stack-protector `
+    '-Wl,-soname,libangrxmain.so' `
+    (Join-Path $dir "angr_xmain.c") (Join-Path $dir "libangrxdep.so") -o (Join-Path $dir "libangrxmain.so")
+if ($LASTEXITCODE -ne 0) { throw "clang failed" }
+
+Write-Host "Built libangrxdep.so and libangrxmain.so"
