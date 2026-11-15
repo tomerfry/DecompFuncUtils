@@ -21,7 +21,8 @@ param(
     [switch]$SkipBuild,
     [string]$GradleExe = "gradle",
     # AngrEmulateHeadlessTest.java (default, the one-shot emulator), AngrDebugHeadlessTest.java
-    # (debug sessions, hooks) or AngrDebuggerPanelHeadlessTest.java (the panel, rendered off-screen).
+    # (debug sessions, hooks), AngrSeekHeadlessTest.java (seeking a destination with nothing given)
+    # or AngrDebuggerPanelHeadlessTest.java (the panel, rendered off-screen).
     [string]$Script = 'AngrEmulateHeadlessTest.java',
     # Interpreter to run angr under; exported to the test as DFU_ANGR_PYTHON.
     [string]$Python = "",
@@ -36,6 +37,9 @@ if (-not (Test-Path $hl)) { Write-Error "analyzeHeadless not found at $hl (set G
 
 $fixture = Join-Path $repo "tests\angr\libangrdemo.so"
 if (-not (Test-Path -LiteralPath $fixture)) { Write-Error "Missing fixture $fixture - run tests\angr\build.ps1"; exit 2 }
+# Functions whose way to a destination depends on what nobody gave a value (AngrSeekHeadlessTest).
+$seekFixture = Join-Path $repo "tests\angr\libangrseek.so"
+if (-not (Test-Path -LiteralPath $seekFixture)) { Write-Error "Missing fixture $seekFixture - run tests\angr\build.ps1"; exit 2 }
 # A position-independent executable with DT_NEEDED entries, borrowed from the cross-module
 # fixtures: the shape of a real Linux binary, which the shared-object fixture is not.
 $executable = Join-Path $repo "tests\extlink\testmain"
@@ -120,7 +124,8 @@ $env:DFU_TEST_OUTPUT = Join-Path $repo "tests"
 $env:XDG_CONFIG_HOME = $settingsRoot
 $env:DFU_ANGR_PYTHON = $Python
 $env:DFU_ANGR_TMP = $imageTmp
-$hlArgs = @($proj, 'T', '-import', $executable, '-import', $fixture, '-import', $crossLibrary,
+$hlArgs = @($proj, 'T', '-import', $executable, '-import', $fixture, '-import', $seekFixture,
+    '-import', $crossLibrary,
     '-import', $crossImporter, '-scriptPath', $sp,
     '-postScript', $Script, '-deleteProject')
 try {

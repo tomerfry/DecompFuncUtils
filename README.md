@@ -702,7 +702,8 @@ while you debug.
 - **Start.** Type the function and its arguments the way the call is written -
   `"hello", 5, 0x10, {"buffer": 64}` - or right-click a function in the Listing
   or Decompiler → **angr Debugger → Debug Function with angr**, which fills the
-  function in.
+  function in. Arguments are optional: what you leave out is *unknown*, not zero
+  (see [What is not given is unknown](#what-is-not-given-is-unknown)).
 - **Step.** The buttons in the control strip, the **angr** menu, or the keys
   Ghidra's own Debugger uses: **F5** Continue, **F8** Step Into, **F10** Step
   Over, **F12** Step Out, **F9** Seek Destination. **Pause** interrupts a run;
@@ -789,6 +790,53 @@ to see what the code does with every value of it. `set` simply overwrites a
 register or memory - with a number, or with `"text"` / `{"buffer": 64}` to point
 it at fresh memory.
 
+#### What is not given is unknown
+
+A function in the middle of a program runs on what its caller set up: its
+arguments, the globals, whatever the pointers it was handed point at. A session
+starts at the function, so none of that exists - and the debugger does not
+pretend it is zero. With **What is not given is unknown** ticked (the default;
+`unknownInputs` over MCP), everything nobody gave a value is an unknown the same
+way an unmodelled import's return value is:
+
+| | named |
+|---|---|
+| an argument left out of the call | after Ghidra's parameter (`key`, `param_2`), or `arg0`, `arg1`, ... where Ghidra has no signature to go by |
+| any other register nothing set | after the register (`rbx`) |
+| a global with no initial contents (`.bss`) | `mem_<address>`; the Ledger adds Ghidra's label (`g_mode`) |
+| the memory behind an unknown pointer | `<pointer>_at_<offset>`: `arg0_at_8` is what is at offset 8 behind `arg0` |
+
+The last one is what makes pointer arguments work without setting anything up.
+The first time an unknown pointer is followed it is given a region of fresh
+memory to point at, and the path records that it points there; what is read
+from the region is unknown in turn, in the size the code reads it. A pointer
+found *inside* it is followed the same way, so a structure, the string one of
+its fields points at, a linked list, `argv` - each unfolds as the code walks it,
+and the Ledger then says what each has to hold:
+
+```
+arg0         0x620000001000   not set at entry       arg0 == 0x620000001000
+arg0_at_0    0x3              memory behind arg0     arg0_at_0 == 0x3
+arg0_at_4    0x40             memory behind arg0     arg0_at_4 >=s 0x10  and  arg0_at_4 <=s 0x40
+arg0_at_8    0x620000005000   memory behind arg0     arg0_at_8 == 0x620000005000
+*arg0        03000000400000000050000000620000
+*arg0_at_8   415a  "AZ"
+```
+
+(that is a function taking a `struct request *` and reaching a branch that
+wants `type == 3`, a `length` of 16 to 64 and a `payload` beginning `AZ`: the
+structure, and the buffer its third field points at, were never set up.)
+
+A value you do give stays what you gave: `seek_int(5)` runs with 5, and a
+pointer you pass as `{"buffer": 64}` or `"text"` points at exactly that.
+Initialized data keeps its contents - only memory the program image has no bytes
+for is unknown - and standard input is unknown unless `stdin` is given. Untick
+the box (`"unknownInputs": false`) to get zeros and NULL pointers instead: one
+fixed path through the function, on which a NULL pointer faults.
+
+A write through an address that depends on an unknown - `table[key & 3] = v` -
+goes to every place it can be, as a read does, rather than to one angr picked.
+
 #### Getting to a destination, and the ledger
 
 A breakpoint is somewhere to stop if execution happens to arrive. A
@@ -804,11 +852,27 @@ choose, Seek follows *every* side of every such branch until one path arrives,
 and makes that path the current one - the Listing is at the destination, the
 registers and stack are that path's.
 
+- **It solves for what you did not give.** The search has something to find
+  only where something is unknown. Started with just a function name, that is
+  every argument, global and pointed-at structure the way depends on (see
+  above); a value you typed in is fixed, and if the way hinges on it the banner
+  says that nothing on the way was unknown rather than that there is no way.
 - **Guided by Ghidra.** Before searching, Ghidra's call graph and control-flow
-  graph are read backwards from the destination: which functions lead to it, and
-  in each of them which blocks cannot. Paths in those blocks are set aside and
-  taken up again only when nothing else is left, so the search leans toward the
-  destination without static analysis ever ruling a path out.
+  graph are read backwards from the destination: which functions lead to it, in
+  each of them which blocks cannot, and from every other block how many blocks
+  are left to go. Paths in blocks that cannot are set aside and taken up again
+  only when nothing else is left, so the search leans toward the destination
+  without static analysis ever ruling a path out.
+- **It goes deep, toward the destination.** The path that has come furthest is
+  carried on, so a loop that forks on every iteration is crossed by one path
+  instead of by all of them abreast (24 such forks are 16 million paths side by
+  side, and a few hundred blocks in a line). At a fork the side with fewer
+  blocks left goes first, and a way out of a loop before another turn of it;
+  when a path ends, the search falls back to the latest fork with a side still
+  open. One pick in four goes to the oldest open path, so a path that never ends
+  cannot starve the others. With `guided: false`, or where no chain of direct
+  calls connects the function to the destination, paths are followed breadth
+  first.
 - **Code that is not there does not stop it.** A call into an import nothing
   models returns an unknown value and execution carries on; so does a call
   through a pointer that is itself unknown (a callback nobody set), which is
@@ -817,7 +881,9 @@ registers and stack are that path's.
 - **It can be interrupted and resumed.** Pause it, or let its time run out:
   what it explored is kept, and seeking again carries on. Seeking again after
   arriving looks for *another* way in. When every path has been followed to its
-  end and none arrives, it says so, and how they ended.
+  end and none arrives, it says so, and how they ended. At most 512 paths are
+  kept open; if some had to be dropped, the result is reported as incomplete
+  rather than as unreachable.
 
 The **Ledger** is the record of the path, in order:
 
@@ -832,7 +898,10 @@ The **Ledger** is the record of the path, in order:
 and under it, for every unknown, **what the path requires of it** and one value
 that works - the values are a single assignment that satisfies the whole path
 together (`key = 0x1e`, `cfg_level` returns `0xa`, `cfg_mode` returns `0x2`), not
-a value each in isolation. Values fixed or changed by hand (Concretize, Make
+a value each in isolation. Each unknown pointer the path followed has an entry
+where it was given somewhere to point, and a row (`*arg0`) with the bytes the
+memory behind it has to hold - `??` where the path does not care - and the text
+they spell, so a structure or a string reads at a glance. Values fixed or changed by hand (Concretize, Make
 Symbolic, Set Value) and constraints a Python hook added appear in the ledger at
 the point they happened.
 

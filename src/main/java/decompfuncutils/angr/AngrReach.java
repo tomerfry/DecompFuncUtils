@@ -18,14 +18,17 @@ import ghidra.util.task.TaskMonitor;
 import java.util.*;
 
 /**
- * What Ghidra's control-flow graph says about getting to a destination: which blocks, in the
- * functions on the way there, cannot lead to it.
+ * What Ghidra's control-flow graph says about getting to a destination: in the functions on the
+ * way there, which blocks cannot lead to it, and from the others how far it is.
  *
  * <p>A search for a destination that follows every fork wastes most of its time on paths that
- * have already left the way - an error exit, the wrong arm of a switch. Ghidra knows the shape of
- * the code, so the search can be told. Starting from the destination, this walks the call graph
- * upwards to find every function from which it can be reached by direct calls, and in each of
- * those marks the blocks from which neither the destination nor a call towards it is reachable.
+ * have already left the way - an error exit, the wrong arm of a switch - and, where a loop forks
+ * on every iteration, on following all of them abreast. Ghidra knows the shape of the code, so
+ * the search can be told. Starting from the destination, this walks the call graph upwards to
+ * find every function from which it can be reached by direct calls. In each of those it marks
+ * the blocks from which neither the destination nor a call towards it is reachable, and gives
+ * every other block the number of blocks still to go: to the destination itself, or to the call
+ * that leads on plus what remains inside the function called.
  *
  * <p>The walk does not stop at the edge of a program. When the function it has reached is one
  * another loaded module imports, it carries on from that module's calls to the import, so a
@@ -42,9 +45,18 @@ public final class AngrReach {
     private static final int MAX_FUNCTIONS = 400;
     private static final int MAX_BLOCKS = 60_000;
     private static final int MAX_RANGES = 20_000;
+    /** What a call towards the destination costs when the way through the function called is not known. */
+    private static final int UNKNOWN_CALL = 64;
+    private static final int UNREACHED = Integer.MAX_VALUE;
 
     /** Address ranges (inclusive, as the worker sees them) of blocks that cannot lead to a destination. */
     public final List<long[]> nonReach;
+    /**
+     * Address ranges (inclusive) of blocks that can, each with the number of blocks still to go:
+     * {@code {low, high, blocks}}. Empty when there are too many to be worth sending; the search
+     * then still knows which blocks to set aside, just not which of the others to prefer.
+     */
+    public final List<long[]> ranks;
     /** Functions from which a destination can be reached by direct calls, the destinations' own included. */
     public final int functions;
     /** How many programs those functions are spread over. */
@@ -52,8 +64,10 @@ public final class AngrReach {
     public final int blocks;
     public final int blocksSetAside;
 
-    private AngrReach(List<long[]> nonReach, int functions, int programs, int blocks, int blocksSetAside) {
+    private AngrReach(List<long[]> nonReach, List<long[]> ranks, int functions, int programs, int blocks,
+            int blocksSetAside) {
         this.nonReach = nonReach;
+        this.ranks = ranks;
         this.functions = functions;
         this.programs = programs;
         this.blocks = blocks;
@@ -69,6 +83,24 @@ public final class AngrReach {
 
     /** A function, told apart from the function at the same address of another program. */
     private record Node(Program program, Address entry) {
+    }
+
+    /** One function on the way: its blocks, how they follow each other, and where the way forward is. */
+    private static final class Graph {
+        final AngrModules.Module module;
+        final List<CodeBlock> blocks = new ArrayList<>();
+        /** For each block, the blocks of the same function that flow into it. */
+        final List<List<Integer>> predecessors = new ArrayList<>();
+        /** Blocks holding a destination. */
+        final Set<Integer> arrivals = new HashSet<>();
+        /** Blocks holding a call one function closer to a destination, with the functions called. */
+        final Map<Integer, Set<Node>> calls = new HashMap<>();
+        int entry = -1;
+        int[] cost;
+
+        Graph(AngrModules.Module module) {
+            this.module = module;
+        }
     }
 
     /** The guidance for one destination in the program the session runs. */
@@ -90,8 +122,9 @@ public final class AngrReach {
             return null;
         }
         // Every function that can get to a destination's function by direct calls, with the
-        // call sites that take it one step closer, and the destinations it holds itself.
-        Map<Node, Set<Address>> towards = new LinkedHashMap<>();
+        // call sites that take it one step closer (and where each leads), and the destinations
+        // it holds itself.
+        Map<Node, Map<Address, Node>> towards = new LinkedHashMap<>();
         Map<Node, Set<Address>> arrivals = new HashMap<>();
         Deque<Node> queue = new ArrayDeque<>();
         for (AngrModules.Location destination : destinations) {
@@ -104,7 +137,7 @@ public final class AngrReach {
                 continue;
             }
             Node node = new Node(destination.program(), target.getEntryPoint());
-            if (towards.putIfAbsent(node, new HashSet<>()) == null) {
+            if (towards.putIfAbsent(node, new HashMap<>()) == null) {
                 queue.add(node);
             }
             arrivals.computeIfAbsent(node, n -> new HashSet<>()).add(destination.address());
@@ -119,22 +152,22 @@ public final class AngrReach {
             if (callee == null) {
                 continue;
             }
-            callers(node.program(), callee, towards, queue);
+            callers(node.program(), callee, node, towards, queue);
             // Where another module imports this function, its calls to the import lead here too.
             for (AngrModules.Link link : modules.importersOf(node.program(), node.entry())) {
-                callers(link.importer.program, link.external, towards, queue);
+                callers(link.importer.program, link.external, node, towards, queue);
             }
         }
         if (!towards.containsKey(new Node(modules.main(), entry.getEntryPoint()))) {
             return null;
         }
 
+        // The shape of each of those functions.
         Map<Program, BasicBlockModel> models = new IdentityHashMap<>();
         Set<Program> programs = Collections.newSetFromMap(new IdentityHashMap<>());
-        List<long[]> nonReach = new ArrayList<>();
+        Map<Node, Graph> graphs = new LinkedHashMap<>();
         int total = 0;
-        int setAside = 0;
-        for (Map.Entry<Node, Set<Address>> item : towards.entrySet()) {
+        for (Map.Entry<Node, Map<Address, Node>> item : towards.entrySet()) {
             monitor.checkCancelled();
             Program program = item.getKey().program();
             Function function = program.getFunctionManager().getFunctionAt(item.getKey().entry());
@@ -144,34 +177,36 @@ public final class AngrReach {
             }
             programs.add(program);
             BasicBlockModel model = models.computeIfAbsent(program, BasicBlockModel::new);
-            List<CodeBlock> blocks = new ArrayList<>();
+            Graph graph = new Graph(module);
+            Map<Address, Integer> index = new HashMap<>();
             CodeBlockIterator iterator = model.getCodeBlocksContaining(function.getBody(), monitor);
             while (iterator.hasNext()) {
-                blocks.add(iterator.next());
+                CodeBlock block = iterator.next();
+                index.put(block.getFirstStartAddress(), graph.blocks.size());
+                graph.blocks.add(block);
             }
-            total += blocks.size();
+            total += graph.blocks.size();
             if (total > MAX_BLOCKS) {
                 return null;
             }
-
-            // Blocks that are a way forward by themselves: a destination, and each call that
-            // goes one function closer to one.
-            Set<Address> forwards = new HashSet<>(item.getValue());
-            forwards.addAll(arrivals.getOrDefault(item.getKey(), Set.of()));
-            Set<Address> reaching = new HashSet<>();
-            Deque<CodeBlock> work = new ArrayDeque<>();
-            for (CodeBlock block : blocks) {
-                boolean forward = false;
-                for (Address address : forwards) {
-                    forward |= block.contains(address);
-                }
-                if (forward && reaching.add(block.getFirstStartAddress())) {
-                    work.add(block);
-                }
-            }
-            while (!work.isEmpty()) {
+            Set<Address> here = arrivals.getOrDefault(item.getKey(), Set.of());
+            for (int i = 0; i < graph.blocks.size(); i++) {
                 monitor.checkCancelled();
-                CodeBlock block = work.removeFirst();
+                CodeBlock block = graph.blocks.get(i);
+                if (block.contains(function.getEntryPoint())) {
+                    graph.entry = i;
+                }
+                for (Address address : here) {
+                    if (block.contains(address)) {
+                        graph.arrivals.add(i);
+                    }
+                }
+                for (Map.Entry<Address, Node> site : item.getValue().entrySet()) {
+                    if (block.contains(site.getKey())) {
+                        graph.calls.computeIfAbsent(i, k -> new HashSet<>()).add(site.getValue());
+                    }
+                }
+                List<Integer> before = new ArrayList<>();
                 CodeBlockReferenceIterator sources = block.getSources(monitor);
                 while (sources.hasNext()) {
                     CodeBlockReference source = sources.next();
@@ -182,31 +217,115 @@ public final class AngrReach {
                         continue;
                     }
                     CodeBlock previous = source.getSourceBlock();
-                    if (previous != null && reaching.add(previous.getFirstStartAddress())) {
-                        work.add(previous);
+                    Integer from = previous == null ? null : index.get(previous.getFirstStartAddress());
+                    if (from != null) {
+                        before.add(from);
                     }
                 }
+                graph.predecessors.add(before);
             }
-            for (CodeBlock block : blocks) {
-                if (reaching.contains(block.getFirstStartAddress())) {
-                    continue;
+            graphs.put(item.getKey(), graph);
+        }
+
+        // How far it is from each block. What a call towards the destination costs depends on
+        // the function called, which may be one not measured yet (the functions come in the
+        // order they were found, callee before caller, but calls go every which way): a few
+        // rounds settle it.
+        Map<Node, Integer> fromEntry = new HashMap<>();
+        for (int round = 0; round < 4; round++) {
+            boolean changed = false;
+            for (Map.Entry<Node, Graph> item : graphs.entrySet()) {
+                monitor.checkCancelled();
+                Graph graph = item.getValue();
+                graph.cost = distances(graph, fromEntry);
+                Integer cost = graph.entry >= 0 && graph.cost[graph.entry] != UNREACHED
+                    ? Integer.valueOf(graph.cost[graph.entry]) : null;
+                if (!Objects.equals(cost, fromEntry.get(item.getKey()))) {
+                    fromEntry.put(item.getKey(), cost);
+                    changed = true;
                 }
-                setAside++;
-                for (AddressRange range : block.getAddressRanges()) {
+            }
+            if (!changed) {
+                break;
+            }
+        }
+
+        List<long[]> nonReach = new ArrayList<>();
+        List<long[]> ranks = new ArrayList<>();
+        int setAside = 0;
+        for (Graph graph : graphs.values()) {
+            for (int i = 0; i < graph.blocks.size(); i++) {
+                boolean reaches = graph.cost[i] != UNREACHED;
+                if (!reaches) {
+                    setAside++;
+                }
+                for (AddressRange range : graph.blocks.get(i).getAddressRanges()) {
+                    long low = graph.module.toAngr(range.getMinAddress());
+                    long high = graph.module.toAngr(range.getMaxAddress());
+                    if (reaches) {
+                        ranks.add(new long[] { low, high, graph.cost[i] });
+                        continue;
+                    }
                     if (nonReach.size() >= MAX_RANGES) {
                         return null;
                     }
-                    nonReach.add(new long[] { module.toAngr(range.getMinAddress()),
-                        module.toAngr(range.getMaxAddress()) });
+                    nonReach.add(new long[] { low, high });
                 }
             }
         }
-        return new AngrReach(nonReach, towards.size(), programs.size(), total, setAside);
+        if (ranks.size() > MAX_RANGES) {
+            ranks = List.of();
+        }
+        return new AngrReach(nonReach, ranks, towards.size(), programs.size(), total, setAside);
     }
 
-    /** Adds the functions of a program that call {@code callee} directly, with where they do. */
-    private static void callers(Program program, Function callee, Map<Node, Set<Address>> towards,
-            Deque<Node> queue) {
+    /**
+     * The number of blocks from each block of a function to the nearest way forward: zero in a
+     * block holding a destination; in a block calling a function one step closer, one more than
+     * it is from that function's entry.
+     */
+    private static int[] distances(Graph graph, Map<Node, Integer> fromEntry) {
+        int[] cost = new int[graph.blocks.size()];
+        Arrays.fill(cost, UNREACHED);
+        PriorityQueue<int[]> queue = new PriorityQueue<>(Comparator.comparingInt(item -> item[0]));
+        for (int block : graph.arrivals) {
+            cost[block] = 0;
+            queue.add(new int[] { 0, block });
+        }
+        for (Map.Entry<Integer, Set<Node>> call : graph.calls.entrySet()) {
+            int best = UNREACHED;
+            for (Node callee : call.getValue()) {
+                Integer inside = fromEntry.get(callee);
+                best = Math.min(best, 1 + (inside == null ? UNKNOWN_CALL : inside));
+            }
+            if (best < cost[call.getKey()]) {
+                cost[call.getKey()] = best;
+                queue.add(new int[] { best, call.getKey() });
+            }
+        }
+        while (!queue.isEmpty()) {
+            int[] item = queue.remove();
+            if (item[0] > cost[item[1]]) {
+                continue;
+            }
+            for (int previous : graph.predecessors.get(item[1])) {
+                if (item[0] + 1 < cost[previous]) {
+                    cost[previous] = item[0] + 1;
+                    queue.add(new int[] { cost[previous], previous });
+                }
+            }
+        }
+        return cost;
+    }
+
+    /**
+     * Adds the functions of a program that call {@code callee} directly, with where they do.
+     *
+     * @param leadsTo the function those calls end up in: {@code callee} itself, or - when
+     *                {@code callee} is an import - the function of another module it stands for
+     */
+    private static void callers(Program program, Function callee, Node leadsTo,
+            Map<Node, Map<Address, Node>> towards, Deque<Node> queue) {
         FunctionManager functions = program.getFunctionManager();
         ReferenceManager references = program.getReferenceManager();
         List<Address> entries = new ArrayList<>(List.of(callee.getEntryPoint()));
@@ -226,13 +345,13 @@ public final class AngrReach {
                     continue;
                 }
                 Node node = new Node(program, caller.getEntryPoint());
-                Set<Address> sites = towards.get(node);
+                Map<Address, Node> sites = towards.get(node);
                 if (sites == null) {
-                    sites = new HashSet<>();
+                    sites = new HashMap<>();
                     towards.put(node, sites);
                     queue.add(node);
                 }
-                sites.add(site);
+                sites.put(site, leadsTo);
             }
         }
     }

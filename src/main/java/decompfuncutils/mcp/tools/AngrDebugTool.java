@@ -46,6 +46,12 @@ public class AngrDebugTool implements McpTool {
             "step_into / step_over / step_out ('count' to repeat), continue (to a breakpoint, a fork, " +
             "the return, or a fault; 'timeoutMs'), run_to ('address': hex or a function name), " +
             "add_breakpoint / remove_breakpoint ('address') / clear_breakpoints, state, stop.\n" +
+            "What you give no value is UNKNOWN, not zero: arguments left out of 'args' (named after " +
+            "Ghidra's parameters, else arg0..), registers nothing set, globals with no initial contents " +
+            "(.bss, named mem_<address>), and - once followed - the memory behind an unknown pointer " +
+            "(named <pointer>_at_<offset>), so structures, strings and lists behind pointer arguments " +
+            "need no setting up. Give a value in 'args' / 'registers' / 'memory' to pin it; " +
+            "'unknownInputs':false at start goes back to zeros.\n" +
             "The binary's shared objects do not need to be in the project. Imports run as angr models " +
             "or your Python hooks (ghidra_angr_hook); anything else returns an UNKNOWN (symbolic) " +
             "value, named like 'read_config_ret_3' ('unmodelledImports':'zero' at start makes them " +
@@ -103,6 +109,9 @@ public class AngrDebugTool implements McpTool {
             "description", "start: fault on unmapped memory (default true)"));
         props.put("unmodelledImports", Map.of("type", "string", "enum", List.of("symbolic", "zero"),
             "description", "start: what imports with no model and no hook return (default symbolic)"));
+        props.put("unknownInputs", Map.of("type", "boolean",
+            "description", "start: leave what was given no value (arguments, registers, .bss, memory behind " +
+                "unknown pointers) unknown rather than zero (default true)"));
         props.put("arch", Map.of("type", "string", "description", "start: override the angr architecture"));
         props.put("modules", Map.of("type", "array", "items", Map.of("type", "string"),
             "description", "start: names of other programs of the project (libraries) to load next to this " +
@@ -439,9 +448,25 @@ public class AngrDebugTool implements McpTool {
                 return "Reached the destination; this path is now the current one. 'ledger' lists, in order, "
                     + "what it took to get here and one set of values that satisfies it. seek again looks for "
                     + "another way in.";
-            case "seek_exhausted":
+            case "seek_exhausted": {
+                Map<String, Object> seek = snapshot.get("seek") instanceof Map<?, ?> m
+                    ? (Map<String, Object>) m : Map.of();
+                if ("incomplete".equals(seek.get("result"))) {
+                    return "No path that was followed reaches the destination, but this is not a verdict: "
+                        + "there were more open paths than the search keeps, and some were dropped "
+                        + "('ended' counts them). Narrow it - concretize unknowns that should not vary, "
+                        + "give arguments values, or rule places out with 'avoid' - and seek again.";
+                }
+                if (seek.get("forks") instanceof Number forks && forks.longValue() == 0) {
+                    return "No branch on the way depended on an unknown, so there was one path to follow and "
+                        + "it does not reach the destination. Whatever decides the way is fixed: a value "
+                        + "given at start, or one already concretized on this path. Start again leaving it "
+                        + "out (what is given no value is unknown), or symbolize it. 'seek' says how the "
+                        + "path ended.";
+                }
                 return "Every path was followed to its end and none reaches the destination from here under "
                     + "the conditions already taken. 'seek' says how they ended.";
+            }
             case "seek_budget":
                 return "The search used its budget without arriving; what it explored is kept. seek again "
                     + "to continue, or narrow it with 'avoid' or by concretizing unknowns.";

@@ -93,8 +93,8 @@ public class AngrEmulateHeadlessTest extends GhidraScript {
     @Override
     @SuppressWarnings("unchecked")
     public void run() throws Exception {
-        if (currentProgram.getName().startsWith("libangrx")) {
-            // The cross-module pair belongs to AngrDebugHeadlessTest.
+        if (currentProgram.getName().startsWith("libangrx") || "libangrseek.so".equals(currentProgram.getName())) {
+            // The cross-module pair belongs to AngrDebugHeadlessTest, the seek fixture to AngrSeekHeadlessTest.
             println(getClass().getSimpleName() + ": skipping " + currentProgram.getName());
             return;
         }

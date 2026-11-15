@@ -22,7 +22,8 @@ Requests:
   {"id": n, "op": "dbg_open", "imageDir": "...", "spec": {...}}      -> a live session
   {"id": n, "op": "dbg_step", "session": s, "kind": "into|over|out|continue", ...}
   {"id": n, "op": "dbg_state", "session": s}
-  {"id": n, "op": "dbg_seek", "session": s, "destinations": [...], "avoid": [...], "nonReach": [[lo, hi], ...]}
+  {"id": n, "op": "dbg_seek", "session": s, "destinations": [...], "avoid": [...],
+   "nonReach": [[lo, hi], ...], "ranks": [[lo, hi, blocks to go], ...]}   (or "sameGuide": true)
   {"id": n, "op": "dbg_ledger", "session": s}                        -> the path's ledger
   {"id": n, "op": "dbg_edit", "session": s, "action": "concretize|symbolize|set|select|drop", ...}
   {"id": n, "op": "dbg_hooks", "session": s, "spec": {...}}          -> re-install hooks
@@ -257,6 +258,93 @@ def expr_text(expr, limit=96):
     if text.endswith(">"):
         text = text[:-1]
     return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def bvs_leaves(expr, out=None):
+    """
+    The symbols an expression is built from, by name, in the order they appear in it. (claripy's
+    own leaf_asts() went away with angr 10; 'variables' gives the names but not the symbols.)
+    """
+    if out is None:
+        out = {}
+    seen = set()
+    stack = [expr]
+    visited = 0
+    while stack and visited < 50000:
+        node = stack.pop()
+        if not hasattr(node, "op") or not getattr(node, "symbolic", False):
+            continue
+        visited += 1
+        if node.op == "BVS":
+            out.setdefault(node.args[0], node)
+            continue
+        try:
+            key = node.hash()
+        except Exception:  # pylint: disable=broad-except
+            key = id(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        stack.extend(reversed(node.args))
+    return out
+
+
+# -------------------------------------------------------------------------------------------
+# What nobody set is unknown
+# -------------------------------------------------------------------------------------------
+
+# Following a pointer nobody set gives it somewhere to point: a region of its own, mapped, with
+# room before the pointer as well as after it, whose contents are unknown in turn.
+REGION_SIZE = 0x4000
+REGION_LEAD = 0x1000
+MAX_REGIONS = 4096
+# An address that can be this far apart is not an index into something that exists.
+UNKNOWN_SPREAD = 0x10000
+# Where every general-purpose register is well enough understood to be made unknown at entry;
+# elsewhere only the arguments are (some registers there are not the caller's to set).
+WHOLE_REGISTER_ARCHS = ("AMD64", "X86", "ARMEL", "ARMHF", "ARMCortexM", "AARCH64")
+
+try:
+    from angr.storage.memory_mixins import DefaultMemory
+except Exception:  # pylint: disable=broad-except
+    DefaultMemory = None
+
+if DefaultMemory is not None:
+    class UnknownMemory(DefaultMemory):
+        """
+        angr's memory, with two things a session of unknown inputs needs (see Call.setup_unknowns):
+        memory nobody wrote reads as an unknown value rather than zero, and an address built on a
+        pointer nobody set is given somewhere to point rather than left to fault or to be pinned
+        to an arbitrary number. A state's memory is switched to this class; it adds no state of
+        its own, so copies stay what they are.
+        """
+
+        def _dfu_owner(self):
+            if self.category != "mem" or self.state is None:
+                return None
+            return getattr(self.state.project, "dfu_unknowns", None)
+
+        def load(self, addr, size=None, **kwargs):
+            owner = self._dfu_owner()
+            if owner is not None:
+                addr = owner.follow(self.state, addr)
+            return super().load(addr, size=size, **kwargs)
+
+        def store(self, addr, data, size=None, **kwargs):
+            owner = self._dfu_owner()
+            if owner is not None:
+                addr = owner.follow(self.state, addr)
+            return super().store(addr, data, size=size, **kwargs)
+
+        def _default_value(self, addr, size, **kwargs):
+            owner = self._dfu_owner()
+            if owner is not None and type(addr) is int and kwargs.get("fill_missing", True):
+                value = owner.unknown_fill(self.state, addr, size, kwargs.get("endness"))
+                if value is not None:
+                    return value
+            return super()._default_value(addr, size, **kwargs)
+else:
+    UnknownMemory = None
 
 
 class HookError(angr.errors.SimError):
@@ -555,6 +643,277 @@ class Call:
         self.unmodelled_called = set()
         self.state = None
         self.symbolic_run = False
+        # What nobody set is unknown (see setup_unknowns).
+        self.unknown_inputs = bool(spec.get("unknownInputs")) and UnknownMemory is not None
+        self.entry_symbols = {}     # registers left unknown at entry: name -> value
+        self.unknown_ranges = []    # (start, end) of memory that has no initial contents
+        self.unknown_starts = []
+        self.region_base = None     # where memory behind unknown pointers is handed out
+        self.fills = {}             # unknown memory that was read: name -> (bits, kind, pointer, offset)
+
+    # ---- what nobody set ----
+
+    def setup_unknowns(self, state):
+        """
+        Makes what the caller of the function would have decided, and nobody here did, unknown
+        instead of zero: registers nothing was put in, memory the program has no initial
+        contents for (.bss), and - as they are followed - the memory behind unknown pointers.
+
+        Looking for a way to a destination is solving for exactly these. With them at zero there
+        is one path, it is whichever the zeros take, and a pointer argument faults on first use.
+        """
+        arch = self.arch
+        self.project.dfu_unknowns = self
+        state.memory.__class__ = UnknownMemory
+
+        if arch.name in WHOLE_REGISTER_ARCHS:
+            for reg in arch.register_list:
+                if not getattr(reg, "general_purpose", False):
+                    continue
+                if reg.vex_offset in (arch.sp_offset, arch.ip_offset):
+                    continue
+                try:
+                    value = state.registers.load(reg.name)
+                    # Whatever the call set up already (a link register) stays as it is.
+                    if value.symbolic or state.solver.eval(value) != 0:
+                        continue
+                    unknown = claripy.BVS(reg.name, value.size(), explicit_name=True)
+                    state.registers.store(reg.name, unknown)
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                self.entry_symbols[reg.name] = unknown
+
+        ranges = []
+        for addr, size, name in self.image.zero:
+            if str(name).endswith("EXTERNAL"):
+                continue  # imported variables have their own handling
+            ranges.append((addr, addr + size))
+        ranges.sort()
+        self.unknown_ranges = ranges
+        self.unknown_starts = [r[0] for r in ranges]
+        # Memory nobody wrote is given its unknown value when it is first read - except in a page
+        # the program image has bytes in as well (.bss usually begins in the last page of .data):
+        # angr loads such a page whole, zeros included, so there the zeros have to be taken back.
+        backed = [(h(seg["addr"]), h(seg["addr"]) + seg["size"]) for seg in self.image.manifest["segments"]]
+        for start, end in ranges:
+            for page in sorted({start & ~(PAGE - 1), (end - 1) & ~(PAGE - 1)}):
+                if any(lo < page + PAGE and page < hi for lo, hi in backed):
+                    lo, hi = max(start, page), min(end, page + PAGE)
+                    try:
+                        self.unwrite(state, lo, hi)
+                    except Exception:  # pylint: disable=broad-except
+                        self.place_unknowns(state, lo, hi)
+
+        if arch.bits >= 32:
+            try:
+                self.region_base = self.image.pick_base(MAX_REGIONS * REGION_SIZE, self.taken)
+                self.known.append((self.region_base, self.region_base + MAX_REGIONS * REGION_SIZE))
+            except SpecError:
+                self.region_base = None
+
+        for i, item in enumerate(self.spec.get("unknownArgs") or []):
+            loc = item.get("loc") or {}
+            if "reg" not in loc and "stack" not in loc:
+                continue
+            bits = int(loc.get("size") or self.ptr_bytes) * 8
+            label = re.sub(r"[^A-Za-z0-9_]", "_", str(item.get("name") or "arg%d" % i))
+            if item.get("guess"):
+                # Ghidra knows no such parameter: listed only once the path depends on it.
+                taken = set(self.entry_symbols) | {n for n, _, _ in self.symbols}
+                while label in taken:
+                    label += "_"
+                value = claripy.BVS(label, bits, explicit_name=True)
+                self.entry_symbols[label] = value
+            else:
+                value = self.new_symbol(label, bits, "int")
+            self.put(loc, value, label)
+        self.symbolic_run = True
+
+    @staticmethod
+    def unwrite(state, start, end):
+        """
+        Makes a range within one page of a state's memory never-written again, so that reading
+        it asks for a default value the way reading a fresh page does. angr has no call for
+        this; it is done on the page itself, and anything unexpected there raises - the caller
+        then stores the unknowns outright (place_unknowns), which costs only their natural
+        sizes and names.
+        """
+        size = state.memory.page_size
+        base = start - start % size
+        page = state.memory._get_page(base // size, True)  # pylint: disable=protected-access
+        lo, hi = start - base, end - base
+        if hi > size or next(iter(page.symbolic_data.irange(lo, hi - 1)), None) is not None:
+            raise ValueError("not a plain range of one page")
+        page.symbolic_bitmap.set_range(lo, hi)
+        if not page.symbolic_bitmap.all_set(lo, hi):
+            raise ValueError("the page kept its bytes")
+
+    def place_unknowns(self, state, start, end):
+        """Stores unknown values over a range, a pointer-sized word at a time so one can be followed."""
+        word = self.ptr_bytes
+        pos = start
+        while pos < end:
+            size = min(word - pos % word, end - pos)
+            while size & (size - 1):
+                size &= size - 1  # an odd run at an edge: the largest power of two that fits
+            try:
+                state.memory.store(pos, self.fill_symbol(pos, size, ("mem",), "int"),
+                                   endness=self.arch.memory_endness)
+            except Exception:  # pylint: disable=broad-except
+                return
+            pos += size
+
+    def follow(self, state, addr):
+        """
+        An address to read or write, with every unknown pointer in it given somewhere to point.
+
+        A pointer nobody set - an argument, a field of a structure behind one, what an unmodelled
+        import returned - can be any address at all. The first time such a pointer is followed it
+        gets a region of fresh memory of its own, and the path records that it points there; the
+        region's contents are unknown in turn, so structures that point on to others unfold as
+        the code walks them.
+        """
+        addr = getattr(addr, "ast", addr)  # an action wrapper around the expression
+        if not getattr(addr, "symbolic", False):
+            return addr
+        homes = state.globals.get("dfu_homes") or {}
+        for name in addr.variables:
+            home = homes.get(name)
+            if home is not None:
+                addr = addr.replace(home[0], claripy.BVV(home[1], home[0].size()))
+        if not addr.symbolic or self.region_base is None:
+            return addr
+        candidates = [(name, leaf) for name, leaf in bvs_leaves(addr).items()
+                      if leaf.size() == self.ptr_bits and name not in homes]
+        if not candidates:
+            return addr
+        solver = state.solver
+        try:
+            if solver.max(addr) - solver.min(addr) < UNKNOWN_SPREAD:
+                return addr  # an index into something that exists; angr's own handling fits
+        except Exception:  # pylint: disable=broad-except
+            return addr
+        regions = state.globals.get("dfu_regions", ())
+        if len(regions) >= MAX_REGIONS:
+            return addr
+        start = self.region_base + len(regions) * REGION_SIZE
+        home = start + REGION_LEAD
+        for name, leaf in candidates:
+            try:
+                if not solver.satisfiable(extra_constraints=[leaf == home]):
+                    continue  # the path already requires something else of it (NULL, say)
+            except Exception:  # pylint: disable=broad-except
+                continue
+            state.add_constraints(leaf == home)
+            if self.strict:
+                try:
+                    state.memory.map_region(start, REGION_SIZE, 3)
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            state.globals["dfu_regions"] = regions + ((start, start + REGION_SIZE, name, home),)
+            updated = dict(homes)
+            updated[name] = (leaf, home)
+            state.globals["dfu_homes"] = updated
+            entry = {"kind": "pointer", "symbol": name, "address": "%#x" % home,
+                     "text": "%s is an unknown pointer and was followed: taken to point at fresh "
+                             "memory at %#x, whose contents are unknown too" % (name, home)}
+            try:
+                site = state.scratch.ins_addr
+            except Exception:  # pylint: disable=broad-except
+                site = None
+            if site is not None:
+                entry["at"] = "%#x" % site
+            note(state, entry)
+            return addr.replace(leaf, claripy.BVV(home, leaf.size()))
+        return addr
+
+    def unknown_span(self, state, pos):
+        """
+        Whether the memory at an address is unknown until written, and up to where that holds:
+        (None | ("mem",) | ("region", pointer, home), end).
+        """
+        limit = 1 << 80
+        i = bisect.bisect_right(self.unknown_starts, pos) - 1
+        if i >= 0 and pos < self.unknown_ranges[i][1]:
+            return ("mem",), self.unknown_ranges[i][1]
+        if i + 1 < len(self.unknown_starts):
+            limit = self.unknown_starts[i + 1]
+        base = self.region_base
+        if base is not None:
+            regions = state.globals.get("dfu_regions", ())
+            if base <= pos < base + len(regions) * REGION_SIZE:
+                start, end, name, home = regions[(pos - base) // REGION_SIZE]
+                return ("region", name, home), end
+            if pos < base:
+                limit = min(limit, base)
+        return None, limit
+
+    def touches_unknown(self, state, addr, size):
+        if not self.unknown_inputs:
+            return False
+        pos = addr
+        end = addr + max(1, size)
+        while pos < end:
+            what, stop = self.unknown_span(state, pos)
+            if what is not None:
+                return True
+            pos = stop
+        return False
+
+    def unknown_fill(self, state, addr, size, endness):
+        """The value of memory nobody wrote, where that is unknown rather than zero; else None."""
+        pieces = []
+        pos = addr
+        end = addr + size
+        unknown = False
+        while pos < end:
+            what, stop = self.unknown_span(state, pos)
+            stop = min(stop, end)
+            pieces.append((pos, stop - pos, what))
+            unknown = unknown or what is not None
+            pos = stop
+        if not unknown:
+            return None
+        native = endness is None or str(endness) == str(self.arch.memory_endness)
+        if len(pieces) == 1:
+            kind = "int" if size == 1 or (size in (2, 4, 8) and native) else "bytes"
+            return self.fill_symbol(addr, size, pieces[0][2], kind)
+        parts = []
+        for start, length, what in pieces:
+            parts.append(claripy.BVV(0, length * 8) if what is None
+                         else self.fill_symbol(start, length, what, "bytes"))
+        value = claripy.Concat(*parts)  # in address order
+        little = str(endness) == str(archinfo.Endness.LE)
+        return value.reversed if little else value
+
+    def fill_symbol(self, addr, size, what, kind):
+        if what[0] == "region":
+            offset = addr - what[2]
+            name = "%s_at_%s" % (what[1], ("%x" % offset) if offset >= 0 else ("m%x" % -offset))
+            pointer = what[1]
+        else:
+            offset = addr
+            name = "mem_%x" % addr
+            pointer = None
+        bits = size * 8
+        known = self.fills.get(name)
+        if known is not None and known[0] != bits:
+            name = "%s_b%d" % (name, size)  # read in another size on another path: another unknown
+        self.fills[name] = (bits, kind, pointer, offset)
+        return claripy.BVS(name, bits, explicit_name=True)
+
+    def origin_of(self, name):
+        """Where an unknown came from, for the ledger; None when nothing here made it."""
+        fill = self.fills.get(name)
+        if fill is not None:
+            if fill[2] is not None:
+                return "memory behind %s" % fill[2]
+            return "memory with no initial contents"
+        if name in self.entry_symbols:
+            return "not set at entry"
+        if name in self.external_symbols:
+            return "imported variable"
+        return None
 
     # ---- memory handed to the callee ----
 
@@ -579,7 +938,7 @@ class Call:
         return addr
 
     def new_symbol(self, name, bits, kind):
-        taken = {n for n, _, _ in self.symbols}
+        taken = {n for n, _, _ in self.symbols} | set(self.entry_symbols)
         base = name
         n = 2
         while name in taken:
@@ -844,7 +1203,10 @@ class Call:
     def load_bytes(self, state, addr, length):
         """Concrete bytes at addr, or None when unreadable or symbolic."""
         try:
-            bv = state.memory.load(addr, length, inspect=False, disable_actions=True)
+            # Looking is not reading: memory that is unknown until the program reads it is not
+            # given a value because a trace or a preview wanted to show it.
+            look = {"fill_missing": False} if self.touches_unknown(state, addr, length) else {}
+            bv = state.memory.load(addr, length, inspect=False, disable_actions=True, **look)
             if bv.symbolic:
                 return None
             return state.solver.eval(bv, cast_to=bytes)
@@ -984,7 +1346,11 @@ class Call:
         arch = self.arch
         entry = h(spec["entry"])
 
-        add = {o.ZERO_FILL_UNCONSTRAINED_MEMORY, o.ZERO_FILL_UNCONSTRAINED_REGISTERS}
+        # A write through an address that depends on an unknown goes to every place it can be
+        # (up to angr's limit), instead of angr quietly deciding it is the highest one - which
+        # constrains the unknown and can cut the path off from where it was going.
+        add = {o.ZERO_FILL_UNCONSTRAINED_MEMORY, o.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+               o.SYMBOLIC_WRITE_ADDRESSES}
         if self.strict:
             add.add(o.STRICT_PAGE_ACCESS)
         kwargs = {}
@@ -992,7 +1358,7 @@ class Call:
         symbolic_requested = bool(spec.get("symbolicRun"))
         if stdin is not None:
             kwargs["stdin"] = angr.SimFileStream(name="stdin", content=self.blob(stdin), has_end=True)
-        elif not symbolic_requested:
+        elif not symbolic_requested and not self.unknown_inputs:
             kwargs["stdin"] = angr.SimFileStream(name="stdin", content=b"", has_end=True)
 
         # Head-room above the entry stack pointer for arguments passed on the stack.
@@ -1028,6 +1394,8 @@ class Call:
                                      "them faults: %s. Use strictMemory=false to read them as zero."
                                      % ", ".join(skipped))
         self.setup_thread_pointer()
+        if self.unknown_inputs:
+            self.setup_unknowns(state)
 
         # Slots Ghidra leaves unresolved (PE import tables) point at the import's hook.
         for ext in image.externals:
@@ -1479,6 +1847,8 @@ class Call:
         """Final contents of a range, as hex plus a string when it reads as one."""
         out = {}
         shown = min(size, MAX_DUMP)
+        if self.touches_unknown(state, addr, shown):
+            state = state.copy()  # showing unknown memory must not give it a value on the path
         try:
             bv = state.memory.load(addr, shown, inspect=False, disable_actions=True)
         except Exception as exc:  # pylint: disable=broad-except
@@ -1620,13 +1990,19 @@ def build_ledger(call, state, extra_symbols=None):
         for name in bv.variables:
             table.setdefault(name, bv)
             origins.setdefault(name, origin)
-    used = set()
+    # ... and whatever else the path came to depend on: a register nobody set, memory nobody
+    # wrote, an imported variable.
+    leaves = {}
     for constraint in constraints:
-        used |= constraint.variables
-    for name, bv in call.external_symbols.items():
-        if name in used:
-            table.setdefault(name, bv)
-            origins.setdefault(name, "imported variable")
+        bvs_leaves(constraint, leaves)
+    for name, leaf in leaves.items():
+        table.setdefault(name, leaf)
+        origin = call.origin_of(name)
+        if origin is not None:
+            origins.setdefault(name, origin)
+        fill = call.fills.get(name)
+        if fill is not None:
+            kinds.setdefault(name, fill[1])
     for name, bv in (extra_symbols or {}).items():
         table.setdefault(name, bv)
 
@@ -1664,6 +2040,52 @@ def build_ledger(call, state, extra_symbols=None):
             row["error"] = "%s: %s" % (type(exc).__name__, exc)
         unknowns.append(row)
     out["unknowns"] = unknowns
+
+    # What the path needs the memory behind each unknown pointer to hold, as the bytes it is:
+    # a field at a time above, a structure or a string at a glance here.
+    little = str(call.arch.memory_endness) == str(archinfo.Endness.LE)
+    pointers = []
+    for _start, _end, pointer, home in state.globals.get("dfu_regions", ())[:32]:
+        fields = sorted(((fill[3], fill[0] // 8, fill[1], leaves[name])
+                         for name, fill in call.fills.items() if fill[2] == pointer and name in leaves),
+                        key=lambda field: field[0])
+        if not fields:
+            continue
+        low = fields[0][0]
+        high = min(max(offset + size for offset, size, _kind, _leaf in fields), low + 256)
+        image = [None] * (high - low)
+        for offset, size, kind, leaf in fields:
+            try:
+                data = model.solver.eval(leaf).to_bytes(size, "little" if kind == "int" and little else "big")
+            except Exception:  # pylint: disable=broad-except
+                continue
+            for i, byte in enumerate(data):
+                if 0 <= offset - low + i < len(image):
+                    image[offset - low + i] = byte
+        text = bytearray()
+        for byte in image:
+            if byte is None or byte == 0:
+                break
+            text.append(byte)
+        is_text = len(text) >= 2 and printable(bytes(text))
+        if is_text and not any(image[len(text) + 1:]):
+            # A string model reads far past the terminator; the zeros it happened to get say nothing.
+            del image[len(text) + 1:]
+        row = {"pointer": pointer, "address": "%#x" % home, "offset": low,
+               "bytes": "".join("??" if byte is None else "%02x" % byte for byte in image)}
+        if is_text:
+            row["string"] = text_of(bytes(text))
+        pointers.append(row)
+    if pointers:
+        out["pointers"] = pointers
+    try:
+        stdin = model.posix.dumps(0)
+        if stdin and call.spec.get("stdin") is None:
+            out["stdin"] = {"hex": stdin[:MAX_DUMP].hex()}
+            if printable(stdin):
+                out["stdin"]["string"] = text_of(stdin[:MAX_DUMP])
+    except Exception:  # pylint: disable=broad-except
+        pass
     return out
 
 
@@ -1674,6 +2096,40 @@ def build_ledger(call, state, extra_symbols=None):
 MAX_PATHS = 64
 MAX_DEBUG_WRITES = 2048
 STACK_WORDS = 24
+# How far from the destination a path counts as being while nothing says how far it is.
+FAR = 1 << 30
+# One pick in this many goes to the oldest open path instead of the most promising one.
+FAIR_PICK = 4
+# How far back along a path a fork looks to tell a way out of a loop from another turn of it.
+LOOP_WINDOW = 256
+
+
+class SeekGuide:
+    """
+    What Ghidra's control-flow graph says about getting to the destination: the blocks from
+    which it cannot be reached at all, and for the others how many blocks away it is.
+    """
+
+    def __init__(self, non_reach=(), ranks=()):
+        self.dead = sorted((lo, hi) for lo, hi in non_reach)
+        self.dead_starts = [r[0] for r in self.dead]
+        self.ranked = sorted((lo, hi, cost) for lo, hi, cost in ranks)
+        self.ranked_starts = [r[0] for r in self.ranked]
+        self.directed = bool(self.ranked)
+
+    def __bool__(self):
+        return bool(self.dead or self.ranked)
+
+    def cannot_reach(self, addr):
+        i = bisect.bisect_right(self.dead_starts, addr) - 1
+        return i >= 0 and addr <= self.dead[i][1]
+
+    def rank(self, addr):
+        """Blocks still to go from here, or None where the graph does not say (a helper, a model)."""
+        i = bisect.bisect_right(self.ranked_starts, addr) - 1
+        if i >= 0 and addr <= self.ranked[i][1]:
+            return self.ranked[i][2]
+        return None
 
 
 class DebugSession:
@@ -1707,6 +2163,7 @@ class DebugSession:
         self.pending = None
         self.search = None        # the open frontier of a seek, kept so it can be resumed
         self.seek_report = None   # how the last seek went
+        self.guide = None         # the last seek's guidance, sent once and reused while it runs
         self.unknown_call_addr = None
         self.stack_range = (self.arch.initial_sp - 0x800000, self.arch.initial_sp + PAGE)
 
@@ -1938,16 +2395,25 @@ class DebugSession:
 
     # ---- seeking a destination ----
 
-    def seek(self, destinations, avoid, non_reach, limit, deadline, max_live):
+    def seek(self, destinations, avoid, guide, limit, deadline, max_live):
         """
         Explores from the current path until some path reaches a destination, and makes that
         path the current one.
 
         Unlike Continue, a branch on an unknown does not stop it: both sides are followed, and
-        so is every later fork, breadth first. Paths in blocks from which Ghidra's control-flow
-        graph says the destination cannot be reached are set aside and only taken up again when
-        nothing else is left, so the search leans toward the destination without ever ruling a
-        path out on the strength of static analysis alone.
+        so is every later fork. With Ghidra's control-flow graph to go by, the search goes deep:
+        the path that has come furthest is carried on, so a loop that forks on every iteration
+        is crossed by one path rather than by all of them abreast. At a fork the side with fewer
+        blocks left to the destination goes first, and of two equally far the one that leaves a
+        loop before the one that goes round it again; when a path ends, the search falls back to
+        the latest fork with a side still open. (Distance alone cannot order the open paths:
+        going round a loop takes a path further from the destination before it brings it nearer,
+        so whichever lags behind always looks closer.) While there is room, one pick in a few
+        goes to the oldest open path instead, so that a path that never ends cannot starve the
+        rest. Paths in blocks from which the graph says the destination cannot be reached are
+        set aside and only taken up again when nothing else is left: static analysis misses
+        indirect calls, so it orders the search but never rules a path out. Without a graph to
+        go by, paths are simply followed breadth first.
 
         A search that runs out of time or budget keeps its frontier; asking again resumes it.
         """
@@ -1965,23 +2431,35 @@ class DebugSession:
             if (start.addr & self.mask) in destinations:
                 raise SpecError("Execution is already at the destination. Step on from here, or set "
                                 "another destination.")
+            first = guide.rank(start.addr & self.mask)
             frontier = {"anchor": pid, "origin": pid, "destinations": destinations, "avoid": avoid,
-                        "active": [start], "deferred": [], "blocks": 0, "expanded": 0, "ended": {},
-                        "found": 0}
+                        "active": [[FAR if first is None else first, 0, start.history.depth, 0, start]],
+                        "deferred": [], "blocks": 0, "expanded": 0, "ended": {},
+                        "found": 0, "forks": 0, "seq": 0, "picks": 0}
         self.search = None
-        ranges = sorted(non_reach)
-        range_starts = [r[0] for r in ranges]
 
-        def cannot_reach(addr):
-            i = bisect.bisect_right(range_starts, addr) - 1
-            return i >= 0 and addr <= ranges[i][1]
+        def ended(kind, count=1):
+            frontier["ended"][kind] = frontier["ended"].get(kind, 0) + count
 
-        def ended(kind):
-            frontier["ended"][kind] = frontier["ended"].get(kind, 0) + 1
+        # An open path is [blocks to go, turns of a loop, steps taken, order of arrival, state].
+        def enqueue(state, rank, turns=0):
+            frontier["seq"] += 1
+            active.append([rank, turns, state.history.depth, frontier["seq"], state])
+
+        def recent_blocks(state):
+            """How often each block was run lately on a path, for telling loops at a fork."""
+            counts = {}
+            try:
+                for addr in itertools.islice(reversed(state.history.bbl_addrs), LOOP_WINDOW):
+                    counts[addr] = counts.get(addr, 0) + 1
+            except Exception:  # pylint: disable=broad-except
+                pass
+            return counts
 
         stops = destinations | avoid
         active = frontier["active"]
         deferred = frontier["deferred"]
+        directed = guide.directed
         found = None
         stop = None
         budget = frontier["blocks"] + limit
@@ -1991,7 +2469,8 @@ class DebugSession:
                     stop = "seek_exhausted"
                     break
                 # Nothing promising is left: take up what static analysis had written off.
-                active.extend(deferred[:16])
+                for state in deferred[:16]:
+                    enqueue(state, FAR)
                 del deferred[:16]
             if frontier["blocks"] >= budget:
                 stop = "seek_budget"
@@ -1999,7 +2478,15 @@ class DebugSession:
             if time.time() >= deadline:
                 stop = "timeout"
                 break
-            state = active.pop(0)
+            frontier["picks"] += 1
+            # A turn for the oldest path only while its successors would have room to stay.
+            fair = frontier["picks"] % FAIR_PICK == 0 and len(active) + len(deferred) < max_live - 4
+            if directed and not fair:
+                pick = min(range(len(active)),
+                           key=lambda k: (-active[k][2], active[k][0], active[k][1], -active[k][3]))
+            else:
+                pick = min(range(len(active)), key=lambda k: active[k][3])
+            rank, _turns, _depth, _seq, state = active.pop(pick)
             pc = state.addr
             hooked = self.is_hook(state, pc)
             size = None
@@ -2024,6 +2511,11 @@ class DebugSession:
             if not following:
                 ended("symbolicJump" if successors.unconstrained_successors else "exited")
                 continue
+            seen = {}
+            if len(following) > 1:
+                frontier["forks"] += 1
+                if directed:
+                    seen = recent_blocks(following[0])
             for nxt in following:
                 try:
                     addr = nxt.addr
@@ -2037,18 +2529,27 @@ class DebugSession:
                     ended("avoided")
                 elif addr == self.ret_addr:
                     ended("returned")
-                elif cannot_reach(key):
+                elif guide.cannot_reach(key):
                     deferred.append(nxt)
                 else:
-                    active.append(nxt)
+                    # In a helper or a model the graph has no figure: it is as far as its caller was.
+                    cost = guide.rank(key)
+                    enqueue(nxt, rank if cost is None else cost, seen.get(addr, 0))
             overflow = len(active) + len(deferred) - max_live
             if overflow > 0:
-                # Bounded memory beats completeness; say so in the report.
+                # Bounded memory beats completeness; say so in the report. What goes first is
+                # what the search would have come to last: the paths written off, then the one
+                # that has come the least far.
                 dropped = min(overflow, len(deferred))
                 del deferred[len(deferred) - dropped:]
-                if overflow > dropped:
-                    del active[len(active) - (overflow - dropped):]
-                frontier["ended"]["dropped"] = frontier["ended"].get("dropped", 0) + overflow
+                for _ in range(overflow - dropped):
+                    if directed:
+                        worst = max(range(len(active)),
+                                    key=lambda k: (-active[k][2], active[k][0], active[k][1], active[k][3]))
+                    else:
+                        worst = max(range(len(active)), key=lambda k: active[k][3])
+                    active.pop(worst)
+                ended("dropped", overflow)
 
         if found is not None:
             stop = "destination"
@@ -2062,13 +2563,16 @@ class DebugSession:
             frontier["found"] += 1
         if stop != "seek_exhausted":
             self.search = frontier
+        result = {"destination": "reached", "seek_exhausted": "unreachable", "seek_budget": "budget",
+                  "timeout": "timeout"}[stop]
+        if stop == "seek_exhausted" and frontier["ended"].get("dropped"):
+            result = "incomplete"  # not every path was followed, so this is not a verdict
         self.seek_report = {
-            "result": {"destination": "reached", "seek_exhausted": "unreachable", "seek_budget": "budget",
-                       "timeout": "timeout"}[stop],
+            "result": result,
             "blocks": frontier["blocks"], "statesExpanded": frontier["expanded"],
             "open": len(active) + len(deferred), "setAside": len(deferred),
-            "ended": dict(frontier["ended"]), "routesFound": frontier["found"],
-            "guided": bool(ranges), "from": frontier["origin"],
+            "ended": dict(frontier["ended"]), "forks": frontier["forks"], "routesFound": frontier["found"],
+            "guided": bool(guide), "directed": directed, "from": frontier["origin"],
         }
         if frontier.get("lastFault"):
             self.seek_report["lastFault"] = frontier["lastFault"]
@@ -2147,13 +2651,14 @@ class DebugSession:
                 names.append(reg.name)
         return names
 
-    def symbol_table(self, state, used=None):
+    def symbol_table(self, state, leaves=None):
         """
         The unknowns of a path, by the name used to concretize them: the inputs made symbolic,
-        the values unmodelled calls returned, and imported variables.
+        the values unmodelled calls returned, and whatever nobody set - registers, memory,
+        imported variables.
 
-        :param used: when given, imported variables are listed only if their name is in it -
-                     that is, once something on the path depends on them. None lists them all.
+        :param leaves: when given, what nobody set is listed only if it is in here - that is,
+                       once something on the path depends on it. None lists all of it.
         """
         table = {}
         for name, bv, _kind in self.call.symbols:
@@ -2161,10 +2666,33 @@ class DebugSession:
         for _origin, bv in state.globals.get("dfu_assumed", ()):
             for name in bv.variables:
                 table.setdefault(name, bv)
-        for name, bv in self.call.external_symbols.items():
-            if used is None or name in used:
+        if leaves is None:
+            for name, bv in self.call.external_symbols.items():
                 table.setdefault(name, bv)
+            for name, bv in self.call.entry_symbols.items():
+                table.setdefault(name, bv)
+            leaves = self.dependencies(state)
+        for name, leaf in leaves.items():
+            table.setdefault(name, leaf)
         return table
+
+    def dependencies(self, state):
+        """
+        Every unknown the path has come to depend on: those in a branch it took, and those in
+        a register - other than a register still holding the unknown it started with.
+        """
+        leaves = {}
+        for constraint in state.solver.constraints:
+            bvs_leaves(constraint, leaves)
+        for name in self.register_names():
+            try:
+                value = state.registers.load(name)
+            except Exception:  # pylint: disable=broad-except
+                continue
+            if value.op == "BVS" and value.args[0] in self.call.entry_symbols:
+                continue
+            bvs_leaves(value, leaves)
+        return leaves
 
     def snapshot(self, reads=None):
         pid = self.current
@@ -2182,13 +2710,9 @@ class DebugSession:
         previous = self.shown.get(pid, {})
         current = {}
         registers = []
-        used = set()  # every unknown a register or a branch taken depends on
-        for constraint in state.solver.constraints:
-            used |= constraint.variables
         for name in self.register_names():
             try:
                 value = state.registers.load(name)
-                used |= value.variables
                 row = self.show(state, value)
             except Exception:  # pylint: disable=broad-except
                 continue
@@ -2225,7 +2749,7 @@ class DebugSession:
                 out[key] = text_of(data[-16384:]) if printable(data) else {"hex": data[-MAX_DUMP:].hex()}
 
         symbols = []
-        for name, bv in list(self.symbol_table(state, used).items())[:64]:
+        for name, bv in list(self.symbol_table(state, self.dependencies(state)).items())[:64]:
             row = self.show(state, bv)
             row["name"] = name
             row["bits"] = bv.size()
@@ -2368,10 +2892,7 @@ class DebugSession:
             bv = table[name]
             if name not in bv.variables or len(bv.variables) != 1 or bv.op != "BVS":
                 # the recorded value may be a wider expression; pick out the named leaf
-                for leaf in bv.leaf_asts():
-                    if leaf.op == "BVS" and name in leaf.variables:
-                        bv = leaf
-                        break
+                bv = bvs_leaves(bv).get(name, bv)
             return "sym", name, bv
         raise SpecError("say what to act on: 'register', 'address' (+ 'size'), or 'symbol'")
 
@@ -2509,9 +3030,13 @@ def handle_debug(op, request):
         if not destinations:
             raise SpecError("no destination is set")
         avoid = {h(a) & session.mask for a in request.get("avoid") or []}
-        non_reach = [(h(lo), h(hi)) for lo, hi in request.get("nonReach") or []]
+        # The guidance of a large program is long; a search served in slices sends it once.
+        if not (request.get("sameGuide") and session.guide is not None):
+            session.guide = SeekGuide(
+                [(h(lo), h(hi)) for lo, hi in request.get("nonReach") or []],
+                [(h(lo), h(hi), int(cost)) for lo, hi, cost in request.get("ranks") or []])
         deadline = time.time() + int(request.get("timeoutMs") or 2000) / 1000.0
-        session.seek(destinations, avoid, non_reach, int(request.get("maxSteps") or 2000000), deadline,
+        session.seek(destinations, avoid, session.guide, int(request.get("maxSteps") or 2000000), deadline,
                      int(request.get("maxLive") or 512))
     elif op == "dbg_ledger":
         return session.ledger()

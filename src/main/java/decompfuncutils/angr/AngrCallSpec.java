@@ -73,7 +73,9 @@ public final class AngrCallSpec {
     /**
      * Builds the request for calling {@code arguments.function} with {@code arguments.args}.
      * Recognised keys are those of the {@code ghidra_angr_emulate} tool, plus
-     * {@code unmodelledImports} ("symbolic" or "zero") and {@code hooks} (false to leave the
+     * {@code unmodelledImports} ("symbolic" or "zero"), {@code unknownInputs} (true to leave what
+     * was given no value - arguments, registers, memory with no initial contents, what unknown
+     * pointers point at - unknown rather than zero) and {@code hooks} (false to leave the
      * program's saved Python hooks out).
      */
     public static AngrCallSpec build(Program program, Map<String, Object> arguments, TaskMonitor monitor)
@@ -157,6 +159,10 @@ public final class AngrCallSpec {
         spec.put("maxPaths", maxPaths);
         spec.put("strictMemory", !Boolean.FALSE.equals(arguments.get("strictMemory")));
         spec.put("symbolicRun", Boolean.TRUE.equals(arguments.get("symbolic")));
+        if (Boolean.TRUE.equals(arguments.get("unknownInputs"))) {
+            spec.put("unknownInputs", true);
+            spec.put("unknownArgs", unknownArguments(program, function, rawArgs.size()));
+        }
         String trace = stringArg(arguments, "trace");
         if (trace != null && !trace.equals("calls") && !trace.equals("none")) {
             throw new IllegalArgumentException("trace must be 'calls' or 'none'");
@@ -332,6 +338,51 @@ public final class AngrCallSpec {
                 + " parameter(s) but " + argCount + " argument(s) were given.");
         }
         return placement;
+    }
+
+    /** How many argument places are made unknown when Ghidra's signature cannot be relied on. */
+    private static final int GUESSED_ARGUMENTS = 6;
+
+    /**
+     * Where the arguments nobody gave a value would be, so each can be made an unknown under a
+     * name: the parameter's, where Ghidra has one. A signature nobody confirmed often has too few
+     * parameters (none at all, before the function was ever decompiled), so beyond the ones it
+     * has the places the convention would use next are covered as well, as guesses.
+     *
+     * @param given how many leading arguments have values already
+     */
+    static List<Map<String, Object>> unknownArguments(Program program, Function function, int given) {
+        Parameter[] params = function != null ? function.getParameters() : new Parameter[0];
+        boolean confirmed = function != null
+            && function.getSignatureSource().isHigherPriorityThan(SourceType.ANALYSIS)
+            && !function.hasVarArgs();
+        int count = Math.max(given, params.length);
+        if (!confirmed) {
+            count = Math.max(count, GUESSED_ARGUMENTS);
+        }
+        count = Math.min(count, MAX_ARGS);
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (count <= given) {
+            return out;
+        }
+        Placement placement = placeArguments(program, function, count);
+        for (int i = given; i < count; i++) {
+            Map<String, Object> loc = placement.argLocations.get(i);
+            if (!loc.containsKey("reg") && !loc.containsKey("stack")) {
+                continue;
+            }
+            Map<String, Object> unknown = new LinkedHashMap<>();
+            unknown.put("loc", loc);
+            if (i < params.length) {
+                unknown.put("name", params[i].getName());
+            }
+            else {
+                unknown.put("name", "arg" + i);
+                unknown.put("guess", true);
+            }
+            out.add(unknown);
+        }
+        return out;
     }
 
     public static Map<String, Object> location(VariableStorage storage) {

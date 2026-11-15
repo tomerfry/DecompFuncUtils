@@ -73,7 +73,9 @@ public final class AngrLedger {
             sb.append("\n## What the path requires of each unknown\n\n");
             sb.append("The values are one assignment that satisfies the whole path together.\n\n");
             for (Map<String, Object> unknown : unknowns) {
-                sb.append("- `").append(unknown.get("name")).append("` (").append(text(unknown.get("bits")))
+                sb.append("- `").append(unknown.get("name")).append('`')
+                  .append(unknown.get("where") != null ? " - " + unknown.get("where") : "")
+                  .append(" (").append(text(unknown.get("bits")))
                   .append("-bit").append(unknown.get("from") != null ? ", from " + unknown.get("from") : "")
                   .append(")\n");
                 if (unknown.get("requires") instanceof List<?> requires) {
@@ -100,6 +102,27 @@ public final class AngrLedger {
             }
         }
 
+        if (ledger.get("pointers") instanceof List<?> pointers && !pointers.isEmpty()) {
+            sb.append("\n## Memory behind unknown pointers\n\n");
+            sb.append("Each unknown pointer the path followed was given fresh memory to point at. This is what "
+                + "that memory has to hold (`??` is free), under the same assignment.\n\n");
+            for (Object o : pointers) {
+                if (o instanceof Map<?, ?> m) {
+                    Map<String, Object> pointer = (Map<String, Object>) m;
+                    sb.append("- `").append(pointer.get("pointer")).append("` -> `").append(pointer.get("address"))
+                      .append("`: ").append(cell(bytesText(pointer))).append('\n');
+                }
+            }
+        }
+        if (ledger.get("stdin") instanceof Map<?, ?> stdin) {
+            sb.append("\n## Standard input\n\n");
+            sb.append("What the path reads from it: `").append(stdin.get("hex")).append('`');
+            if (stdin.get("string") != null) {
+                sb.append(" (\"").append(stdin.get("string")).append("\")");
+            }
+            sb.append('\n');
+        }
+
         List<Object> constraints = ledger.get("constraints") instanceof List<?> l ? (List<Object>) l : List.of();
         sb.append("\n## All constraints (").append(text(ledger.get("constraintCount"))).append(")\n\n");
         if (constraints.isEmpty()) {
@@ -109,6 +132,15 @@ public final class AngrLedger {
             sb.append("- `").append(constraint).append("`\n");
         }
         return sb.toString();
+    }
+
+    /** The bytes behind an unknown pointer: where they start, the bytes, and the text they spell. */
+    public static String bytesText(Map<String, Object> pointer) {
+        long offset = pointer.get("offset") instanceof Number n ? n.longValue() : 0;
+        String at = offset == 0 ? "" : (offset < 0 ? "-0x" + Long.toHexString(-offset) : "+0x"
+            + Long.toHexString(offset)) + ": ";
+        return at + text(pointer.get("bytes"))
+            + (pointer.get("string") != null ? "  \"" + pointer.get("string") + "\"" : "");
     }
 
     /** "gate+0x17" when Ghidra has a name for the address, else the address. */
