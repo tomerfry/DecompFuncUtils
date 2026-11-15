@@ -93,6 +93,11 @@ public class AngrEmulateHeadlessTest extends GhidraScript {
     @Override
     @SuppressWarnings("unchecked")
     public void run() throws Exception {
+        if (currentProgram.getName().startsWith("libangrx")) {
+            // The cross-module pair belongs to AngrDebugHeadlessTest.
+            println(getClass().getSimpleName() + ": skipping " + currentProgram.getName());
+            return;
+        }
         if (!"libangrdemo.so".equals(currentProgram.getName())) {
             executable();
             // The runner fails on any FAIL line; the shared-object pass prints the summary.

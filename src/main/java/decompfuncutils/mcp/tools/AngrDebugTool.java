@@ -3,6 +3,7 @@ package decompfuncutils.mcp.tools;
 import decompfuncutils.angr.AngrCallSpec;
 import decompfuncutils.angr.AngrDebugSession;
 import decompfuncutils.angr.AngrDebugger;
+import decompfuncutils.angr.AngrModules;
 import decompfuncutils.mcp.McpTool;
 import decompfuncutils.mcp.McpUtil;
 import ghidra.framework.plugintool.PluginTool;
@@ -68,6 +69,14 @@ public class AngrDebugTool implements McpTool {
             "that satisfies the whole path. If time runs out, seek again resumes; after arriving, seek " +
             "again looks for another way in. action=ledger returns the ledger of the current path at " +
             "any time ('format':'markdown' for a document).\n" +
+            "The destination may be in ANOTHER PROGRAM of the project - a library this one uses. Name an " +
+            "import of this program (its code in the library that defines it is meant), or " +
+            "'library.so!function', or give 'program' with the 'address'. The session then loads that " +
+            "library next to this program: calls into it run its real code instead of returning an " +
+            "unknown, the search is guided across both, and locations in it read 'library.so!function+0x12' " +
+            "('module' and 'moduleAddress' say where pc is in that program's own terms). Set the " +
+            "destination before start; a session that has not moved yet is restarted to load the " +
+            "library. 'modules':[names] at start loads libraries without a destination in them.\n" +
             "Each response gives pc, why it stopped, the registers that changed, new calls and memory " +
             "writes; pass 'detail':'full' for every register and the stack.";
     }
@@ -95,6 +104,12 @@ public class AngrDebugTool implements McpTool {
         props.put("unmodelledImports", Map.of("type", "string", "enum", List.of("symbolic", "zero"),
             "description", "start: what imports with no model and no hook return (default symbolic)"));
         props.put("arch", Map.of("type", "string", "description", "start: override the angr architecture"));
+        props.put("modules", Map.of("type", "array", "items", Map.of("type", "string"),
+            "description", "start: names of other programs of the project (libraries) to load next to this " +
+                "one, so imports they define run their real code"));
+        props.put("program", Map.of("type", "string",
+            "description", "set_destination: the program of the project the 'address' is in, when it is not " +
+                "this one (same as writing 'program!address')"));
         props.put("count", Map.of("type", "integer", "description", "step_*: how many steps (default 1)"));
         props.put("timeoutMs", Map.of("type", "integer",
             "description", "continue / run_to / step_over / step_out: wall-clock limit (default "
@@ -150,9 +165,11 @@ public class AngrDebugTool implements McpTool {
                     launch.remove(key);
                 }
                 AngrDebugSession session = AngrDebugger.start(program,
-                    AngrEmulateTool.configuredPython(tool), launch, monitor);
+                    AngrEmulateTool.configuredPython(tool), launch, tool, monitor);
                 applyWatch(session, arguments, monitor);
-                return present(session, full, "Stopped at the first instruction of " + session.call.title + ".");
+                return present(session, full, "Stopped at the first instruction of " + session.call.title + "."
+                    + (session.modules.size() > 1 ? " Loaded with it: "
+                        + String.join(", ", session.modules.libraryNames()) + "." : ""));
             }
             case "stop": {
                 boolean had = AngrDebugger.stop(program);
@@ -168,17 +185,38 @@ public class AngrDebugTool implements McpTool {
                 AngrDebugger.clearBreakpoints(program);
                 return breakpointList(program);
             case "set_destination": {
-                Address address = AngrCallSpec.resolveCode(program, required(arguments, "address"), "address");
-                AngrDebugger.setDestination(program, address);
+                AngrModules.Location target = AngrDebugger.locate(program, required(arguments, "address"),
+                    arguments.get("program") == null ? null : String.valueOf(arguments.get("program")),
+                    tool, monitor);
+                AngrDebugger.setDestination(program, target);
                 Map<String, Object> set = new LinkedHashMap<>();
-                set.put("destination", AngrCallSpec.codeLabel(program, "0x" + Long.toHexString(address.getOffset())));
-                set.put("next", AngrDebugger.session(program) == null
+                AngrDebugSession running = AngrDebugger.session(program);
+                boolean elsewhere = target.program() != program;
+                if (elsewhere) {
+                    Address address = target.address();
+                    ghidra.program.model.listing.Function function =
+                        target.program().getFunctionManager().getFunctionContaining(address);
+                    long delta = function == null ? 0 : address.subtract(function.getEntryPoint());
+                    set.put("destination", AngrModules.nameOf(target.program()) + "!"
+                        + (function == null ? address.toString()
+                            : function.getName() + (delta == 0 ? "" : "+0x" + Long.toHexString(delta)) + " @ " + address));
+                    set.put("module", AngrModules.nameOf(target.program()));
+                }
+                else {
+                    set.put("destination",
+                        AngrCallSpec.codeLabel(program, "0x" + Long.toHexString(target.address().getOffset())));
+                }
+                boolean loaded = running != null && running.modules.contains(target.program());
+                set.put("next", running == null
                     ? "Start a session (action=start), then action=seek."
-                    : "action=seek looks for a way there from the current path.");
+                        + (elsewhere ? " The session loads " + AngrModules.nameOf(target.program()) + " with it." : "")
+                    : loaded ? "action=seek looks for a way there from the current path."
+                    : "action=seek loads " + AngrModules.nameOf(target.program()) + " by starting the session "
+                        + "again if it has not moved yet; otherwise start it again first.");
                 return set;
             }
             case "clear_destination":
-                AngrDebugger.setDestination(program, null);
+                AngrDebugger.setDestination(program, (AngrModules.Location) null);
                 return Map.of("destination", "none");
             default:
                 break;
@@ -244,7 +282,8 @@ public class AngrDebugTool implements McpTool {
                         avoid.add(AngrCallSpec.resolveCode(program, String.valueOf(item), "avoid"));
                     }
                 }
-                session.seek(avoid, !Boolean.FALSE.equals(arguments.get("guided")), budget, monitor);
+                session = AngrDebugger.seek(program, avoid, !Boolean.FALSE.equals(arguments.get("guided")),
+                    budget, monitor);
                 break;
             }
             case "ledger": {
@@ -296,8 +335,8 @@ public class AngrDebugTool implements McpTool {
     private Map<String, Object> present(AngrDebugSession session, boolean full, String note) {
         Map<String, Object> snapshot = session.snapshot();
         Map<String, Object> out = new LinkedHashMap<>();
-        for (String key : List.of("function", "called", "status", "stop", "pc", "location", "path",
-                "instructions", "depth", "flags")) {
+        for (String key : List.of("function", "called", "status", "stop", "pc", "location", "module",
+                "moduleAddress", "path", "instructions", "depth", "flags")) {
             if (snapshot.get(key) != null && (full || !key.equals("called") || note != null)) {
                 out.put(key, snapshot.get(key));
             }
@@ -306,12 +345,12 @@ public class AngrDebugTool implements McpTool {
         if (hint != null) {
             out.put("hint", hint);
         }
-        Address destination = AngrDebugger.destination(session.program);
+        String destination = session.destinationText();
         if (destination != null) {
-            out.put("destination",
-                AngrCallSpec.codeLabel(session.program, "0x" + Long.toHexString(destination.getOffset())));
+            out.put("destination", destination);
         }
-        for (String key : List.of("seek", "seekGuide", "ledger", "returnValue", "fault", "paths", "symbols")) {
+        for (String key : List.of("modules", "reloaded", "seek", "seekGuide", "ledger", "returnValue", "fault",
+                "paths", "symbols")) {
             if (snapshot.get(key) != null) {
                 out.put(key, snapshot.get(key));
             }

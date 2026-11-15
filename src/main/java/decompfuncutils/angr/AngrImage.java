@@ -8,7 +8,9 @@ import ghidra.program.model.lang.LanguageDescription;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.reloc.Relocation;
 import ghidra.program.model.symbol.ExternalLocation;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceManager;
@@ -38,6 +40,12 @@ import java.util.stream.Stream;
  *
  * <p>An export is keyed on the program's modification number, so it is reused until the program
  * changes and replaced when it does.
+ *
+ * <p>An image can hold several programs ({@link AngrModules}): the one being debugged and
+ * libraries of the project next to it, in one address space. A library that would overlap is
+ * moved, and the pointers stored in it - found through Ghidra's relocation table - are moved
+ * with it. Imports that another module defines are marked as such, so a call runs the real code,
+ * and pointers to imported variables are pointed at the real storage.
  */
 public final class AngrImage {
 
@@ -56,6 +64,9 @@ public final class AngrImage {
 
     private static final Gson GSON = new Gson();
     private static final Map<Long, AngrImage> CACHE = new ConcurrentHashMap<>();
+    /** Images of several programs together, most recently used last. */
+    private static final LinkedHashMap<String, AngrImage> COMPOSITES = new LinkedHashMap<>(8, 0.75f, true);
+    private static final int MAX_COMPOSITES = 4;
     private static volatile Path root;
 
     /** Directory holding image.bin and image.json. */
@@ -64,14 +75,21 @@ public final class AngrImage {
     public final String key;
     /** Names of the imports that have at least one hookable address. */
     public final Set<String> externalNames;
+    /** Imports that run another module's code, by name, with the module they run in. */
+    public final Map<String, String> linkedImports;
+    /** Things about the export the user should know (a module moved without relocations, say). */
+    public final List<String> notes;
 
     private final long modificationNumber;
 
-    private AngrImage(Path directory, String key, long modificationNumber, Set<String> externalNames) {
+    private AngrImage(Path directory, String key, long modificationNumber, Set<String> externalNames,
+            Map<String, String> linkedImports, List<String> notes) {
         this.directory = directory;
         this.key = key;
         this.modificationNumber = modificationNumber;
         this.externalNames = externalNames;
+        this.linkedImports = linkedImports;
+        this.notes = notes;
     }
 
     /** The export for the program as it is now, creating or refreshing it as needed. */
@@ -87,8 +105,38 @@ public final class AngrImage {
             if (cached != null) {
                 deleteTree(cached.directory);
             }
-            AngrImage fresh = export(program, id, modification, monitor);
+            String key = Long.toHexString(id) + "-" + modification;
+            Path dir = root().resolve(safeName(program.getName()) + "-" + key);
+            AngrImage fresh = export(AngrModules.single(program), dir, key, modification, monitor);
             CACHE.put(id, fresh);
+            return fresh;
+        }
+    }
+
+    /** The export of several programs in one address space; of the first alone when it is alone. */
+    public static AngrImage of(AngrModules modules, TaskMonitor monitor) throws Exception {
+        if (modules.size() == 1) {
+            return of(modules.main(), monitor);
+        }
+        String key = modules.key();
+        synchronized (COMPOSITES) {
+            AngrImage cached = COMPOSITES.get(key);
+            if (cached != null && Files.isRegularFile(cached.directory.resolve("image.json"))) {
+                return cached;
+            }
+            Path dir = root().resolve(safeName(modules.main().getName()) + "-with-"
+                + (modules.size() - 1) + "-" + Integer.toHexString(key.hashCode()));
+            deleteTree(dir);
+            AngrImage fresh = export(modules, dir, key, 0, monitor);
+            COMPOSITES.put(key, fresh);
+            Iterator<Map.Entry<String, AngrImage>> oldest = COMPOSITES.entrySet().iterator();
+            while (COMPOSITES.size() > MAX_COMPOSITES && oldest.hasNext()) {
+                AngrImage old = oldest.next().getValue();
+                if (old != fresh) {
+                    oldest.remove();
+                    deleteTree(old.directory);
+                }
+            }
             return fresh;
         }
     }
@@ -101,68 +149,139 @@ public final class AngrImage {
 
     // ---- export ----
 
-    private static AngrImage export(Program program, long id, long modification, TaskMonitor monitor)
-            throws Exception {
-        String key = Long.toHexString(id) + "-" + modification;
-        Path dir = root().resolve(safeName(program.getName()) + "-" + key);
+    @SuppressWarnings("unchecked")
+    private static AngrImage export(AngrModules modules, Path dir, String key, long modification,
+            TaskMonitor monitor) throws Exception {
         Files.createDirectories(dir);
+        Program program = modules.main();
 
-        AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
+        // What another module defines: variables by the stand-in address the importer uses for
+        // them, functions by name.
+        Map<AngrModules.Module, Map<Long, Long>> variables = new IdentityHashMap<>();
+        Map<String, AngrModules.Link> functions = new LinkedHashMap<>();
+        for (AngrModules.Link link : modules.links()) {
+            if (link.external != null) {
+                functions.putIfAbsent(link.name, link);
+            }
+            else {
+                variables.computeIfAbsent(link.importer, m -> new HashMap<>())
+                    .put(link.slot.getOffset(), link.angrAddress());
+            }
+        }
+
         List<Map<String, Object>> segments = new ArrayList<>();
         List<Map<String, Object>> zero = new ArrayList<>();
+        List<Map<String, Object>> loaded = new ArrayList<>();
+        Map<String, Map<String, Object>> externals = new LinkedHashMap<>();
+        List<Map<String, Object>> externalData = new ArrayList<>();
+        List<Map<String, Object>> stdio = new ArrayList<>();
+        List<String> notes = new ArrayList<>(modules.notes());
         long offset = IMAGE_HEADER.length;
 
         monitor.setMessage("Exporting memory image for angr");
         try (OutputStream out = Files.newOutputStream(dir.resolve("image.bin"))) {
             out.write(IMAGE_HEADER);
             byte[] buffer = new byte[1 << 16];
-            for (MemoryBlock block : program.getMemory().getBlocks()) {
-                monitor.checkCancelled();
-                // Overlays and other spaces are not part of the flat address space the code runs in.
-                if (block.isOverlay() || !block.getStart().getAddressSpace().equals(space)) {
-                    continue;
-                }
-                // The EXTERNAL block is Ghidra's stand-in for imports. Functions in it are hooked;
-                // imported variables in it are plain storage, so it goes out as zero memory and a
-                // read of 'stdout' or a missing library's global does not fault.
-                boolean external = block.isExternalBlock();
-                if (!block.isLoaded() && !external) {
-                    continue;
-                }
-                Map<String, Object> entry = new LinkedHashMap<>();
-                entry.put("name", block.getName());
-                entry.put("addr", hex(block.getStart().getOffset()));
-                entry.put("size", block.getSize());
-                entry.put("perm", (block.isRead() ? "r" : "") + (block.isWrite() ? "w" : "")
-                    + (block.isExecute() ? "x" : ""));
+            for (AngrModules.Module module : modules.modules()) {
+                Program source = module.program;
+                AddressSpace space = source.getAddressFactory().getDefaultAddressSpace();
+                boolean first = source == program;
+                long delta = module.delta();
+                Map<Long, Long> imported = variables.getOrDefault(module, Map.of());
+                Patches patches = Patches.of(module, imported, monitor);
+                int blocks = 0;
 
-                if (!block.isInitialized() || external) {
-                    zero.add(entry);
-                    continue;
-                }
-                if (offset + block.getSize() > MAX_IMAGE_BYTES) {
-                    throw new IllegalStateException("The program has more than "
-                        + (MAX_IMAGE_BYTES >> 20) + " MiB of initialized memory, which is more than "
-                        + "this tool will copy out for angr.");
-                }
-                entry.put("offset", offset);
-                long written = 0;
-                try (InputStream in = block.getData()) {
-                    int n;
-                    while ((n = in.read(buffer)) > 0) {
-                        out.write(buffer, 0, n);
-                        written += n;
+                for (MemoryBlock block : source.getMemory().getBlocks()) {
+                    monitor.checkCancelled();
+                    // Overlays and other spaces are not part of the flat address space the code runs in.
+                    if (!AngrModules.exported(block, space)) {
+                        continue;
+                    }
+                    // The EXTERNAL block is Ghidra's stand-in for imports. Functions in it are hooked;
+                    // imported variables in it are plain storage, so it goes out as zero memory and a
+                    // read of 'stdout' or a missing library's global does not fault.
+                    boolean external = block.isExternalBlock();
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("name", first ? block.getName() : module.name + ":" + block.getName());
+                    entry.put("addr", hex(block.getStart().getOffset() + delta));
+                    entry.put("size", block.getSize());
+                    entry.put("perm", (block.isRead() ? "r" : "") + (block.isWrite() ? "w" : "")
+                        + (block.isExecute() ? "x" : ""));
+
+                    if (!block.isInitialized() || external) {
+                        zero.add(entry);
+                        continue;
+                    }
+                    if (offset + block.getSize() > MAX_IMAGE_BYTES) {
+                        throw new IllegalStateException("There is more than " + (MAX_IMAGE_BYTES >> 20)
+                            + " MiB of initialized memory to load, which is more than this tool will copy "
+                            + "out for angr.");
+                    }
+                    entry.put("offset", offset);
+                    long written = 0;
+                    try (InputStream in = block.getData()) {
+                        int n;
+                        while ((n = in.read(buffer)) > 0) {
+                            if (patches != null) {
+                                patches.apply(buffer, n, block.getStart().getOffset() + written);
+                            }
+                            out.write(buffer, 0, n);
+                            written += n;
+                        }
+                    }
+                    if (written != block.getSize()) {
+                        // A mapped block whose source is not fully backed: keep what could be read.
+                        entry.put("size", written);
+                    }
+                    if (written > 0) {
+                        segments.add(entry);
+                        offset += written;
+                        blocks++;
                     }
                 }
-                if (written != block.getSize()) {
-                    // A mapped block whose source is not fully backed: keep what could be read.
-                    entry.put("size", written);
+
+                for (Map<String, Object> ext : externalsOf(source, space, delta)) {
+                    Map<String, Object> known = externals.get(ext.get("name"));
+                    if (known == null) {
+                        externals.put((String) ext.get("name"), ext);
+                        continue;
+                    }
+                    // The same import in two modules is one import: a stub or a hook covers both.
+                    merge(known, "addrs", new LinkedHashSet<>((List<String>) ext.get("addrs")));
+                    merge(known, "slots", new LinkedHashSet<>((List<String>) ext.get("slots")));
+                    if (((Number) known.get("params")).intValue() < 0) {
+                        known.put("params", ext.get("params"));
+                    }
                 }
-                if (written > 0) {
-                    segments.add(entry);
-                    offset += written;
+                for (Map<String, Object> item : externalDataOf(source, space, delta)) {
+                    // Pointed at the defining module's storage instead; see Patches.
+                    if (!imported.containsKey(Long.decode((String) item.get("addr")) - delta)) {
+                        externalData.add(item);
+                    }
                 }
+                stdio.addAll(stdioOf(source, space, delta));
+
+                Map<String, Object> described = new LinkedHashMap<>();
+                described.put("name", module.name);
+                described.put("delta", hex(delta));
+                described.put("addr", hex(module.min + delta));
+                described.put("end", hex(module.max + delta));
+                described.put("blocks", blocks);
+                described.put("pointersMoved", patches == null ? 0 : patches.moved);
+                described.put("pointersLinked", patches == null ? 0 : patches.linked);
+                loaded.add(described);
             }
+        }
+
+        Map<String, String> linkedImports = new LinkedHashMap<>();
+        for (AngrModules.Link link : functions.values()) {
+            Map<String, Object> ext = externals.get(link.name);
+            if (ext == null) {
+                continue; // nothing reaches the import, so there is nothing to redirect
+            }
+            ext.put("target", hex(link.angrAddress()));
+            ext.put("module", link.target.name);
+            linkedImports.put(link.name, link.target.name);
         }
 
         Language language = program.getLanguage();
@@ -177,20 +296,116 @@ public final class AngrImage {
         manifest.put("image", "image.bin");
         manifest.put("segments", segments);
         manifest.put("zero", zero);
-        List<Map<String, Object>> externals = externalsOf(program, space);
-        manifest.put("externals", externals);
-        manifest.put("externalData", externalDataOf(program, space));
-        manifest.put("stdio", stdioOf(program, space));
+        manifest.put("modules", loaded);
+        manifest.put("externals", new ArrayList<>(externals.values()));
+        manifest.put("externalData", externalData);
+        manifest.put("stdio", stdio);
 
         Files.writeString(dir.resolve("image.json"), GSON.toJson(manifest), StandardCharsets.UTF_8);
 
-        Set<String> names = new HashSet<>();
-        for (Map<String, Object> ext : externals) {
-            names.add((String) ext.get("name"));
+        Msg.info(AngrImage.class, "Exported " + program.getName()
+            + (modules.size() > 1 ? " with " + String.join(", ", modules.libraryNames()) : "")
+            + " for angr: " + segments.size() + " initialized block(s), " + (offset >> 10) + " KiB, "
+            + externals.size() + " import(s), " + linkedImports.size() + " linked -> " + dir);
+        return new AngrImage(dir, key, modification, new HashSet<>(externals.keySet()),
+            Collections.unmodifiableMap(linkedImports), Collections.unmodifiableList(notes));
+    }
+
+    /**
+     * The pointers of one module that have to hold something other than what Ghidra's memory
+     * holds: those into the module itself when it was moved, and those to an imported variable
+     * that another module defines. Ghidra's relocation table says where the pointers are.
+     */
+    private static final class Patches {
+        final long[] at;
+        final long[] value;
+        final int width;
+        final boolean bigEndian;
+        final int moved;
+        final int linked;
+
+        private Patches(TreeMap<Long, Long> found, int width, boolean bigEndian, int moved, int linked) {
+            this.at = new long[found.size()];
+            this.value = new long[found.size()];
+            int i = 0;
+            for (Map.Entry<Long, Long> e : found.entrySet()) {
+                at[i] = e.getKey();
+                value[i++] = e.getValue();
+            }
+            this.width = width;
+            this.bigEndian = bigEndian;
+            this.moved = moved;
+            this.linked = linked;
         }
-        Msg.info(AngrImage.class, "Exported " + program.getName() + " for angr: " + segments.size()
-            + " initialized block(s), " + (offset >> 10) + " KiB, " + externals.size() + " import(s) -> " + dir);
-        return new AngrImage(dir, key, modification, names);
+
+        static Patches of(AngrModules.Module module, Map<Long, Long> imported, TaskMonitor monitor)
+                throws Exception {
+            long delta = module.delta();
+            if (delta == 0 && imported.isEmpty()) {
+                return null;
+            }
+            Program program = module.program;
+            int width = program.getDefaultPointerSize();
+            if (width != 2 && width != 4 && width != 8) {
+                return null;
+            }
+            boolean bigEndian = program.getLanguage().isBigEndian();
+            AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
+            Memory memory = program.getMemory();
+            TreeMap<Long, Long> found = new TreeMap<>();
+            byte[] word = new byte[width];
+            int moved = 0;
+            int linked = 0;
+            Iterator<Relocation> relocations = program.getRelocationTable().getRelocations();
+            while (relocations.hasNext()) {
+                monitor.checkCancelled();
+                Address address = relocations.next().getAddress();
+                if (address == null || !address.getAddressSpace().equals(space)) {
+                    continue;
+                }
+                try {
+                    if (memory.getBytes(address, word) != width) {
+                        continue;
+                    }
+                }
+                catch (Exception e) {
+                    continue; // nothing stored there
+                }
+                long stored = 0;
+                for (int i = 0; i < width; i++) {
+                    stored = (stored << 8) | (word[bigEndian ? i : width - 1 - i] & 0xffL);
+                }
+                Long target = imported.get(stored);
+                if (target != null) {
+                    found.put(address.getOffset(), target);
+                    linked++;
+                }
+                else if (delta != 0 && stored != 0 && module.covers(stored)) {
+                    // A pointer into the module itself: it moves with the module.
+                    found.put(address.getOffset(), stored + delta);
+                    moved++;
+                }
+            }
+            return new Patches(found, width, bigEndian, moved, linked);
+        }
+
+        /** Rewrites the pointers that fall in {@code buffer}, which holds memory from {@code start}. */
+        void apply(byte[] buffer, int length, long start) {
+            int i = Arrays.binarySearch(at, start - width + 1);
+            if (i < 0) {
+                i = -i - 1;
+            }
+            for (; i < at.length && at[i] < start + length; i++) {
+                for (int k = 0; k < width; k++) {
+                    long index = at[i] + k - start;
+                    if (index < 0 || index >= length) {
+                        continue;
+                    }
+                    int shift = 8 * (bigEndian ? width - 1 - k : k);
+                    buffer[(int) index] = (byte) (value[i] >>> shift);
+                }
+            }
+        }
     }
 
     /** What angr should lift the program as. The worker falls back to archinfo's own lookup by name. */
@@ -239,7 +454,7 @@ public final class AngrImage {
      * calls alike. Where the loader leaves a pointer slot unresolved instead - a PE import table -
      * the slot is listed so the worker can point it at a hook of its own.
      */
-    private static List<Map<String, Object>> externalsOf(Program program, AddressSpace space) {
+    private static List<Map<String, Object>> externalsOf(Program program, AddressSpace space, long delta) {
         Map<String, Map<String, Object>> byName = new LinkedHashMap<>();
         ReferenceManager references = program.getReferenceManager();
         Listing listing = program.getListing();
@@ -256,7 +471,7 @@ public final class AngrImage {
             if (thunks != null) {
                 for (Address thunk : thunks) {
                     if (thunk.getAddressSpace().equals(space)) {
-                        addrs.add(hex(thunk.getOffset()));
+                        addrs.add(hex(thunk.getOffset() + delta));
                     }
                 }
             }
@@ -266,7 +481,7 @@ public final class AngrImage {
                 if (from != null && from.getAddressSpace().equals(space)
                         && listing.getInstructionContaining(from) == null
                         && program.getMemory().contains(from)) {
-                    slots.add(hex(from.getOffset()));
+                    slots.add(hex(from.getOffset() + delta));
                 }
             }
             if (addrs.isEmpty() && slots.isEmpty()) {
@@ -298,7 +513,7 @@ public final class AngrImage {
      * EXTERNAL block when reached through the GOT, or copied into the program's own .bss. The
      * worker points each at a FILE object, so stdio calls on them work.
      */
-    private static List<Map<String, Object>> stdioOf(Program program, AddressSpace space) {
+    private static List<Map<String, Object>> stdioOf(Program program, AddressSpace space, long delta) {
         List<Map<String, Object>> out = new ArrayList<>();
         String[] names = { "stdin", "stdout", "stderr" };
         for (int fd = 0; fd < names.length; fd++) {
@@ -311,7 +526,7 @@ public final class AngrImage {
                 }
                 Map<String, Object> entry = new LinkedHashMap<>();
                 entry.put("name", names[fd]);
-                entry.put("addr", hex(address.getOffset()));
+                entry.put("addr", hex(address.getOffset() + delta));
                 entry.put("fd", fd);
                 out.add(entry);
             }
@@ -323,7 +538,7 @@ public final class AngrImage {
      * Imported variables: labels in the EXTERNAL block that are not functions. With unknown
      * imports symbolic, the worker makes these unknown as well.
      */
-    private static List<Map<String, Object>> externalDataOf(Program program, AddressSpace space) {
+    private static List<Map<String, Object>> externalDataOf(Program program, AddressSpace space, long delta) {
         List<Map<String, Object>> out = new ArrayList<>();
         for (MemoryBlock block : program.getMemory().getBlocks()) {
             if (!block.isExternalBlock() || !block.getStart().getAddressSpace().equals(space)) {
@@ -342,7 +557,7 @@ public final class AngrImage {
                 }
                 Map<String, Object> entry = new LinkedHashMap<>();
                 entry.put("name", symbol.getName());
-                entry.put("addr", hex(address.getOffset()));
+                entry.put("addr", hex(address.getOffset() + delta));
                 out.add(entry);
             }
         }

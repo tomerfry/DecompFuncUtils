@@ -8,6 +8,7 @@ import decompfuncutils.angr.AngrDebugger;
 import decompfuncutils.angr.AngrHooks;
 import decompfuncutils.angr.AngrImage;
 import decompfuncutils.angr.AngrImports;
+import decompfuncutils.angr.AngrModules;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Program;
@@ -105,12 +106,26 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     // ---- plumbing ----
 
+    /**
+     * The program whose session is on screen. Usually the one the tool is showing; but when
+     * that one is a library loaded into another program's session - execution crossed into it
+     * and the Listing followed - it is still that other program's session being debugged.
+     */
+    public Program subject() {
+        Program current = programSupplier.get();
+        if (current == null) {
+            return null;
+        }
+        AngrDebugSession showing = AngrDebugger.sessionShowing(current);
+        return showing == null ? current : showing.program;
+    }
+
     private interface Work {
         void run(Program program) throws Exception;
     }
 
     private void background(Work work) {
-        Program program = programSupplier.get();
+        Program program = subject();
         if (program == null) {
             fail("Open a program first.");
             return;
@@ -149,12 +164,10 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
     }
 
     private void show() {
-        Program program = programSupplier.get();
+        Program program = subject();
         AngrDebugSession session = program == null ? null : AngrDebugger.session(program);
         panel.showState(session == null ? null : session.snapshot(), session != null && session.isRunning());
-        Address destination = program == null ? null : AngrDebugger.destination(program);
-        panel.showDestination(destination == null ? null
-            : AngrCallSpec.codeLabel(program, AngrImage.hex(destination.getOffset())));
+        panel.showDestination(program == null ? null : AngrDebugger.destinationText(program));
         if (session == null) {
             panel.showLedger(null);
         }
@@ -165,7 +178,10 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     @Override
     public void debuggerChanged(Program program) {
-        if (program == programSupplier.get()) {
+        Program subject = subject();
+        // A destination or a breakpoint in a program that belongs with this one is ours to show too.
+        if (program == subject || program == programSupplier.get()
+                || subject != null && AngrDebugger.companions(subject).contains(program)) {
             refresh();
         }
     }
@@ -281,15 +297,40 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     // ---- the destination and the ledger ----
 
-    /** @param address the new destination, or null for none */
+    /**
+     * @param address the new destination, or null for none. The stub of an import means the
+     *                code it stands for, in the library of the project that defines it.
+     */
     public void setDestination(Program program, Address address) {
-        AngrDebugger.setDestination(program, address);
+        Function function = address == null ? null : program.getFunctionManager().getFunctionAt(address);
+        Function thunked = function != null && function.isThunk() ? function.getThunkedFunction(true) : null;
+        if (thunked == null || !thunked.isExternal()) {
+            AngrDebugger.setDestination(program, address);
+            return;
+        }
+        // Finding the library may mean opening it: not on the Swing thread.
+        lastError = null;
+        lastTask = executor.submit(() -> {
+            try {
+                AngrModules.Location target = AngrDebugger.locate(program, AngrImage.hex(address.getOffset()),
+                    null, null, TaskMonitor.DUMMY);
+                if (target.program() == program) {
+                    AngrDebugger.setDestination(program, target.address());
+                }
+                else {
+                    AngrDebugger.setDestination(program, target);
+                }
+            }
+            catch (Exception e) {
+                AngrDebugger.setDestination(program, address);
+            }
+        });
     }
 
     @Override
     public void seek() {
         background(program -> {
-            session(program).seek(List.of(), true, RUN_BUDGET_MILLIS, TaskMonitor.DUMMY);
+            AngrDebugger.seek(program, List.of(), true, RUN_BUDGET_MILLIS, TaskMonitor.DUMMY);
             ledger(program, true);
         });
     }
@@ -301,7 +342,7 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     @Override
     public String ledgerMarkdown() {
-        Program program = programSupplier.get();
+        Program program = subject();
         AngrDebugSession session = program == null ? null : AngrDebugger.session(program);
         return session == null || session.lastLedger() == null ? null
             : decompfuncutils.angr.AngrLedger.toMarkdown(session.lastLedger());
@@ -319,15 +360,21 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     /** Runs to an address once, as "Run to Cursor" does. */
     public void runTo(Address address) {
+        runTo(null, address);
+    }
+
+    /** @param in the program the address is in: the one being debugged, or a library loaded with it */
+    public void runTo(Program in, Address address) {
         background(program -> {
-            session(program).step("continue", 1, address, RUN_BUDGET_MILLIS, TaskMonitor.DUMMY);
+            session(program).stepUntil("continue", 1, new AngrModules.Location(in == null ? program : in, address),
+                RUN_BUDGET_MILLIS, TaskMonitor.DUMMY);
             ledger(program, false);
         });
     }
 
     @Override
     public void pause() {
-        Program program = programSupplier.get();
+        Program program = subject();
         AngrDebugSession session = program == null ? null : AngrDebugger.session(program);
         if (session != null) {
             session.requestPause();
@@ -336,7 +383,7 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     @Override
     public void stop() {
-        Program program = programSupplier.get();
+        Program program = subject();
         if (program != null) {
             // Not queued behind a run in progress: Stop has to be able to end one.
             AngrDebugger.stop(program);
@@ -415,8 +462,18 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     @Override
     public void goTo(String hexAddress) {
-        Program program = programSupplier.get();
+        Program program = subject();
         if (program == null) {
+            return;
+        }
+        // What the panel shows are addresses as the session runs them; in a library that was
+        // moved they are not the library's own.
+        AngrDebugSession session = AngrDebugger.session(program);
+        if (session != null) {
+            AngrModules.Location location = session.modules.locate(hexAddress);
+            if (location != null) {
+                host.goTo(location.program(), location.address());
+            }
             return;
         }
         Address address = AngrCallSpec.tryAddress(program, hexAddress);
@@ -448,7 +505,7 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
 
     @Override
     public AngrHooks.Hook hookFor(String target) {
-        Program program = programSupplier.get();
+        Program program = subject();
         if (program == null) {
             return null;
         }

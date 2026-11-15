@@ -2,6 +2,7 @@ package decompfuncutils.angr.ui;
 
 import decompfuncutils.angr.AngrDebugSession;
 import decompfuncutils.angr.AngrDebugger;
+import decompfuncutils.angr.AngrModules;
 import docking.ComponentProvider;
 import docking.action.DockingActionIf;
 import ghidra.GhidraApplicationLayout;
@@ -480,7 +481,134 @@ public class AngrDebuggerToolPreview implements GhidraLaunchable {
         settle();
         check("Stop ends the session and clears the marker", AngrDebugger.session(program) == null
             && !pc.contains(session.pc()), null);
+
+        File library = new File(binary.getParentFile(), "libangrxdep.so");
+        File importer = new File(binary.getParentFile(), "libangrxmain.so");
+        if (library.isFile() && importer.isFile()) {
+            crossModule(directory, library, importer, debugger, programs, listing);
+        }
         check("nothing raised a dialog along the way", dialogs().isEmpty(), dialogs());
+    }
+
+    /**
+     * A destination in another program: the library is open in the tool next to the program
+     * that imports from it, the destination is set in the library, and the session of the
+     * importer has to get there - with the Listing following it across.
+     */
+    private void crossModule(File directory, File libraryFile, File importerFile, AngrDebuggerPlugin debugger,
+            ProgramManager programs, CodeViewerService listing) throws Exception {
+        Program library = open(libraryFile, programs);
+        Program importer = open(importerFile, programs);
+        AngrDebuggerController controller = debugger.controller();
+        AngrDebuggerPanel panel = controller.panel();
+
+        Address secret = library.getListing().getGlobalFunctions("xdep_secret").get(0).getEntryPoint();
+        Swing.runNow(() -> {
+            programs.setCurrentProgram(library);
+            controller.setDestination(library, secret);
+        });
+        settle();
+        MarkerSet flag = debugger.markers(library, "destination");
+        check("a destination set in the library is marked in the library", flag != null && flag.contains(secret),
+            secret);
+
+        Swing.runNow(() -> {
+            programs.setCurrentProgram(importer);
+            panel.setFunction("xroute");
+            panel.setArguments("{\"symbolicInt\": 32, \"name\": \"key\"}");
+            panel.button("Start").doClick();
+        });
+        controller.await();
+        settle();
+        AngrDebugSession session = AngrDebugger.session(importer);
+        check("the importer's session loads the library", session != null && session.modules.contains(library),
+            panel.bannerTitle() + " | " + controller.lastError());
+        if (session == null) {
+            return;
+        }
+        check("the importer is still the program on screen", programs.getCurrentProgram() == importer,
+            programs.getCurrentProgram());
+        check("Seek Destination is offered for a destination in another program",
+            panel.button("Seek Destination").isEnabled(), null);
+
+        Swing.runNow(() -> panel.button("Seek Destination").doClick());
+        controller.await();
+        settle();
+        AngrModules.Location where = session.where();
+        check("seeking arrives in the library", panel.bannerTitle().startsWith("Reached the destination")
+            && where != null && where.program() == library && secret.equals(where.address()),
+            panel.bannerTitle() + " | " + controller.lastError() + " | " + where);
+        check("the tool switches to the library and the Listing is at the destination",
+            programs.getCurrentProgram() == library && listing.getCurrentLocation() != null
+                && secret.equals(listing.getCurrentLocation().getAddress()),
+            programs.getCurrentProgram() + " @ " + (listing.getCurrentLocation() == null ? null
+                : listing.getCurrentLocation().getAddress()));
+        MarkerSet libraryPc = debugger.markers(library, "pc");
+        MarkerSet importerPc = debugger.markers(importer, "pc");
+        check("the program counter is marked in the library, and nowhere in the importer",
+            libraryPc != null && libraryPc.contains(secret)
+                && (importerPc == null || !importerPc.contains(secret)), null);
+        check("the windows still show the importer's session", controller.subject() == importer
+            && panel.button("Step Over").isEnabled() && panel.table("ledger").getRowCount() >= 4,
+            controller.subject() + ", ledger rows " + panel.table("ledger").getRowCount());
+        screenshot(new File(directory, "_angr_tool_5_cross_module.png"));
+
+        Swing.runNow(() -> panel.button("Step Out").doClick());
+        controller.await();
+        settle();
+        where = session.where();
+        check("stepping on works from the library's Listing", where != null && where.program() == library
+            && !secret.equals(where.address()) && libraryPc.contains(where.address()), where);
+        Swing.runNow(() -> panel.button("Step Out").doClick());
+        controller.await();
+        settle();
+        where = session.where();
+        check("stepping out of the library brings the Listing back to the importer",
+            where != null && where.program() == importer && programs.getCurrentProgram() == importer
+                && where.address().equals(listing.getCurrentLocation().getAddress()), where);
+
+        Swing.runNow(() -> {
+            panel.button("Stop").doClick();
+            controller.setDestination(library, null);
+        });
+        controller.await();
+        settle();
+        check("stopping clears the marker in the library", !libraryPc.contains(secret)
+            && AngrDebugger.session(importer) == null, null);
+
+        // Set Destination on the importer's stub for an import means the library's code.
+        // A stub has no name of its own (it shows its import's), so it is found from the import.
+        Address stub = null;
+        for (Function external : importer.getFunctionManager().getExternalFunctions()) {
+            Address[] thunks = external.getFunctionThunkAddresses(true);
+            if (external.getName().equals("xdep_check") && thunks != null && thunks.length > 0) {
+                stub = thunks[0];
+            }
+        }
+        Address stubAddress = stub;
+        Address real = library.getListing().getGlobalFunctions("xdep_check").get(0).getEntryPoint();
+        if (stubAddress != null) {
+            Swing.runNow(() -> controller.setDestination(importer, stubAddress));
+            controller.await();
+            settle();
+        }
+        check("a destination set on an import's stub lands on its code in the library", stubAddress != null
+            && AngrDebugger.destinations(importer).equals(List.of(new AngrModules.Location(library, real))),
+            AngrDebugger.destinations(importer));
+        Swing.runNow(() -> controller.setDestination(library, null));
+        settle();
+    }
+
+    private Program open(File binary, ProgramManager programs) throws Exception {
+        Program program = ghidraProject.importProgram(binary);
+        ghidraProject.analyze(program);
+        int transaction = program.startTransaction("mark analyzed");
+        ghidra.program.util.GhidraProgramUtilities.markProgramAnalyzed(program);
+        program.endTransaction(transaction, true);
+        ghidraProject.saveAs(program, "/", program.getName(), true);
+        Swing.runNow(() -> programs.openProgram(program));
+        settle();
+        return program;
     }
 
     // ---------------------------------------------------------------------------------------

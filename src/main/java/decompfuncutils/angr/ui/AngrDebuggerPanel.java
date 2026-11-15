@@ -802,7 +802,10 @@ public class AngrDebuggerPanel extends JPanel {
 
     private void describe(String status) {
         String stop = text(snapshot.get("stop"));
-        String where = text(snapshot.get("pc"))
+        // In a library the address a person can look up is the library's own, which is not the
+        // one it runs at when it had to be moved out of the program's way.
+        String where = (snapshot.get("moduleAddress") != null ? text(snapshot.get("moduleAddress"))
+                : text(snapshot.get("pc")))
             + (snapshot.get("location") != null ? "   " + snapshot.get("location") : "");
         String tail = snapshot.get("instructions") + " instructions"
             + (snapshot.get("flags") != null ? "   flags: " + snapshot.get("flags") : "")
@@ -944,7 +947,8 @@ public class AngrDebuggerPanel extends JPanel {
                 line = indent + call.get("call") + "(" + arguments + ")"
                     + (call.get("returned") != null ? "  ->  " + call.get("returned") : "")
                     + (Boolean.TRUE.equals(call.get("python")) ? "   [python hook]"
-                        : Boolean.TRUE.equals(call.get("stubbed")) ? "   [stub]" : "");
+                        : Boolean.TRUE.equals(call.get("stubbed")) ? "   [stub]"
+                        : call.get("into") != null ? "   [runs in " + call.get("into") + "]" : "");
             }
             shown.add(row);
             data.add(new Object[] { line, from });
@@ -1038,7 +1042,8 @@ public class AngrDebuggerPanel extends JPanel {
             if (entry.get("library") != null && !inProject) {
                 missing++;
             }
-            row.put("stub", hook == null && !"angr model".equals(entry.get("handledBy")));
+            row.put("stub", hook == null && !"angr model".equals(entry.get("handledBy"))
+                && entry.get("linked") == null);
             shown.add(row);
             data.add(new Object[] { entry.get("name"), entry.get("library") == null ? "(unknown)" : entry.get("library"),
                 entry.get("library") == null ? "" : inProject ? "yes" : "no", handled });

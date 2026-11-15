@@ -198,6 +198,18 @@ class ExternalStub(angr.SimProcedure):
         return claripy.BVV(0, bits)
 
 
+class LinkedImport(angr.SimProcedure):
+    """
+    An import whose library is loaded next to the program: the call carries on in the real
+    code. The return address the caller pushed is still in place, so the library function
+    returns straight to the caller.
+    """
+
+    # pylint: disable=arguments-differ
+    def run(self, dfu_target=None, dfu_module=None):
+        self.jump(claripy.BVV(dfu_target, self.state.arch.bits))
+
+
 _SYMBOL_COUNTER = itertools.count(1)
 
 
@@ -536,6 +548,7 @@ class Call:
         self.known = []         # (start, end) ranges worth previewing as data
         self.hook_names = {}
         self.unmodelled = set()  # imports angr has no model for, stubbed
+        self.linked = {}        # imports that run another loaded module's code: name -> module
         self.external_symbols = {}  # imported variables made unknown: symbol name -> value
         self.inline_hooks = set()
         self.python_hooks = []
@@ -752,6 +765,7 @@ class Call:
                 params = int(ext.get("params", -1))
                 display = item["external"]
                 self.unmodelled.discard(display)
+                self.linked.pop(display, None)
             if item.get("kind") == "inline":
                 skip = int(h(item.get("skip", 0)))
                 for addr in addrs:
@@ -787,6 +801,11 @@ class Call:
         if override is not None:
             return ExternalStub(display_name=name, num_args=num_args, cc=self.image.cc,
                                 **self.stub_kwargs(override))
+        if ext.get("target") is not None:
+            # Another loaded module defines it: run that code rather than a model of it.
+            self.linked[name] = ext.get("module") or "another module"
+            return LinkedImport(display_name=name, num_args=0, cc=self.image.cc,
+                                dfu_target=h(ext["target"]), dfu_module=ext.get("module"))
         cls = find_simprocedure(name)
         if cls is not None:
             return cls(display_name=name, cc=self.image.cc)
@@ -918,6 +937,9 @@ class Call:
         if name is None or getattr(proc, "display_name", None) != name:
             return
         entry = {"call": name, "args": [self.render(state, x) for x in (proc.arguments or [])]}
+        if isinstance(proc, LinkedImport):
+            # Not a model that ran and returned: execution went into the library's own code.
+            entry = {"call": name, "into": self.linked.get(name)}
         result = a.simprocedure_result
         if result is not None:
             entry["returned"] = self.render(state, result)
@@ -2507,8 +2529,11 @@ def describe_imports(image):
     rows = []
     for ext in image.externals:
         cls = find_simprocedure(ext["name"])
-        rows.append({"name": ext["name"], "library": ext.get("library"),
-                     "model": cls.__name__ if cls is not None else None})
+        row = {"name": ext["name"], "library": ext.get("library"),
+               "model": cls.__name__ if cls is not None else None}
+        if ext.get("target") is not None:
+            row["linked"] = ext.get("module") or "another module"
+        rows.append(row)
     return rows
 
 

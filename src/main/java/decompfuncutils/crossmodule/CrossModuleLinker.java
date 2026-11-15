@@ -594,7 +594,7 @@ public final class CrossModuleLinker {
     // Shared lookups
     // ---------------------------------------------------------------------------------------
 
-    private static String importedName(ExternalLocation extLoc) {
+    public static String importedName(ExternalLocation extLoc) {
         return extLoc.getOriginalImportedName() != null
             ? extLoc.getOriginalImportedName()
             : extLoc.getLabel();
@@ -604,7 +604,7 @@ public final class CrossModuleLinker {
      * The address of an exported (external entry point) label or function of the given name,
      * or null when the program does not publish it.
      */
-    private static Address exportedAddress(Program program, String name) {
+    public static Address exportedAddress(Program program, String name) {
         if (name == null) {
             return null;
         }
@@ -665,7 +665,7 @@ public final class CrossModuleLinker {
      * first, then the whole project; an exact name wins over a prefix match, which is what links
      * a DT_NEEDED "libfoo.so.1" to a file imported as "libfoo.so.1.2.3".
      */
-    private static DomainFile findLibraryFile(ProjectData projectData, DomainFolder preferred,
+    public static DomainFile findLibraryFile(ProjectData projectData, DomainFolder preferred,
             String libName, TaskMonitor monitor) throws Exception {
         DomainFile prefixHit = null;
 
@@ -717,7 +717,7 @@ public final class CrossModuleLinker {
      * exported symbol of that name — Ghidra's resolver attributes a namespace without ever storing
      * an address, so the name lookup is the common path.
      */
-    private static Address resolveTarget(Program libProgram, ExternalLocation extLoc) {
+    public static Address resolveTarget(Program libProgram, ExternalLocation extLoc) {
         Address stored = extLoc.getAddress();
         if (stored != null) {
             Address translated = translate(libProgram, stored);
