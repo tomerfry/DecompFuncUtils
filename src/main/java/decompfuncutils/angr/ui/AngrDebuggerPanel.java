@@ -57,7 +57,7 @@ public class AngrDebuggerPanel extends JPanel {
 
         void refreshImports();
 
-        /** Look for a way from the current path to the destination. */
+        /** Look for a way to the destination from every open path, the current one first. */
         void seek();
 
         /** Read the current path's ledger again. */
@@ -870,9 +870,15 @@ public class AngrDebuggerPanel extends JPanel {
             default:
                 Map<?, ?> seek = snapshot.get("seek") instanceof Map<?, ?> m ? m : null;
                 if ("destination".equals(stop) && seek != null) {
+                    // The search starts from every open path: say so when the way was down a side
+                    // an earlier fork had parked, since the current path has changed under the user.
+                    boolean parked = seek.get("through") != null && seek.get("from") != null
+                        && number(seek.get("through")) != number(seek.get("from"));
                     setBanner(palette.ok, "Reached the destination at " + where,
                         seek.get("blocks") + " blocks explored across " + seek.get("statesExpanded")
-                            + " states. The Ledger lists what it took to get here, in order, and values that "
+                            + " states." + (parked ? " The way was down path " + number(seek.get("through"))
+                                + ", the other side of an earlier fork, not the path that was current." : "")
+                            + " The Ledger lists what it took to get here, in order, and values that "
                             + "satisfy it. Seek again looks for another way in.");
                     selectTab("Ledger");
                 }
@@ -882,7 +888,8 @@ public class AngrDebuggerPanel extends JPanel {
                             + seek.get("ended") + "). Narrow it down - give arguments values, or concretize "
                             + "unknowns that should not vary - and seek again. Still at " + where + ".");
                 }
-                else if ("seek_exhausted".equals(stop) && seek != null && number(seek.get("forks")) == 0) {
+                else if ("seek_exhausted".equals(stop) && seek != null && number(seek.get("forks")) == 0
+                    && number(seek.get("startedFrom")) <= 1) {
                     setBanner(palette.warn, "The destination was not reached: nothing on the way was unknown",
                         "No branch depended on an unknown value, so there was one path to follow ("
                             + seek.get("ended") + ") and it does not arrive. What decides the way is fixed: "
@@ -891,8 +898,8 @@ public class AngrDebuggerPanel extends JPanel {
                 }
                 else if ("seek_exhausted".equals(stop) && seek != null) {
                     setBanner(palette.warn, "The destination cannot be reached from here",
-                        "Every path was followed to its end (" + seek.get("ended") + ") and none arrives under "
-                            + "the conditions already taken. Still at " + where + ".");
+                        "Every open path was followed to its end (" + seek.get("ended") + ") and none arrives "
+                            + "under the conditions already taken. Still at " + where + ".");
                 }
                 else if (seek != null && List.of("seek_budget", "timeout", "paused").contains(stop)) {
                     setBanner(palette.info, "Not at the destination yet",

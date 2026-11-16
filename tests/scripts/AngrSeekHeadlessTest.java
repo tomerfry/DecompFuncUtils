@@ -99,6 +99,7 @@ public class AngrSeekHeadlessTest extends GhidraScript {
         try {
             dbg("set_destination", "address", "reached");
             unknownInputs();
+            afterAFork();
             searchOrder();
         }
         finally {
@@ -211,6 +212,76 @@ public class AngrSeekHeadlessTest extends GhidraScript {
         check("an unknown at entry can be concretized by name",
             String.valueOf(s.get("symbols")).contains("pinned=true")
                 && !String.valueOf(s.get("symbols")).contains("example"), s.get("symbols"));
+    }
+
+    /**
+     * Continue stops at a branch on an unknown and stays on one side of it, with the other side
+     * parked as a path of its own. The way to the destination is as likely to be the parked side
+     * as the current one, so a seek from there has to look down both.
+     */
+    private void afterAFork() throws Exception {
+        dbg("start", "function", "seek_int", "args", List.of());
+        Map<String, Object> s = dbg("continue");
+        List<Map<String, Object>> paths = rows(s.get("paths"));
+        check("continue stops at the fork with both sides kept", "fork".equals(s.get("stop")) && paths.size() == 2, s);
+        for (Map<String, Object> path : paths) {
+            long id = num(path.get("id"));
+            dbg("start", "function", "seek_int", "args", List.of());
+            dbg("continue");
+            dbg("select_path", "path", (double) id);
+            s = dbg("seek", "timeoutMs", 60000.0);
+            check("seek arrives after a fork, with path " + id + " (" + path.get("guard") + ") current",
+                arrived(s) && "0x1337".equals(unknown(s, "arg0").get("value")),
+                s.get("stop") + " " + s.get("seek") + " " + s.get("hint"));
+        }
+
+        // Several forks deep, wherever stepping happened to leave the current path.
+        dbg("start", "function", "seek_chain", "args", List.of());
+        int forks = 0;
+        for (int i = 0; i < 3; i++) {
+            s = dbg("continue");
+            if (!"fork".equals(s.get("stop"))) {
+                break;
+            }
+            forks++;
+        }
+        s = dbg("seek", "timeoutMs", 60000.0);
+        check("seek arrives after " + forks + " forks taken by hand", forks > 0 && arrived(s),
+            s.get("stop") + " " + s.get("seek") + " " + s.get("paths"));
+        check("and says how many paths it started from and which one the way carries on from",
+            num(map(s.get("seek")).get("startedFrom")) == forks + 1 && map(s.get("seek")).get("through") != null,
+            s.get("seek"));
+
+        // No way from any side is still a verdict, and not the "nothing was unknown" one.
+        dbg("start", "function", "seek_never", "args", List.of());
+        s = dbg("continue");
+        s = dbg("seek", "timeoutMs", 60000.0);
+        check("no way from either side of a fork is still unreachable",
+            "seek_exhausted".equals(s.get("stop")) && "unreachable".equals(map(s.get("seek")).get("result"))
+                && !String.valueOf(s.get("hint")).contains("No branch on the way depended"),
+            s.get("seek") + " " + s.get("hint"));
+
+        // A path that has finished is no place to search from, but its open siblings are.
+        dbg("start", "function", "seek_int", "args", List.of());
+        s = dbg("continue");
+        long wrong = -1;
+        long right = -1;
+        for (Map<String, Object> path : rows(s.get("paths"))) {
+            if (String.valueOf(path.get("guard")).contains("!=")) {
+                wrong = num(path.get("id"));
+            }
+            else {
+                right = num(path.get("id"));
+            }
+        }
+        dbg("select_path", "path", (double) wrong);
+        s = dbg("continue");
+        check("the side that misses runs to its end", "returned".equals(s.get("stop")), s.get("stop"));
+        s = dbg("seek", "timeoutMs", 60000.0);
+        check("seek from a path that has returned searches the side still open",
+            arrived(s) && num(map(s.get("seek")).get("through")) == right
+                && String.valueOf(s.get("hint")).contains("down path " + right),
+            s.get("stop") + " " + s.get("seek") + " " + s.get("hint"));
     }
 
     /** Which open path goes next decides whether a search that could arrive does. */
