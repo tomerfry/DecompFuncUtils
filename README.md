@@ -857,6 +857,12 @@ registers and stack are that path's.
   every argument, global and pointed-at structure the way depends on (see
   above); a value you typed in is fixed, and if the way hinges on it the banner
   says that nothing on the way was unknown rather than that there is no way.
+- **It starts from every open path, not only the current one.** If you stepped
+  or continued first, execution has stopped at a branch on an unknown, stayed
+  on one side and parked the other - and which side it stayed on is an accident.
+  The way to the destination is as likely down the parked one, so Seek looks
+  down all of them (the current one first where nothing else tells them apart)
+  and the banner says when the way was down a path other than the current one.
 - **Guided by Ghidra.** Before searching, Ghidra's call graph and control-flow
   graph are read backwards from the destination: which functions lead to it, in
   each of them which blocks cannot, and from every other block how many blocks

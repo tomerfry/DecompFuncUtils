@@ -69,7 +69,9 @@ public class AngrDebugTool implements McpTool {
             "leaning on Ghidra's control-flow graph to try the promising ones first ('guided':false to " +
             "turn that off, 'avoid':[addresses] to rule places out), and makes that path current. Code " +
             "that is not there does not stop it: a call into an unmodelled import, or through an unknown " +
-            "pointer, is skipped with an unknown return value. The response carries the path's LEDGER: " +
+            "pointer, is skipped with an unknown return value. It starts from EVERY open path of the " +
+            "session, not only the current one: after a fork the way is as likely down the parked side, " +
+            "and 'seek.through' names the path the route carries on from. The response carries the path's LEDGER: " +
             "in order, each point where an unknown appeared and each branch that depended on one with " +
             "the condition taken, then for every unknown the conditions on it and one set of values " +
             "that satisfies the whole path. If time runs out, seek again resumes; after arriving, seek " +
@@ -219,7 +221,7 @@ public class AngrDebugTool implements McpTool {
                 set.put("next", running == null
                     ? "Start a session (action=start), then action=seek."
                         + (elsewhere ? " The session loads " + AngrModules.nameOf(target.program()) + " with it." : "")
-                    : loaded ? "action=seek looks for a way there from the current path."
+                    : loaded ? "action=seek looks for a way there from every open path of the session."
                     : "action=seek loads " + AngrModules.nameOf(target.program()) + " by starting the session "
                         + "again if it has not moved yet; otherwise start it again first.");
                 return set;
@@ -444,10 +446,20 @@ public class AngrDebugTool implements McpTool {
                     + "or raise timeoutMs.";
             case "breakpoint":
                 return "Stopped at a breakpoint.";
-            case "destination":
-                return "Reached the destination; this path is now the current one. 'ledger' lists, in order, "
-                    + "what it took to get here and one set of values that satisfies it. seek again looks for "
-                    + "another way in.";
+            case "destination": {
+                Map<String, Object> seek = snapshot.get("seek") instanceof Map<?, ?> m
+                    ? (Map<String, Object>) m : Map.of();
+                // The search starts from every open path, so the way may be down a side that an
+                // earlier fork had parked rather than the one that was current.
+                String through = seek.get("through") instanceof Number t && seek.get("from") instanceof Number f
+                    && t.longValue() != f.longValue()
+                        ? " The way was not down the path that was current (" + f.longValue() + ") but down path "
+                            + t.longValue() + ", parked at an earlier fork."
+                        : "";
+                return "Reached the destination; this path is now the current one." + through
+                    + " 'ledger' lists, in order, what it took to get here and one set of values that "
+                    + "satisfies it. seek again looks for another way in.";
+            }
             case "seek_exhausted": {
                 Map<String, Object> seek = snapshot.get("seek") instanceof Map<?, ?> m
                     ? (Map<String, Object>) m : Map.of();
@@ -457,15 +469,16 @@ public class AngrDebugTool implements McpTool {
                         + "('ended' counts them). Narrow it - concretize unknowns that should not vary, "
                         + "give arguments values, or rule places out with 'avoid' - and seek again.";
                 }
-                if (seek.get("forks") instanceof Number forks && forks.longValue() == 0) {
+                boolean onePath = !(seek.get("startedFrom") instanceof Number seeds) || seeds.longValue() <= 1;
+                if (onePath && seek.get("forks") instanceof Number forks && forks.longValue() == 0) {
                     return "No branch on the way depended on an unknown, so there was one path to follow and "
                         + "it does not reach the destination. Whatever decides the way is fixed: a value "
                         + "given at start, or one already concretized on this path. Start again leaving it "
                         + "out (what is given no value is unknown), or symbolize it. 'seek' says how the "
                         + "path ended.";
                 }
-                return "Every path was followed to its end and none reaches the destination from here under "
-                    + "the conditions already taken. 'seek' says how they ended.";
+                return "Every open path of the session was followed to its end and none reaches the "
+                    + "destination under the conditions already taken. 'seek' says how they ended.";
             }
             case "seek_budget":
                 return "The search used its budget without arriving; what it explored is kept. seek again "

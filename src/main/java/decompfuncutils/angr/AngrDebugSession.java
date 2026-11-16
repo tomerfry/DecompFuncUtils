@@ -246,8 +246,8 @@ public final class AngrDebugSession {
     // ---- seeking the destination ----
 
     /**
-     * Looks for a way from the current path to a destination ({@link AngrDebugger#destinations} -
-     * in this program, or in a library loaded with it) and, when it finds one, makes that path
+     * Looks for a way from the open paths of the session (the current one first) to a
+     * destination ({@link AngrDebugger#destinations} - in this program, or in a library loaded with it) and, when it finds one, makes that path
      * the current one and reads its ledger.
      *
      * <p>Unlike {@link #step}, forks do not stop it: every side of every branch on an unknown is

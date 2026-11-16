@@ -2397,8 +2397,13 @@ class DebugSession:
 
     def seek(self, destinations, avoid, guide, limit, deadline, max_live):
         """
-        Explores from the current path until some path reaches a destination, and makes that
-        path the current one.
+        Explores until some path reaches a destination, and makes that path the current one.
+
+        The search starts from every path of the session that can still run, not only the
+        current one. Continue stops at a branch on an unknown, stays on one side and parks the
+        other; which side it stayed on is an accident of the order the successors came in, and
+        the way to the destination is as likely down the parked one. The current path goes
+        first where there is nothing else to choose by.
 
         Unlike Continue, a branch on an unknown does not stop it: both sides are followed, and
         so is every later fork. With Ghidra's control-flow graph to go by, the search goes deep:
@@ -2424,18 +2429,28 @@ class DebugSession:
                        and frontier["avoid"] == avoid)
         self.pending = None
         if not resumed:
-            if info["status"] != "paused":
-                raise SpecError("This path has finished (%s). Select another path or restart the session."
-                                % info["status"])
-            start = self.paths[pid]
-            if (start.addr & self.mask) in destinations:
+            if info["status"] == "paused" and (self.paths[pid].addr & self.mask) in destinations:
                 raise SpecError("Execution is already at the destination. Step on from here, or set "
                                 "another destination.")
-            first = guide.rank(start.addr & self.mask)
+            seeds = self.seek_seeds(pid, destinations | avoid)
+            if not seeds:
+                raise SpecError("This path has finished (%s) and no other path is open. Restart the session."
+                                % info["status"])
             frontier = {"anchor": pid, "origin": pid, "destinations": destinations, "avoid": avoid,
-                        "active": [[FAR if first is None else first, 0, start.history.depth, 0, start]],
-                        "deferred": [], "blocks": 0, "expanded": 0, "ended": {},
-                        "found": 0, "forks": 0, "seq": 0, "picks": 0}
+                        "active": [], "deferred": [], "blocks": 0, "expanded": 0, "ended": {},
+                        "found": 0, "forks": 0, "seq": len(seeds), "picks": 0, "seeds": len(seeds)}
+            # Of paths that are otherwise level, depth first takes the newest and breadth first
+            # the oldest; either way that should be the current one.
+            order = seeds[1:] + seeds[:1] if guide.directed else seeds
+            for seq, seed in enumerate(order):
+                start = self.paths[seed]
+                start.globals["dbg_seed"] = seed
+                key = start.addr & self.mask
+                if seed != pid and guide.cannot_reach(key):
+                    frontier["deferred"].append(start)
+                    continue
+                cost = guide.rank(key)
+                frontier["active"].append([FAR if cost is None else cost, 0, start.history.depth, seq, start])
         self.search = None
 
         def ended(kind, count=1):
@@ -2557,7 +2572,8 @@ class DebugSession:
             self.next_path += 1
             found.globals["dbg_writes"] = ()
             self.paths[new_id] = found
-            self.info[new_id] = {"status": "paused", "parent": frontier["origin"], "via": "seek"}
+            frontier["through"] = found.globals.get("dbg_seed", frontier["origin"])
+            self.info[new_id] = {"status": "paused", "parent": frontier["through"], "via": "seek"}
             self.current = new_id
             frontier["anchor"] = new_id  # asking again from here looks for another way in
             frontier["found"] += 1
@@ -2573,11 +2589,32 @@ class DebugSession:
             "open": len(active) + len(deferred), "setAside": len(deferred),
             "ended": dict(frontier["ended"]), "forks": frontier["forks"], "routesFound": frontier["found"],
             "guided": bool(guide), "directed": directed, "from": frontier["origin"],
+            "startedFrom": frontier["seeds"],
         }
+        if found is not None:
+            self.seek_report["through"] = frontier["through"]  # the path this route carries on from
         if frontier.get("lastFault"):
             self.seek_report["lastFault"] = frontier["lastFault"]
         self.last_stop = stop
         return stop
+
+    def seek_seeds(self, pid, stops):
+        """
+        The paths a search starts from: every one that can still run and is not already standing
+        on a destination or somewhere to avoid, the current one first.
+        """
+        seeds = []
+        for other in [pid] + sorted(p for p in self.paths if p != pid):
+            if self.info[other]["status"] != "paused":
+                continue
+            try:
+                addr = self.paths[other].addr
+            except Exception:  # pylint: disable=broad-except
+                continue
+            if addr == self.ret_addr or (addr & self.mask) in stops:
+                continue
+            seeds.append(other)
+        return seeds
 
     def ledger(self):
         state = self.paths[self.current]
