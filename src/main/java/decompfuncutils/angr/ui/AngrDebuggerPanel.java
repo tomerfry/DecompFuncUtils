@@ -25,7 +25,12 @@ public class AngrDebuggerPanel extends JPanel {
 
     /** What the user can ask for. Implemented by {@link AngrDebuggerController}. */
     public interface Actions {
-        void start(String function, String argumentsText, boolean symbolicImports, boolean strictMemory);
+        /**
+         * @param unknownInputs leave what is given no value - arguments, registers, memory with
+         *                      no initial contents, what unknown pointers point at - unknown
+         */
+        void start(String function, String argumentsText, boolean symbolicImports, boolean strictMemory,
+            boolean unknownInputs);
 
         void step(String kind);
 
@@ -78,6 +83,7 @@ public class AngrDebuggerPanel extends JPanel {
     private final JTextField argumentsField = new JTextField(30);
     private final JCheckBox symbolicImports = new JCheckBox("Unknown imports return symbolic values", true);
     private final JCheckBox strictMemory = new JCheckBox("Fault on unmapped memory", true);
+    private final JCheckBox unknownInputs = new JCheckBox("What is not given is unknown", true);
     private final JLabel hintLabel = new JLabel(" ");
     private final Map<String, JButton> buttons = new LinkedHashMap<>();
 
@@ -184,7 +190,7 @@ public class AngrDebuggerPanel extends JPanel {
         c.weightx = 0;
         JButton start = button("Start", "Start debugging the function (replaces the current session)",
             () -> actions.start(functionField.getText().strip(), argumentsField.getText().strip(),
-                symbolicImports.isSelected(), strictMemory.isSelected()));
+                symbolicImports.isSelected(), strictMemory.isSelected(), unknownInputs.isSelected()));
         start.setFont(start.getFont().deriveFont(Font.BOLD));
         panel.add(start, c);
         functionField.addActionListener(e -> start.doClick());
@@ -218,8 +224,14 @@ public class AngrDebuggerPanel extends JPanel {
         strictMemory.setToolTipText("<html>Stop with a fault when the function touches an address Ghidra has "
             + "no memory block for -<br>the usual sign of a pointer nobody supplied. Untick for firmware that "
             + "reads unmapped peripherals.</html>");
+        unknownInputs.setToolTipText("<html>Arguments you leave out, registers nothing sets, globals with no "
+            + "initial contents and<br>the memory behind unknown pointers are <b>unknown</b>, so Seek "
+            + "Destination can solve for them<br>and a pointer argument needs no setting up. Give an "
+            + "argument a value to pin it.<br>Unticked, all of these are zero - one fixed path through the "
+            + "function.</html>");
         options.add(symbolicImports);
         options.add(strictMemory);
+        options.add(unknownInputs);
         hintLabel.setForeground(palette.muted);
 
         // The hint takes whatever width is left and is cut short, not wrapped, when there is
@@ -523,8 +535,8 @@ public class AngrDebuggerPanel extends JPanel {
         }
         fill("ledger", entries, cells);
 
-        List<Map<String, Object>> unknowns = ledger != null && ledger.get("unknowns") instanceof List<?> l
-            ? (List<Map<String, Object>>) l : List.of();
+        List<Map<String, Object>> unknowns = new ArrayList<>(
+            ledger != null && ledger.get("unknowns") instanceof List<?> l ? (List<Map<String, Object>>) l : List.of());
         List<Object[]> rowsOut = new ArrayList<>();
         for (Map<String, Object> unknown : unknowns) {
             String value = text(unknown.get("value"))
@@ -533,7 +545,23 @@ public class AngrDebuggerPanel extends JPanel {
             String requires = unknown.get("requires") instanceof List<?> list
                 ? String.join("   and   ", list.stream().map(String::valueOf).toList())
                 : "nothing on this path depends on it";
-            rowsOut.add(new Object[] { unknown.get("name"), text(unknown.get("from")), value, requires });
+            String name = text(unknown.get("name"))
+                + (unknown.get("where") != null ? "  (" + unknown.get("where") + ")" : "");
+            rowsOut.add(new Object[] { name, text(unknown.get("from")), value, requires });
+        }
+        // The memory behind each unknown pointer the path followed, as the bytes it has to hold.
+        if (ledger != null && ledger.get("pointers") instanceof List<?> pointers) {
+            for (Object o : pointers) {
+                if (!(o instanceof Map<?, ?> m)) {
+                    continue;
+                }
+                Map<String, Object> pointer = (Map<String, Object>) m;
+                unknowns.add(pointer);
+                rowsOut.add(new Object[] { "*" + pointer.get("pointer"),
+                    "memory at " + pointer.get("address"),
+                    decompfuncutils.angr.AngrLedger.bytesText(pointer),
+                    "what the memory " + pointer.get("pointer") + " points at has to hold (?? is free)" });
+            }
         }
         fill("unknowns", unknowns, rowsOut);
 
@@ -847,6 +875,19 @@ public class AngrDebuggerPanel extends JPanel {
                             + " states. The Ledger lists what it took to get here, in order, and values that "
                             + "satisfy it. Seek again looks for another way in.");
                     selectTab("Ledger");
+                }
+                else if ("seek_exhausted".equals(stop) && seek != null && "incomplete".equals(seek.get("result"))) {
+                    setBanner(palette.warn, "The destination was not reached, but not every path was followed",
+                        "There were more open paths than the search keeps, so some were dropped ("
+                            + seek.get("ended") + "). Narrow it down - give arguments values, or concretize "
+                            + "unknowns that should not vary - and seek again. Still at " + where + ".");
+                }
+                else if ("seek_exhausted".equals(stop) && seek != null && number(seek.get("forks")) == 0) {
+                    setBanner(palette.warn, "The destination was not reached: nothing on the way was unknown",
+                        "No branch depended on an unknown value, so there was one path to follow ("
+                            + seek.get("ended") + ") and it does not arrive. What decides the way is fixed: "
+                            + "an argument given a value, or something already concretized. Start again "
+                            + "leaving it out, or make it unknown in the Registers tab. Still at " + where + ".");
                 }
                 else if ("seek_exhausted".equals(stop) && seek != null) {
                     setBanner(palette.warn, "The destination cannot be reached from here",

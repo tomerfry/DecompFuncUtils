@@ -264,7 +264,8 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
     }
 
     @Override
-    public void start(String function, String argumentsText, boolean symbolicImports, boolean strictMemory) {
+    public void start(String function, String argumentsText, boolean symbolicImports, boolean strictMemory,
+            boolean unknownInputs) {
         background(program -> {
             if (function == null || function.isBlank()) {
                 throw new IllegalArgumentException("Enter the name or address of the function to debug.");
@@ -274,6 +275,7 @@ public class AngrDebuggerController implements AngrDebuggerPanel.Actions, AngrDe
             arguments.put("args", parseArguments(argumentsText));
             arguments.put("unmodelledImports", symbolicImports ? "symbolic" : "zero");
             arguments.put("strictMemory", strictMemory);
+            arguments.put("unknownInputs", unknownInputs);
             SwingUtilities.invokeLater(() -> panel.showMessage("Starting angr...", false));
             AngrDebugSession session =
                 AngrDebugger.start(program, host.configuredPython(), arguments, TaskMonitor.DUMMY);

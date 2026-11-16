@@ -17,6 +17,15 @@ if ($LASTEXITCODE -ne 0) { throw "clang failed" }
 
 Write-Host "Built libangrdemo.so"
 
+# Seeking a destination from a session started with no arguments (AngrSeekHeadlessTest.java).
+& clang -target x86_64-linux-gnu -shared -fPIC -nostdlib -fuse-ld=lld `
+    -O0 -fno-builtin -fno-stack-protector `
+    '-Wl,-soname,libangrseek.so' `
+    (Join-Path $dir "angr_seek.c") -o (Join-Path $dir "libangrseek.so")
+if ($LASTEXITCODE -ne 0) { throw "clang failed" }
+
+Write-Host "Built libangrseek.so"
+
 # The cross-module pair: a library, and a module that imports functions and a variable from it.
 & clang -target x86_64-linux-gnu -shared -fPIC -nostdlib -fuse-ld=lld `
     -O0 -fno-builtin -fno-stack-protector `

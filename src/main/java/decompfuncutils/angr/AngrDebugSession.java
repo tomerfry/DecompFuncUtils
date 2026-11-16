@@ -71,6 +71,11 @@ public final class AngrDebugSession {
         // A debugger exists to look at what is unknown: imports nothing models return unknown
         // values unless the caller says otherwise.
         launch.putIfAbsent("unmodelledImports", "symbolic");
+        // The same goes for what the function's caller would have decided and nobody here did:
+        // an argument that was not given, a global nothing initialises, the memory behind a
+        // pointer. Left at zero there is one path through the function - whichever the zeros
+        // take - and no way for a search to find another.
+        launch.putIfAbsent("unknownInputs", true);
         AngrCallSpec call;
         AngrWorkers.Dedicated worker;
         try {
@@ -281,9 +286,13 @@ public final class AngrDebugSession {
                 guide = reach;
             }
             List<List<String>> nonReach = new ArrayList<>();
+            List<List<Object>> ranks = new ArrayList<>();
             if (guide != null) {
                 for (long[] range : guide.nonReach) {
                     nonReach.add(List.of(AngrImage.hex(range[0]), AngrImage.hex(range[1])));
+                }
+                for (long[] range : guide.ranks) {
+                    ranks.add(List.of(AngrImage.hex(range[0]), AngrImage.hex(range[1]), range[2]));
                 }
             }
             List<String> avoided = new ArrayList<>();
@@ -296,12 +305,21 @@ public final class AngrDebugSession {
             }
             long deadline = System.currentTimeMillis() + budgetMillis;
             Map<String, Object> result;
+            boolean first = true;
             while (true) {
                 long slice = Math.max(50, Math.min(SLICE_MILLIS, deadline - System.currentTimeMillis()));
                 Map<String, Object> request = base("dbg_seek");
                 request.put("destinations", targets);
                 request.put("avoid", avoided);
-                request.put("nonReach", nonReach);
+                // The guidance of a large program is long: it goes with the first slice only.
+                if (first) {
+                    request.put("nonReach", nonReach);
+                    request.put("ranks", ranks);
+                    first = false;
+                }
+                else {
+                    request.put("sameGuide", true);
+                }
                 request.put("timeoutMs", slice);
                 result = send(request, slice + QUICK_MILLIS, monitor);
                 if (!"timeout".equals(result.get("stop"))) {
@@ -399,6 +417,18 @@ public final class AngrDebugSession {
                 if (entry.get("to") instanceof String to) {
                     String label = label(to);
                     entry.put("toWhere", label == null ? to : label);
+                }
+            }
+        }
+        if (ledger.get("unknowns") instanceof List<?> unknowns) {
+            // Memory nobody initialised is named after its address; say which global that is.
+            for (Object o : unknowns) {
+                if (o instanceof Map<?, ?> m && m.get("name") instanceof String name
+                        && name.matches("mem_[0-9a-f]+(_b[0-9]+)?")) {
+                    String label = label("0x" + name.substring(4).replaceFirst("_b[0-9]+$", ""));
+                    if (label != null) {
+                        ((Map<String, Object>) m).put("where", label);
+                    }
                 }
             }
         }
